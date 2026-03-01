@@ -101,7 +101,11 @@ fn compute_frame_delay_entry(frame_idx: usize, cfg: &DelayEvalConfig) -> FrameDe
             + cfg.extra_delay_rate_sps * t_mid;
         let clock1_t = cfg.clock1_delay_s + cfg.clock1_rate_sps * t_mid;
         let clock2_t = cfg.clock2_delay_s + cfg.clock2_rate_sps * t_mid;
-        ((net_d_rel_no_clock_t - clock1_t) - cfg.d_seek, -clock2_t)
+        // Apply only relative clock delay/rate to avoid large common-mode shifts.
+        // Large absolute per-station clocks can exceed small FFT frame length and
+        // zero-fill whole frames even though the baseline-relative delay is small.
+        let rel_clock_t = clock2_t - clock1_t;
+        (net_d_rel_no_clock_t + rel_clock_t - cfg.d_seek, 0.0)
     } else {
         (
             delay_seconds_at_time(
@@ -1366,11 +1370,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     }
     let d_seek = (s2_s - s1_s) as f64 / fs; let helper = Arc::new(FftHelper::new(fft_len));
     let frame_dt = fft_len as f64 / fs;
-    let net_d1_base = (net_d_rel_no_clock0 - clock1_delay_s) - d_seek;
-    let net_d2_base = -clock2_delay_s;
+    // Keep integer/fractional shifts on baseline-relative delay only.
+    let net_d1_base = net_d_rel_no_clock0 + clock_delay_s - d_seek;
+    let net_d2_base = 0.0;
     let rate_rel_no_clock_base = (geometric_rate_hz + rotation_fringe_hz + rate_user_hz) / (obs_mhz * 1e6);
-    let total_rate1_base = rate_rel_no_clock_base - clock1_rate_sps;
-    let total_rate2_base = -clock2_rate_sps;
+    let total_rate1_base = rate_rel_no_clock_base + clock_rate_sps;
+    let total_rate2_base = 0.0;
     let total_accel_base = correction_sign * ga0;
     let total_accel1_base = total_accel_base;
     let total_accel2_base = 0.0;
