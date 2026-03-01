@@ -29,7 +29,10 @@ use plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE,
 use utils::{apply_delay_and_rate_regular_bins, apply_delay_and_rate_regular_bins_range, apply_integer_sample_shift_zerofill, build_decode_plan, decode_block_into_with_plan, quantise_frame, DynError, FftHelper, FftScratch};
 use xcf::finalize_cross_spectrum;
 
-const DEFAULT_COARSE_DELAY_S: f64 = 1.6e-6;
+const DEFAULT_COARSE_DELAY_S: f64 = 0.0;
+// GICO3-compatible one-sided spectrum normalization factor:
+// .cor stores only positive-frequency bins for real-input FFT outputs.
+const COR_ONE_SIDED_POWER_FACTOR: f64 = 0.5;
 
 fn carrier_phase_from_delay(f_hz: f64, tau_s: f64) -> Complex<f32> {
     if f_hz == 0.0 {
@@ -268,6 +271,17 @@ fn compute_band_alignment(fft: usize, fs: f64, c1: f64, c2: f64, bw1: f64, bw2: 
 fn format_bit_codes(b: usize) -> String { if b == 0 { "n/a".into() } else { (0..(1<<b).min(1024)).map(|c| format!("{c:0b$b}", b=b)).collect::<Vec<_>>().join(" ") } }
 fn format_level_map(b: usize, l: &[f64]) -> String { if b == 0 { "n/a".into() } else { (0..(1<<b).min(l.len())).map(|c| format!("{c:0b$b}->{:.1}", l[c], b=b)).collect::<Vec<_>>().join(", ") } }
 fn format_shuffle_compact(values: &[usize]) -> String { values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",") }
+
+fn quantization_mean_power(levels: &[f64], label: &str) -> Result<f64, DynError> {
+    if levels.is_empty() {
+        return Err(format!("{label} levels are empty").into());
+    }
+    let p = levels.iter().map(|v| v * v).sum::<f64>() / levels.len() as f64;
+    if !p.is_finite() || p <= 0.0 {
+        return Err(format!("{label} mean-square level is invalid: {p}").into());
+    }
+    Ok(p)
+}
 
 fn normalize_level_args(level_args: &[String], bit1: usize, bit2: usize) -> Result<Vec<String>, DynError> {
     if level_args.is_empty() {
@@ -891,6 +905,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let level_args = normalize_level_args(&level_src, bit1, bit2)?;
     let (lv1_s, lv2_s) = resolve_per_antenna_config(&level_args, if_d.as_ref().and_then(|d| d.ant1_level.clone()).unwrap_or("-1.5,-0.5,0.5,1.5".into()), |s| Ok(s.to_string()))?;
     let (levels1, levels2) = (Arc::new(parse_levels(bit1, &lv1_s)?), Arc::new(parse_levels(bit2, &lv2_s)?));
+    let level_power1 = quantization_mean_power(levels1.as_ref(), "ant1")?;
+    let level_power2 = quantization_mean_power(levels2.as_ref(), "ant2")?;
     let ds_s = DEFAULT_SHUFFLE_IN.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
     let shuffle_src = args.shuffle_in.clone();
     let shuffle_args = normalize_shuffle_args(&shuffle_src)?;
@@ -1308,6 +1324,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         println!("  level:      {}={:?}", a2_name, levels2);
         println!("  level-map:  {}={}", a1_name, format_level_map(bit1, &levels1));
         println!("  level-map:  {}={}", a2_name, format_level_map(bit2, &levels2));
+        println!(
+            "  cor-normalization: inv = 1 / (0.5 * P * nf * fft^2), P11={:.6}, P22={:.6}, P12={:.6}",
+            level_power1,
+            level_power2,
+            (level_power1 * level_power2).sqrt()
+        );
         println!("  shuffle-in: {}={:?}", a1_name, sh1_ext);
         println!("  shuffle-in: {}={:?}", a2_name, sh2_ext);
         println!("  sideband:   {}={} {}={}", a1_name, sb1_s, a2_name, sb2_s);
@@ -2221,21 +2243,43 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 acc_11_total[k] += batch_11[k];
                 acc_22_total[k] += batch_22[k];
             }
-            let inv = 1.0 / (nf as f64 * (fft_len as f64).powi(2));
+            let norm_base = nf as f64 * (fft_len as f64).powi(2);
+            let inv_11 = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * norm_base);
+            let inv_22 = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power2 * norm_base);
+            let inv_12 = 1.0
+                / (COR_ONE_SIDED_POWER_FACTOR * (level_power1 * level_power2).sqrt() * norm_base);
+            let phased_power_ref = (w1 * w1 * level_power1 + w2 * w2 * level_power2).max(1e-12);
+            let inv_ph = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * norm_base);
             if let Some(w) = cw_ph.as_mut() {
-                let s_ph: Vec<Complex<f32>> = batch_ph.iter().take(fft_len/2).map(|&v| Complex::new((v*inv) as f32, 0.0)).collect();
+                let s_ph: Vec<Complex<f32>> = batch_ph
+                    .iter()
+                    .take(fft_len / 2)
+                    .map(|&v| Complex::new((v * inv_ph) as f32, 0.0))
+                    .collect();
                 w.write_sector(c_unix + si as i64, (nf as f64 * fft_len as f64 / fs) as f32, &s_ph)?;
             }
             if let Some(w) = cw_11.as_mut() {
-                let s_11: Vec<Complex<f32>> = batch_11.iter().take(fft_len/2).map(|&v| Complex::new((v*inv) as f32, 0.0)).collect();
+                let s_11: Vec<Complex<f32>> = batch_11
+                    .iter()
+                    .take(fft_len / 2)
+                    .map(|&v| Complex::new((v * inv_11) as f32, 0.0))
+                    .collect();
                 w.write_sector(c_unix + si as i64, (nf as f64 * fft_len as f64 / fs) as f32, &s_11)?;
             }
             if let Some(w) = cw_12.as_mut() {
-                let s_12: Vec<Complex<f32>> = batch_12.iter().take(fft_len/2).map(|v| Complex::new((v.re*inv) as f32, (v.im*inv) as f32)).collect();
+                let s_12: Vec<Complex<f32>> = batch_12
+                    .iter()
+                    .take(fft_len / 2)
+                    .map(|v| Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32))
+                    .collect();
                 w.write_sector(c_unix + si as i64, (nf as f64 * fft_len as f64 / fs) as f32, &s_12)?;
             }
             if let Some(w) = cw_22.as_mut() {
-                let s_22: Vec<Complex<f32>> = batch_22.iter().take(fft_len/2).map(|&v| Complex::new((v*inv) as f32, 0.0)).collect();
+                let s_22: Vec<Complex<f32>> = batch_22
+                    .iter()
+                    .take(fft_len / 2)
+                    .map(|&v| Complex::new((v * inv_22) as f32, 0.0))
+                    .collect();
                 w.write_sector(c_unix + si as i64, (nf as f64 * fft_len as f64 / fs) as f32, &s_22)?;
             }
         }
