@@ -837,7 +837,28 @@ fn main() -> Result<(), DynError> {
                 let mut run_args = args.clone();
                 run_args.process_index = Some(idx);
                 run_args.compact_logs = idx > 0;
-                run_once(run_args, run_mode, cpu_threads)?;
+                let process_started = std::time::Instant::now();
+                let run_result = run_once(run_args, run_mode, cpu_threads);
+                let elapsed_sec = process_started.elapsed().as_secs_f64();
+                match run_result {
+                    Ok(()) => {
+                        println!(
+                            "[info] process {}/{} elapsed: {:.3}s",
+                            idx + 1,
+                            meta.processes.len(),
+                            elapsed_sec
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "[error] process {}/{} failed after {:.3}s",
+                            idx + 1,
+                            meta.processes.len(),
+                            elapsed_sec
+                        );
+                        return Err(e);
+                    }
+                }
             }
             return Ok(());
         }
