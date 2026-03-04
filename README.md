@@ -60,7 +60,7 @@ This writes `example.xml` in the current directory.
 
 ```bash
 target/release/yi-corr \
-  --sc r24131a_cor.xml \
+  --sc test.xml \
   --raw raw \
   --cor test/
 ```
@@ -69,16 +69,16 @@ target/release/yi-corr \
 
 ```bash
 # ACF only
-target/release/yi-acf --sc r24131a_cor.xml --raw raw --cor test/
+target/release/yi-acf --sc test.xml --raw raw --cor test/
 
 # XCF only
-target/release/yi-xcf --sc r24131a_cor.xml --raw raw --cor test/
+target/release/yi-xcf --sc test.xml --raw raw --cor test/
 
 # ACF + XCF
-target/release/yi-corr --sc r24131a_cor.xml --raw raw --cor test/
+target/release/yi-corr --sc test.xml --raw raw --cor test/
 
 # Phased-array (writes outputs to current directory)
-target/release/yi-phasedarray --sc r24131a_cor.xml --raw raw
+target/release/yi-phasedarray --sc test.xml --raw raw
 ```
 
 ## How input files are resolved
@@ -356,7 +356,7 @@ When multiple lines exist, one slot is claimed via lock file so concurrent runs 
 
 ```bash
 time target/release/yi-corr \
-  --sc r24131a_cor.xml \
+  --sc test.xml \
   --raw raw \
   --cor test/ \
   --cpu 18
