@@ -40,6 +40,8 @@ pub struct IFileData {
     pub ant2_clock_delay_s: Option<f64>,
     pub ant1_clock_rate_sps: Option<f64>,
     pub ant2_clock_rate_sps: Option<f64>,
+    pub ant1_clock_epoch: Option<String>,
+    pub ant2_clock_epoch: Option<String>,
     pub ant1_sideband: Option<String>,
     pub ant2_sideband: Option<String>,
     pub ant1_rotation_hz: Option<f64>,
@@ -134,6 +136,19 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
     let ant2_clock_delay_s = parse_optional_f64(&params, &["ant2clockdelay", "clock2delay", "station2clockdelay"])?;
     let ant1_clock_rate_sps = parse_optional_f64(&params, &["ant1clockrate", "clock1rate", "station1clockrate"])?;
     let ant2_clock_rate_sps = parse_optional_f64(&params, &["ant2clockrate", "clock2rate", "station2clockrate"])?;
+    let clock_epoch = params.get("clockepoch").cloned();
+    let ant1_clock_epoch = params
+        .get("ant1clockepoch")
+        .or_else(|| params.get("clock1epoch"))
+        .or_else(|| params.get("station1clockepoch"))
+        .cloned()
+        .or_else(|| clock_epoch.clone());
+    let ant2_clock_epoch = params
+        .get("ant2clockepoch")
+        .or_else(|| params.get("clock2epoch"))
+        .or_else(|| params.get("station2clockepoch"))
+        .cloned()
+        .or_else(|| clock_epoch.clone());
     let obsfreq_mhz = parse_optional_f64(&params, &["obsfreq", "skyfreq", "freq"])?;
     let ant1_ecef_m = parse_optional_xyz(
         &params,
@@ -181,6 +196,8 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         ant2_clock_delay_s,
         ant1_clock_rate_sps,
         ant2_clock_rate_sps,
+        ant1_clock_epoch,
+        ant2_clock_epoch,
         ant1_sideband: params.get("sideband").cloned(),
         ant2_sideband: params.get("sideband").cloned(),
         ant1_rotation_hz: parse_optional_f64(&params, &["ant1rotationhz", "rotation1hz", "rotation"])?,

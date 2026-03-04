@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use num_complex::Complex;
@@ -26,19 +27,96 @@ use acf::finalize_auto_spectrum;
 use args::{parse_levels, parse_shuffle, resolve_per_antenna_config, resolve_weight, DEFAULT_SHUFFLE_IN};
 use cor::{epoch_to_yyyydddhhmmss, unix_seconds_to_yyyydddhhmmss, CorHeaderConfig, CorStation, CorWriter};
 use plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE, GREEN, RED};
-use utils::{apply_delay_and_rate_regular_bins, apply_delay_and_rate_regular_bins_range, apply_integer_sample_shift_zerofill, build_decode_plan, decode_block_into_with_plan, quantise_frame, DynError, FftHelper, FftScratch};
+use utils::{apply_delay_and_rate_regular_bins, apply_integer_sample_shift_zerofill, build_decode_plan, decode_block_into_with_plan, quantise_frame, DynError, FftHelper, FftScratch};
 use xcf::finalize_cross_spectrum;
 
 const DEFAULT_COARSE_DELAY_S: f64 = 0.0;
 // GICO3-compatible one-sided spectrum normalization factor:
 // .cor stores only positive-frequency bins for real-input FFT outputs.
 const COR_ONE_SIDED_POWER_FACTOR: f64 = 0.5;
+static STDOUT_LOG_WRITER: OnceLock<Mutex<Option<BufWriter<File>>>> = OnceLock::new();
+static STDOUT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn stdout_log_writer() -> &'static Mutex<Option<BufWriter<File>>> {
+    STDOUT_LOG_WRITER.get_or_init(|| Mutex::new(None))
+}
+
+fn stdout_log_lock() -> &'static Mutex<()> {
+    STDOUT_LOG_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn emit_stdout_fmt(args: std::fmt::Arguments<'_>, newline: bool) {
+    let text = args.to_string();
+    let _guard = stdout_log_lock().lock().ok();
+    {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(text.as_bytes());
+        if newline {
+            let _ = out.write_all(b"\n");
+        }
+        let _ = out.flush();
+    }
+    if let Ok(mut writer_guard) = stdout_log_writer().lock() {
+        if let Some(writer) = writer_guard.as_mut() {
+            let _ = writer.write_all(text.as_bytes());
+            if newline {
+                let _ = writer.write_all(b"\n");
+            }
+            let _ = writer.flush();
+        }
+    }
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::emit_stdout_fmt(format_args!($($arg)*), false);
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        crate::emit_stdout_fmt(format_args!(""), true);
+    }};
+    ($($arg:tt)*) => {{
+        crate::emit_stdout_fmt(format_args!($($arg)*), true);
+    }};
+}
+
+fn init_stdout_log_for_yi_corr(run_mode: RunMode, enabled: bool) -> Result<(), DynError> {
+    if !enabled || !matches!(run_mode, RunMode::Corr) {
+        return Ok(());
+    }
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system time error: {e}"))?
+        .as_secs() as i64;
+    let tag = unix_seconds_to_yyyydddhhmmss(now_sec)?;
+    let log_dir = std::env::current_dir()?.join("stdout");
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("stdout_{}.log", tag));
+    let mut writer = BufWriter::new(File::create(&log_path)?);
+    writeln!(writer, "# yi-corr stdout log started at {}", tag)?;
+    writer.flush()?;
+    {
+        let mut slot = stdout_log_writer()
+            .lock()
+            .map_err(|_| "stdout log lock poisoned")?;
+        *slot = Some(writer);
+    }
+    println!("[info] stdout log dir: {}", log_dir.display());
+    println!("[info] stdout log: {}", log_path.display());
+    Ok(())
+}
 
 fn carrier_phase_from_delay(f_hz: f64, tau_s: f64) -> Complex<f32> {
     if f_hz == 0.0 {
         Complex::new(1.0_f32, 0.0_f32)
     } else {
-        Complex::from_polar(1.0_f32, (-2.0 * std::f64::consts::PI * f_hz * tau_s) as f32)
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let phase = -two_pi * f_hz * tau_s;
+        // Reduce phase before f32 conversion to keep precision for large absolute delays.
+        let wrapped = ((phase + std::f64::consts::PI).rem_euclid(two_pi)) - std::f64::consts::PI;
+        Complex::from_polar(1.0_f32, wrapped as f32)
     }
 }
 
@@ -50,6 +128,25 @@ fn split_delay_to_integer_and_fractional(delay_seconds: f64, fs_hz: f64) -> (i64
     let integer_samples = (delay_seconds * fs_hz).round() as i64;
     let fractional_seconds = delay_seconds - (integer_samples as f64 / fs_hz);
     (integer_samples, fractional_seconds)
+}
+
+#[inline]
+fn xcf_phase_start_and_step(
+    df_hz: f64,
+    frac_delay1: f64,
+    frac_delay2: f64,
+    start_bin1: usize,
+    start_bin2: usize,
+) -> (Complex<f32>, Complex<f32>) {
+    // Equivalent to rotating s1/s2 spectra independently and then forming
+    // s1 * conj(s2): apply only the combined fractional-delay phase on XCF.
+    let two_pi_df = -2.0_f64 * std::f64::consts::PI * df_hz;
+    let step1 = two_pi_df * frac_delay1;
+    let step2 = two_pi_df * frac_delay2;
+    let phase_start =
+        Complex::from_polar(1.0_f32, (step1 * start_bin1 as f64 - step2 * start_bin2 as f64) as f32);
+    let phase_step = Complex::from_polar(1.0_f32, (step1 - step2) as f32);
+    (phase_start, phase_step)
 }
 
 #[derive(Clone, Copy)]
@@ -88,7 +185,7 @@ struct DelayEvalConfig {
 fn compute_frame_delay_entry(frame_idx: usize, cfg: &DelayEvalConfig) -> FrameDelayEntry {
     let t_mid_local = (frame_idx as f64 + 0.5) * cfg.frame_dt;
     let t_mid = t_mid_local + cfg.time_offset_s;
-    let (tau1, tau2) = if let Some(gd_table) = cfg.geom_delay_table_1s.as_deref() {
+    let (tau1, tau2, tau1_for_fringe, tau2_for_fringe) = if let Some(gd_table) = cfg.geom_delay_table_1s.as_deref() {
         let sec_idx = t_mid_local.floor().max(0.0) as usize;
         let i0 = sec_idx.min(gd_table.len().saturating_sub(1));
         let i1 = (i0 + 1).min(gd_table.len().saturating_sub(1));
@@ -108,21 +205,28 @@ fn compute_frame_delay_entry(frame_idx: usize, cfg: &DelayEvalConfig) -> FrameDe
         // Large absolute per-station clocks can exceed small FFT frame length and
         // zero-fill whole frames even though the baseline-relative delay is small.
         let rel_clock_t = clock2_t - clock1_t;
-        (net_d_rel_no_clock_t + rel_clock_t - cfg.d_seek, 0.0)
+        let full_rel_t = net_d_rel_no_clock_t + rel_clock_t;
+        (full_rel_t - cfg.d_seek, 0.0, full_rel_t, 0.0)
     } else {
+        let tau1_res = delay_seconds_at_time(
+            cfg.net_d1_base,
+            cfg.total_rate1_base,
+            cfg.total_accel1_base,
+            t_mid,
+        );
+        let tau2_res = delay_seconds_at_time(
+            cfg.net_d2_base,
+            cfg.total_rate2_base,
+            cfg.total_accel2_base,
+            t_mid,
+        );
         (
-            delay_seconds_at_time(
-                cfg.net_d1_base,
-                cfg.total_rate1_base,
-                cfg.total_accel1_base,
-                t_mid,
-            ),
-            delay_seconds_at_time(
-                cfg.net_d2_base,
-                cfg.total_rate2_base,
-                cfg.total_accel2_base,
-                t_mid,
-            ),
+            tau1_res,
+            tau2_res,
+            // Keep fringe phase tied to the pre-seek absolute delay so changing
+            // read-start alignment between scans does not reset phase origin.
+            tau1_res + cfg.d_seek,
+            tau2_res,
         )
     };
     let (int1, frac1) = split_delay_to_integer_and_fractional(tau1, cfg.fs);
@@ -132,8 +236,8 @@ fn compute_frame_delay_entry(frame_idx: usize, cfg: &DelayEvalConfig) -> FrameDe
         int2,
         frac1,
         frac2,
-        fr_lo1: carrier_phase_from_delay(cfg.lo1_hz, tau1),
-        fr_lo2: carrier_phase_from_delay(cfg.lo2_hz, tau2),
+        fr_lo1: carrier_phase_from_delay(cfg.lo1_hz, tau1_for_fringe),
+        fr_lo2: carrier_phase_from_delay(cfg.lo2_hz, tau2_for_fringe),
     }
 }
 
@@ -174,6 +278,18 @@ fn detect_run_mode_from_argv0() -> RunMode {
     }
 }
 
+fn build_logical_cpus() -> Option<usize> {
+    option_env!("YI_BUILD_LOGICAL_CPUS")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
+fn build_l3_cache_bytes() -> Option<u64> {
+    option_env!("YI_BUILD_L3_CACHE_BYTES")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+}
+
 fn parse_cache_size_bytes(text: &str) -> Option<u64> {
     let s = text.trim();
     if s.is_empty() {
@@ -212,7 +328,9 @@ fn auto_chunk_frames(cpu_threads: usize, bytes_per_frame_pair: usize) -> usize {
     if bytes_per_frame_pair == 0 {
         return 4096;
     }
-    let l3_bytes = detect_l3_cache_bytes().unwrap_or(32 * 1024 * 1024);
+    let l3_bytes = build_l3_cache_bytes()
+        .or_else(detect_l3_cache_bytes)
+        .unwrap_or(32 * 1024 * 1024);
     let scale = (cpu_threads as u64).clamp(1, 16);
     let target_bytes = (l3_bytes.saturating_mul(scale) / 4).clamp(8 * 1024 * 1024, 128 * 1024 * 1024);
     let mut frames = (target_bytes / bytes_per_frame_pair as u64) as usize;
@@ -330,13 +448,13 @@ fn normalize_shuffle_args(shuffle_args: &[String]) -> Result<Vec<String>, DynErr
     Ok(shuffle_args.to_vec())
 }
 
-fn seek_forward_samples(r: &mut BufReader<File>, s: u64, b: usize, len: u64, sought: &mut isize, label: &str, reason: &str) -> Result<(), DynError> {
-    let bytes = (s * b as u64 + 7) / 8;
-    if bytes >= len { return Err(format!("Seek for {} exceeds file", label).into()); }
-    r.seek(SeekFrom::Current(bytes as i64))?;
-    *sought += ((bytes * 8) / b as u64) as isize;
-    println!("[info] Seeking {} forward by {} bytes for {}", label, bytes, reason);
-    Ok(())
+fn sample_to_total_bits(sample_offset: u64, bits_per_sample: usize) -> Result<u64, DynError> {
+    if bits_per_sample == 0 {
+        return Err("bits_per_sample must be >= 1".into());
+    }
+    sample_offset
+        .checked_mul(bits_per_sample as u64)
+        .ok_or("sample offset overflow while converting to bit offset".into())
 }
 
 fn read_with_padding(reader: &mut BufReader<File>, buf: &mut [u8]) -> Result<usize, DynError> {
@@ -352,6 +470,53 @@ fn read_with_padding(reader: &mut BufReader<File>, buf: &mut [u8]) -> Result<usi
     Ok(total)
 }
 
+struct PackedSampleReader {
+    reader: BufReader<File>,
+    bit_offset: u8,
+    prev_byte: Option<u8>,
+}
+
+impl PackedSampleReader {
+    fn open(path: &PathBuf, start_byte: u64, bit_offset: u8) -> Result<Self, DynError> {
+        if bit_offset >= 8 {
+            return Err("bit_offset must be in 0..8".into());
+        }
+        let f = File::open(path)?;
+        advise_sequential_readahead(&f);
+        let mut reader = BufReader::new(f);
+        reader.seek(SeekFrom::Start(start_byte))?;
+        let prev_byte = if bit_offset == 0 {
+            None
+        } else {
+            let mut b = [0u8; 1];
+            let _ = read_with_padding(&mut reader, &mut b)?;
+            Some(b[0])
+        };
+        Ok(Self {
+            reader,
+            bit_offset,
+            prev_byte,
+        })
+    }
+
+    fn read_packed_with_padding(&mut self, out: &mut [u8]) -> Result<(), DynError> {
+        if self.bit_offset == 0 {
+            let _ = read_with_padding(&mut self.reader, out)?;
+            return Ok(());
+        }
+        let mut next = vec![0u8; out.len()];
+        let _ = read_with_padding(&mut self.reader, &mut next)?;
+        let shift = self.bit_offset;
+        let mut prev = self.prev_byte.unwrap_or(0);
+        for (dst, &n) in out.iter_mut().zip(next.iter()) {
+            *dst = (prev >> shift) | (n << (8 - shift));
+            prev = n;
+        }
+        self.prev_byte = Some(prev);
+        Ok(())
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn advise_sequential_readahead(file: &File) {
     use std::os::fd::AsRawFd;
@@ -364,13 +529,6 @@ fn advise_sequential_readahead(file: &File) {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn advise_sequential_readahead(_file: &File) {}
-
-fn apply_integer_delay_with_forward_seek(ds: i64, b1: usize, b2: usize, res: &str, r1: &mut BufReader<File>, r2: &mut BufReader<File>, l1: u64, l2: u64, s1: &mut isize, s2: &mut isize) -> Result<(), DynError> {
-    if ds == 0 { return Ok(()); }
-    if ds > 0 { seek_forward_samples(r2, ds as u64, b2, l2, s2, "ant2", res)?; }
-    else { seek_forward_samples(r1, (-ds) as u64, b1, l1, s1, "ant1", res)?; }
-    Ok(())
-}
 
 fn resolve_input_paths(args: &args::Args, pe: &str, meta: Option<&ifile::IFileData>) -> Result<(PathBuf, PathBuf, String, String), DynError> {
     if let (Some(a1), Some(a2)) = (&args.ant1, &args.ant2) { let (_, tag) = epoch_to_yyyydddhhmmss(pe)?; return Ok((a1.clone(), a2.clone(), pe.to_string(), tag)); }
@@ -752,6 +910,7 @@ fn main() -> Result<(), DynError> {
         return Ok(());
     }
     let run_mode = detect_run_mode_from_argv0();
+    init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
     match run_mode {
         RunMode::PhasedArray => {
             if args.schedule.is_none() {
@@ -773,8 +932,8 @@ fn main() -> Result<(), DynError> {
             }
         }
     }
-    let cpu_auto = std::thread::available_parallelism()
-        .map(|n| n.get())
+    let cpu_auto = build_logical_cpus()
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
         .unwrap_or(2)
         .saturating_sub(2)
         .max(1);
@@ -994,16 +1153,44 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     }
     let clock_delay_rel_legacy_s = if_d.as_ref().and_then(|d| d.clock_delay_s).unwrap_or(0.0);
     let clock_rate_rel_legacy_sps = if_d.as_ref().and_then(|d| d.clock_rate_sps).unwrap_or(0.0);
-    let clock1_delay_s = if_d.as_ref().and_then(|d| d.ant1_clock_delay_s).unwrap_or(0.0);
-    let clock2_delay_s = if_d
+    let clock1_delay_base_s = if_d.as_ref().and_then(|d| d.ant1_clock_delay_s).unwrap_or(0.0);
+    let clock2_delay_base_s = if_d
         .as_ref()
         .and_then(|d| d.ant2_clock_delay_s)
-        .unwrap_or(clock1_delay_s + clock_delay_rel_legacy_s);
+        .unwrap_or(clock1_delay_base_s + clock_delay_rel_legacy_s);
     let clock1_rate_sps = if_d.as_ref().and_then(|d| d.ant1_clock_rate_sps).unwrap_or(0.0);
     let clock2_rate_sps = if_d
         .as_ref()
         .and_then(|d| d.ant2_clock_rate_sps)
         .unwrap_or(clock1_rate_sps + clock_rate_rel_legacy_sps);
+    let clock1_epoch = if_d
+        .as_ref()
+        .and_then(|d| d.ant1_clock_epoch.as_deref())
+        .map(|s| s.to_string());
+    let clock2_epoch = if_d
+        .as_ref()
+        .and_then(|d| d.ant2_clock_epoch.as_deref())
+        .map(|s| s.to_string());
+    let clock1_epoch_offset_s = if let Some(ep) = clock1_epoch.as_deref() {
+        let (clock_unix, _) = epoch_to_yyyydddhhmmss(ep)
+            .map_err(|e| format!("invalid ant1 clock epoch '{}': {}", ep, e))?;
+        Some((c_unix_base - clock_unix) as f64)
+    } else {
+        None
+    };
+    let clock2_epoch_offset_s = if let Some(ep) = clock2_epoch.as_deref() {
+        let (clock_unix, _) = epoch_to_yyyydddhhmmss(ep)
+            .map_err(|e| format!("invalid ant2 clock epoch '{}': {}", ep, e))?;
+        Some((c_unix_base - clock_unix) as f64)
+    } else {
+        None
+    };
+    // Clock delay/rate are defined at each <clock><epoch>; if present, propagate
+    // delay to the process epoch before per-frame evaluation.
+    let clock1_delay_s =
+        clock1_delay_base_s + clock1_rate_sps * clock1_epoch_offset_s.unwrap_or(0.0);
+    let clock2_delay_s =
+        clock2_delay_base_s + clock2_rate_sps * clock2_epoch_offset_s.unwrap_or(0.0);
     let clock_delay_s = clock2_delay_s - clock1_delay_s;
     let clock_rate_sps = clock2_rate_sps - clock1_rate_sps;
     let coarse_delay_s = args.coarse.unwrap_or(DEFAULT_COARSE_DELAY_S);
@@ -1043,10 +1230,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let bpf1 = (fft_len * bit1 + 7) / 8; let bpf2 = (fft_len * bit2 + 7) / 8;
     let bpf_o = (fft_len * bit_out + 7) / 8;
     let bytes_per_frame_pair = bpf1 + bpf2;
-    let io_chunk_frames = match args.chunk_frames {
-        Some(0) => return Err("--chunk-frames must be >= 1".into()),
-        Some(v) => v,
-        None => auto_chunk_frames(cpu_threads, bytes_per_frame_pair),
+    let io_chunk_frames = if args.razoku5bay {
+        let forced = ((0.5_f64 * fs) / fft_len as f64).round().max(1.0) as usize;
+        if args.chunk_frames.is_some() {
+            println!(
+                "[info] --razoku5bay is enabled: overriding --chunk-frames with {}",
+                forced
+            );
+        } else {
+            println!(
+                "[info] --razoku5bay is enabled: forcing chunk size to {} frames (~0.5 s)",
+                forced
+            );
+        }
+        forced
+    } else {
+        match args.chunk_frames {
+            Some(0) => return Err("--chunk-frames must be >= 1".into()),
+            Some(v) => v,
+            None => auto_chunk_frames(cpu_threads, bytes_per_frame_pair),
+        }
     };
     let io_pipeline_depth = match args.pipeline_depth {
         Some(0) => return Err("--pipeline-depth must be >= 1".into()),
@@ -1298,6 +1501,22 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     println!("  clock-delay {}: {:.6e} s => applied {:.3} samples", a2_name, clock2_delay_s, clock2_delay_s * fs);
     println!("  clock-rate  {}: {:.6e} s/s", a1_name, clock1_rate_sps);
     println!("  clock-rate  {}: {:.6e} s/s", a2_name, clock2_rate_sps);
+    if let Some(ep) = clock1_epoch.as_deref() {
+        println!(
+            "  clock-epoch {}: {} (to process epoch: {:+.3} s)",
+            a1_name,
+            ep,
+            clock1_epoch_offset_s.unwrap_or(0.0)
+        );
+    }
+    if let Some(ep) = clock2_epoch.as_deref() {
+        println!(
+            "  clock-epoch {}: {} (to process epoch: {:+.3} s)",
+            a2_name,
+            ep,
+            clock2_epoch_offset_s.unwrap_or(0.0)
+        );
+    }
     }
     if !schedule_mode {
         println!("  res-delay input: {} samples (relative pre-align)", delay_user_samples);
@@ -1368,6 +1587,13 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     }
     if !args.compact_logs {
         println!("  cpu:        {} (compute threads: {})", cpu_threads, rayon::current_num_threads());
+        let build_cpu = build_logical_cpus()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let build_l3 = build_l3_cache_bytes()
+            .map(|b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!("  build-host: logical-cpu={} l3-cache={}", build_cpu, build_l3);
         println!(
             "  io:         chunk={} frames (pair-bytes={}), pipeline={} chunks",
             io_chunk_frames, bytes_per_frame_pair, io_pipeline_depth
@@ -1401,17 +1627,47 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         println!("[info] cor-dir: {}", o_dir.display());
     }
 
-    let fr1 = File::open(&a1p)?;
-    let fr2 = File::open(&a2p)?;
-    advise_sequential_readahead(&fr1);
-    advise_sequential_readahead(&fr2);
-    let (mut r1, mut r2) = (BufReader::new(fr1), BufReader::new(fr2));
-    let (mut s1_s, mut s2_s) = (0, 0); apply_integer_delay_with_forward_seek((net_d0 * fs).round() as i64, bit1, bit2, "init", &mut r1, &mut r2, f1_m.len(), f2_m.len(), &mut s1_s, &mut s2_s)?;
-    if total_skip_samples > 0 {
-        seek_forward_samples(&mut r1, total_skip_samples, bit1, f1_m.len(), &mut s1_s, "ant1", "skip")?;
-        seek_forward_samples(&mut r2, total_skip_samples, bit2, f2_m.len(), &mut s2_s, "ant2", "skip")?;
+    let start_s1_samples = start_s1;
+    let start_s2_samples = start_s2;
+    // Keep raw-word alignment for shuffle decode path.
+    // shuffle-in is defined on 32-bit words, so mid-word starts can look like bit reordering.
+    let samples_per_word1 = 32_u64
+        .checked_div(bit1 as u64)
+        .ok_or("invalid bit1 for word alignment")?;
+    let samples_per_word2 = 32_u64
+        .checked_div(bit2 as u64)
+        .ok_or("invalid bit2 for word alignment")?;
+    if samples_per_word1 == 0 || samples_per_word2 == 0 {
+        return Err("invalid samples-per-word while aligning input start".into());
     }
-    let d_seek = (s2_s - s1_s) as f64 / fs; let helper = Arc::new(FftHelper::new(fft_len));
+    let start_s1_actual_samples = (start_s1_samples / samples_per_word1) * samples_per_word1;
+    let start_s2_actual_samples = (start_s2_samples / samples_per_word2) * samples_per_word2;
+    let start_s1_residual_samples = start_s1_actual_samples as i64 - start_s1_samples as i64;
+    let start_s2_residual_samples = start_s2_actual_samples as i64 - start_s2_samples as i64;
+    let start_s1_bits = sample_to_total_bits(start_s1_actual_samples, bit1)?;
+    let start_s2_bits = sample_to_total_bits(start_s2_actual_samples, bit2)?;
+    let start_s1_byte = start_s1_bits / 8;
+    let start_s2_byte = start_s2_bits / 8;
+    let start_s1_bit = 0_u8;
+    let start_s2_bit = 0_u8;
+    println!(
+        "[info] Input start ant1: desired sample {} -> byte {} + bit {} (actual sample {}, residual {} sample)",
+        start_s1_samples, start_s1_byte, start_s1_bit, start_s1_actual_samples, start_s1_residual_samples
+    );
+    println!(
+        "[info] Input start ant2: desired sample {} -> byte {} + bit {} (actual sample {}, residual {} sample)",
+        start_s2_samples, start_s2_byte, start_s2_bit, start_s2_actual_samples, start_s2_residual_samples
+    );
+    if start_s1_residual_samples != 0 || start_s2_residual_samples != 0 {
+        println!(
+            "[info] Word-aligned seek residual: ant1={} sample(s), ant2={} sample(s)",
+            start_s1_residual_samples, start_s2_residual_samples
+        );
+    }
+    let d_seek_samples = start_s2_actual_samples as i128 - start_s1_actual_samples as i128;
+    let d_seek = d_seek_samples as f64 / fs;
+
+    let helper = Arc::new(FftHelper::new(fft_len));
     let frame_dt = fft_len as f64 / fs;
     // Keep integer/fractional shifts on baseline-relative delay only.
     let net_d1_base = net_d_rel_no_clock0 + clock_delay_s - d_seek;
@@ -1492,45 +1748,37 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             io_chunk_frames, io_pipeline_depth
         );
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<Vec<u8>>, String>>(io_pipeline_depth);
-        let (r1_p, r2_p, s1_c, s2_c) = (a1p.clone(), a2p.clone(), s1_s, s2_s);
+        let (r1_p, r2_p, s1_b, s2_b) = (
+            a1p.clone(),
+            a2p.clone(),
+            start_s1_byte,
+            start_s2_byte,
+        );
+        let (s1_bit, s2_bit) = (start_s1_bit, start_s2_bit);
         thread::spawn(move || {
-            let mut rd1 = match File::open(&r1_p) {
-                Ok(f) => {
-                    advise_sequential_readahead(&f);
-                    BufReader::new(f)
-                }
+            let mut rd1 = match PackedSampleReader::open(&r1_p, s1_b, s1_bit) {
+                Ok(v) => v,
                 Err(e) => {
-                    let _ = tx.send(Err(format!("failed to open {}: {e}", r1_p.display())));
+                    let _ = tx.send(Err(format!("failed to open/seek {}: {e}", r1_p.display())));
                     return;
                 }
             };
-            let mut rd2 = match File::open(&r2_p) {
-                Ok(f) => {
-                    advise_sequential_readahead(&f);
-                    BufReader::new(f)
-                }
+            let mut rd2 = match PackedSampleReader::open(&r2_p, s2_b, s2_bit) {
+                Ok(v) => v,
                 Err(e) => {
-                    let _ = tx.send(Err(format!("failed to open {}: {e}", r2_p.display())));
+                    let _ = tx.send(Err(format!("failed to open/seek {}: {e}", r2_p.display())));
                     return;
                 }
             };
-            if let Err(e) = rd1.seek(SeekFrom::Start(s1_c as u64 * bit1 as u64 / 8)) {
-                let _ = tx.send(Err(format!("failed to seek ant1 input: {e}")));
-                return;
-            }
-            if let Err(e) = rd2.seek(SeekFrom::Start(s2_c as u64 * bit2 as u64 / 8)) {
-                let _ = tx.send(Err(format!("failed to seek ant2 input: {e}")));
-                return;
-            }
             let mut nf = 0;
             while nf < total_f {
                 let n = (total_f - nf).min(io_chunk_frames);
                 let (mut b1, mut b2) = (vec![0u8; n * bpf1], vec![0u8; n * bpf2]);
-                if let Err(e) = read_with_padding(&mut rd1, &mut b1) {
+                if let Err(e) = rd1.read_packed_with_padding(&mut b1) {
                     let _ = tx.send(Err(format!("failed reading ant1 input: {e}")));
                     return;
                 }
-                if let Err(e) = read_with_padding(&mut rd2, &mut b2) {
+                if let Err(e) = rd2.read_packed_with_padding(&mut b2) {
                     let _ = tx.send(Err(format!("failed reading ant2 input: {e}")));
                     return;
                 }
@@ -1554,49 +1802,115 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 .map(|i| compute_frame_delay_entry(processed + i, &delay_cfg))
                 .collect();
             let frame_errors = AtomicUsize::new(0);
-            let bc = raw1.par_chunks(bpf1).zip(raw2.par_chunks(bpf2)).enumerate().fold(|| vec![Complex::new(0.0_f64, 0.0_f64); fft_len/2+1], |mut c, (i, (r1, r2))| {
-                let d = frame_delays[i];
-                let (mut f1, mut f2, mut s1, mut s2) = (vec![0.0_f32; fft_len], vec![0.0_f32; fft_len], vec![Complex::new(0.0_f32, 0.0_f32); fft_len/2+1], vec![Complex::new(0.0_f32, 0.0_f32); fft_len/2+1]);
-                if decode_block_into_with_plan(r1, fft_len, &dp1, &mut f1, lsb1).is_err() {
-                    frame_errors.fetch_add(1, Ordering::Relaxed);
-                    return c;
-                }
-                if decode_block_into_with_plan(r2, fft_len, &dp2, &mut f2, lsb2).is_err() {
-                    frame_errors.fetch_add(1, Ordering::Relaxed);
-                    return c;
-                }
-                let int_shift1 = d.int1;
-                let int_shift2 = d.int2;
-                let frac_delay1 = d.frac1;
-                let frac_delay2 = d.frac2;
-                apply_integer_sample_shift_zerofill(&mut f1, int_shift1);
-                apply_integer_sample_shift_zerofill(&mut f2, int_shift2);
-                if helper.forward_r2c_process(&mut f1, &mut s1).is_err() {
-                    frame_errors.fetch_add(1, Ordering::Relaxed);
-                    return c;
-                }
-                if helper.forward_r2c_process(&mut f2, &mut s2).is_err() {
-                    frame_errors.fetch_add(1, Ordering::Relaxed);
-                    return c;
-                }
-                
-                // Use observing reference frequency in .cor header (not upper band edge)
-                // so residual-rate definition matches frinZ delay/rate search.
-                let fr_mix = d.fr_lo1 * d.fr_lo2.conj();
-                apply_delay_and_rate_regular_bins(&mut s1, fft_len, fs/fft_len as f64, frac_delay1, 0.0, 0.0, 0.0, false);
-                apply_delay_and_rate_regular_bins(&mut s2, fft_len, fs/fft_len as f64, frac_delay2, 0.0, 0.0, 0.0, false);
-                
-                for k in 0..(ba.a1e - ba.a1s) {
-                    let i1 = ba.a1s + k;
-                    let i2 = ba.a2s + k;
-                    let v = (s1[i1] * s2[i2].conj()) * fr_mix;
-                    match out_grid {
-                        OutputGrid::Ant1 => c[i1] += Complex::new(v.re as f64, v.im as f64),
-                        OutputGrid::Ant2 => c[i2] += Complex::new(v.re as f64, v.im as f64),
+            struct XcfThreadAccum {
+                acc: Vec<Complex<f64>>,
+                f1: Vec<f32>,
+                f2: Vec<f32>,
+                s1: Vec<Complex<f32>>,
+                s2: Vec<Complex<f32>>,
+                fft_scratch: FftScratch,
+            }
+            let half = fft_len / 2 + 1;
+            let init = || XcfThreadAccum {
+                acc: vec![Complex::new(0.0_f64, 0.0_f64); half],
+                f1: vec![0.0_f32; fft_len],
+                f2: vec![0.0_f32; fft_len],
+                s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
+                s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
+                fft_scratch: helper.make_scratch(),
+            };
+            let frames_per_job = (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(128, 2048);
+            let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
+            let mut out = chunk_starts
+                .into_par_iter()
+                .map(|start| {
+                    let mut st = init();
+                    let end = (start + frames_per_job).min(nf);
+                    for i in start..end {
+                        let d = frame_delays[i];
+                        if decode_block_into_with_plan(
+                            &raw1[i * bpf1..(i + 1) * bpf1],
+                            fft_len,
+                            &dp1,
+                            &mut st.f1,
+                            lsb1,
+                        )
+                        .is_err()
+                        {
+                            frame_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if decode_block_into_with_plan(
+                            &raw2[i * bpf2..(i + 1) * bpf2],
+                            fft_len,
+                            &dp2,
+                            &mut st.f2,
+                            lsb2,
+                        )
+                        .is_err()
+                        {
+                            frame_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        apply_integer_sample_shift_zerofill(&mut st.f1, d.int1);
+                        apply_integer_sample_shift_zerofill(&mut st.f2, d.int2);
+                        if helper
+                            .forward_r2c_process_with_scratch(
+                                &mut st.f1,
+                                &mut st.s1,
+                                &mut st.fft_scratch,
+                            )
+                            .is_err()
+                        {
+                            frame_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if helper
+                            .forward_r2c_process_with_scratch(
+                                &mut st.f2,
+                                &mut st.s2,
+                                &mut st.fft_scratch,
+                            )
+                            .is_err()
+                        {
+                            frame_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        // Use observing reference frequency in .cor header (not upper band edge)
+                        // so residual-rate definition matches frinZ delay/rate search.
+                        let fr_mix = d.fr_lo1 * d.fr_lo2.conj();
+                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                            df_hz,
+                            d.frac1,
+                            d.frac2,
+                            ba.a1s,
+                            ba.a2s,
+                        );
+                        for k in 0..(ba.a1e - ba.a1s) {
+                            let i1 = ba.a1s + k;
+                            let i2 = ba.a2s + k;
+                            let v = (st.s1[i1] * st.s2[i2].conj()) * fr_mix * phase_corr;
+                            match out_grid {
+                                OutputGrid::Ant1 => {
+                                    st.acc[i1] += Complex::new(v.re as f64, v.im as f64)
+                                }
+                                OutputGrid::Ant2 => {
+                                    st.acc[i2] += Complex::new(v.re as f64, v.im as f64)
+                                }
+                            }
+                            phase_corr *= phase_step;
+                        }
                     }
-                }
-                c
-            }).reduce(|| vec![Complex::new(0.0_f64, 0.0_f64); fft_len/2+1], |mut c1, c2| { for k in 0..c1.len() { c1[k] += c2[k]; } c1 });
+                    st
+                })
+                .reduce(init, |mut a, b| {
+                    for k in 0..half {
+                        a.acc[k] += b.acc[k];
+                    }
+                    a
+                });
+            let bc = std::mem::take(&mut out.acc);
             dropped_xcf_frames += frame_errors.load(Ordering::Relaxed);
             for k in 0..ac.len() { ac[k] += bc[k] * inv_fft2; }
             processed += nf;
@@ -1640,12 +1954,99 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             None
         };
         let mut dbg_writer: Option<BufWriter<File>> = if args.debug {
-            let dbg_path = o_dir.join(format!("YAMAGU66_{}_debug.log", c_tag));
+            let debug_base_dir = args
+                .schedule
+                .as_ref()
+                .and_then(|p| p.parent().map(PathBuf::from))
+                .unwrap_or_else(|| o_dir.clone());
+            let debug_dir = debug_base_dir.join("debug_yi-corr");
+            std::fs::create_dir_all(&debug_dir)?;
+            let dbg_path = debug_dir.join(format!("debug_{}.log", c_tag));
             println!("[info] Debug log: {}", dbg_path.display());
             let mut w = BufWriter::new(File::create(&dbg_path)?);
+            let processed_sec = total_f as f64 * fft_len as f64 / fs;
             writeln!(w, "# phased_array debug log")?;
             writeln!(w, "# schedule_mode={schedule_mode} fft={fft_len} fs_hz={fs:.3}")?;
-            writeln!(w, "# all frames are logged")?;
+            writeln!(
+                w,
+                "# process_window: start={} end_floor={} end_offset_s={:.6} length_req_s={:.6} length_proc_s={:.6}",
+                c_tag,
+                unix_seconds_to_yyyydddhhmmss(c_unix + processed_sec.floor() as i64)?,
+                processed_sec,
+                requested_sec,
+                processed_sec
+            )?;
+            writeln!(
+                w,
+                "# geom_time_reference: process_epoch={} t_abs=process_epoch+(xml_skip+cli_skip)+frame_mid",
+                ep_i
+            )?;
+            writeln!(
+                w,
+                "# phase_convention: x12 = X1 * conj(X2), fringe_mix = fr_lo1 * conj(fr_lo2)"
+            )?;
+            writeln!(
+                w,
+                "# delay_convention: model=(ant2-ant1), correction applied on ant1 toward ant2"
+            )?;
+            writeln!(
+                w,
+                "# read_align_components_s: geom={:.9e} coarse={:.9e} user={:.9e} clock={:.9e} total={:.9e}",
+                gd0,
+                coarse_delay_s,
+                delay_user_samples / fs,
+                clock_delay_s,
+                net_d0
+            )?;
+            writeln!(
+                w,
+                "# read_align_components_samples: geom={:.6} coarse={:.6} user={:.6} clock={:.6} total={:.6}",
+                gd0 * fs,
+                coarse_delay_s * fs,
+                delay_user_samples,
+                clock_delay_s * fs,
+                net_d0 * fs
+            )?;
+            writeln!(
+                w,
+                "# delay_rate_terms_hz: total={:.9} geom={:.9} clock={:.9} rot_res={:.9} user={:.9}",
+                total_rate_hz,
+                geometric_rate_hz,
+                clock_rate_hz,
+                rotation_fringe_hz,
+                rate_user_hz
+            )?;
+            writeln!(
+                w,
+                "# clock_epoch: ant1={} dt_s={:+.3} ant2={} dt_s={:+.3}",
+                clock1_epoch.as_deref().unwrap_or("-"),
+                clock1_epoch_offset_s.unwrap_or(0.0),
+                clock2_epoch.as_deref().unwrap_or("-"),
+                clock2_epoch_offset_s.unwrap_or(0.0)
+            )?;
+            writeln!(
+                w,
+                "# seek_ant1: desired_samples={} actual_samples={} residual_samples={} byte_offset={} bit_offset={} byte_floor_samples={} byte_rounding_loss_samples={}",
+                start_s1_samples,
+                start_s1_actual_samples,
+                start_s1_residual_samples,
+                start_s1_byte,
+                start_s1_bit,
+                (start_s1_byte * 8) / bit1 as u64,
+                start_s1_residual_samples.unsigned_abs()
+            )?;
+            writeln!(
+                w,
+                "# seek_ant2: desired_samples={} actual_samples={} residual_samples={} byte_offset={} bit_offset={} byte_floor_samples={} byte_rounding_loss_samples={}",
+                start_s2_samples,
+                start_s2_actual_samples,
+                start_s2_residual_samples,
+                start_s2_byte,
+                start_s2_bit,
+                (start_s2_byte * 8) / bit2 as u64,
+                start_s2_residual_samples.unsigned_abs()
+            )?;
+            writeln!(w, "# frame_logging: all frames")?;
             Some(w)
         } else {
             None
@@ -1699,46 +2100,37 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let (tx_sec, rx_sec) =
             mpsc::sync_channel::<Result<(Vec<u8>, Vec<u8>), String>>(prefetch_depth);
         let (a1_read, a2_read) = (a1p.clone(), a2p.clone());
+        let (s1_b, s2_b) = (start_s1_byte, start_s2_byte);
+        let (s1_bit, s2_bit) = (start_s1_bit, start_s2_bit);
         let reader_handle = thread::spawn(move || {
-            let fpr1 = match File::open(&a1_read) {
-                Ok(f) => f,
+            let mut pr1 = match PackedSampleReader::open(&a1_read, s1_b, s1_bit) {
+                Ok(v) => v,
                 Err(e) => {
                     let _ = tx_sec.send(Err(format!(
-                        "failed to open {}: {e}",
+                        "failed to open/seek {}: {e}",
                         a1_read.display()
                     )));
                     return;
                 }
             };
-            let fpr2 = match File::open(&a2_read) {
-                Ok(f) => f,
+            let mut pr2 = match PackedSampleReader::open(&a2_read, s2_b, s2_bit) {
+                Ok(v) => v,
                 Err(e) => {
                     let _ = tx_sec.send(Err(format!(
-                        "failed to open {}: {e}",
+                        "failed to open/seek {}: {e}",
                         a2_read.display()
                     )));
                     return;
                 }
             };
-            advise_sequential_readahead(&fpr1);
-            advise_sequential_readahead(&fpr2);
-            let (mut pr1, mut pr2) = (BufReader::new(fpr1), BufReader::new(fpr2));
-            if let Err(e) = pr1.seek(SeekFrom::Start(s1_s as u64 * bit1 as u64 / 8)) {
-                let _ = tx_sec.send(Err(format!("failed to seek ant1 input: {e}")));
-                return;
-            }
-            if let Err(e) = pr2.seek(SeekFrom::Start(s2_s as u64 * bit2 as u64 / 8)) {
-                let _ = tx_sec.send(Err(format!("failed to seek ant2 input: {e}")));
-                return;
-            }
             for nf in sec_counts_for_read {
                 let mut b1 = vec![0u8; nf * bpf1];
                 let mut b2 = vec![0u8; nf * bpf2];
-                if let Err(e) = read_with_padding(&mut pr1, &mut b1) {
+                if let Err(e) = pr1.read_packed_with_padding(&mut b1) {
                     let _ = tx_sec.send(Err(format!("failed reading ant1 input: {e}")));
                     return;
                 }
-                if let Err(e) = read_with_padding(&mut pr2, &mut b2) {
+                if let Err(e) = pr2.read_packed_with_padding(&mut b2) {
                     let _ = tx_sec.send(Err(format!("failed reading ant2 input: {e}")));
                     return;
                 }
@@ -2073,32 +2465,6 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
 
                         match out_grid {
                             OutputGrid::Ant1 => {
-                                if need_xcf_products {
-                                    apply_delay_and_rate_regular_bins_range(
-                                        &mut st.s1,
-                                        fft_len,
-                                        df_hz,
-                                        frac_delay1,
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        false,
-                                        ba.a1s,
-                                        ba.a1e,
-                                    );
-                                    apply_delay_and_rate_regular_bins_range(
-                                        &mut st.s2,
-                                        fft_len,
-                                        df_hz,
-                                        frac_delay2,
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        false,
-                                        ba.a2s,
-                                        ba.a2s + overlap_len,
-                                    );
-                                }
                                 if need_acf_products {
                                     if acf_overlap_only {
                                         for k in 0..overlap_len {
@@ -2111,61 +2477,32 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         for k in 0..half {
                                             st.acc_11[k] += st.s1[k].norm_sqr() as f64;
                                         }
-                                        if need_xcf_products {
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_22[i1] += st.s2[i2].norm_sqr() as f64;
-                                                let v = (st.s1[i1] * st.s2[i2].conj()) * fr_mix;
-                                                st.acc_12[i1] += Complex::new(v.re as f64, v.im as f64);
-                                            }
-                                        } else {
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_22[i1] += st.s2[i2].norm_sqr() as f64;
-                                            }
+                                        for k in 0..overlap_len {
+                                            let i1 = ba.a1s + k;
+                                            let i2 = ba.a2s + k;
+                                            st.acc_22[i1] += st.s2[i2].norm_sqr() as f64;
                                         }
                                     }
                                 }
                                 if need_xcf_products {
-                                    if !(need_acf_products && !acf_overlap_only) {
-                                        for k in 0..overlap_len {
-                                            let i1 = ba.a1s + k;
-                                            let i2 = ba.a2s + k;
-                                            let v = (st.s1[i1] * st.s2[i2].conj()) * fr_mix;
-                                            st.acc_12[i1] += Complex::new(v.re as f64, v.im as f64);
-                                        }
+                                    let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                                        df_hz,
+                                        frac_delay1,
+                                        frac_delay2,
+                                        ba.a1s,
+                                        ba.a2s,
+                                    );
+                                    for k in 0..overlap_len {
+                                        let i1 = ba.a1s + k;
+                                        let i2 = ba.a2s + k;
+                                        let v =
+                                            (st.s1[i1] * st.s2[i2].conj()) * fr_mix * phase_corr;
+                                        st.acc_12[i1] += Complex::new(v.re as f64, v.im as f64);
+                                        phase_corr *= phase_step;
                                     }
                                 }
                             }
                             OutputGrid::Ant2 => {
-                                if need_xcf_products {
-                                    apply_delay_and_rate_regular_bins_range(
-                                        &mut st.s2,
-                                        fft_len,
-                                        df_hz,
-                                        frac_delay2,
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        false,
-                                        ba.a2s,
-                                        ba.a2s + (ba.a1e - ba.a1s),
-                                    );
-                                    apply_delay_and_rate_regular_bins_range(
-                                        &mut st.s1,
-                                        fft_len,
-                                        df_hz,
-                                        frac_delay1,
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        false,
-                                        ba.a1s,
-                                        ba.a1e,
-                                    );
-                                }
                                 if need_acf_products {
                                     if acf_overlap_only {
                                         for k in 0..overlap_len {
@@ -2178,31 +2515,28 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         for k in 0..half {
                                             st.acc_22[k] += st.s2[k].norm_sqr() as f64;
                                         }
-                                        if need_xcf_products {
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_11[i2] += st.s1[i1].norm_sqr() as f64;
-                                                let v = (st.s1[i1] * st.s2[i2].conj()) * fr_mix;
-                                                st.acc_12[i2] += Complex::new(v.re as f64, v.im as f64);
-                                            }
-                                        } else {
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_11[i2] += st.s1[i1].norm_sqr() as f64;
-                                            }
+                                        for k in 0..overlap_len {
+                                            let i1 = ba.a1s + k;
+                                            let i2 = ba.a2s + k;
+                                            st.acc_11[i2] += st.s1[i1].norm_sqr() as f64;
                                         }
                                     }
                                 }
                                 if need_xcf_products {
-                                    if !(need_acf_products && !acf_overlap_only) {
-                                        for k in 0..overlap_len {
-                                            let i1 = ba.a1s + k;
-                                            let i2 = ba.a2s + k;
-                                            let v = (st.s1[i1] * st.s2[i2].conj()) * fr_mix;
-                                            st.acc_12[i2] += Complex::new(v.re as f64, v.im as f64);
-                                        }
+                                    let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                                        df_hz,
+                                        frac_delay1,
+                                        frac_delay2,
+                                        ba.a1s,
+                                        ba.a2s,
+                                    );
+                                    for k in 0..overlap_len {
+                                        let i1 = ba.a1s + k;
+                                        let i2 = ba.a2s + k;
+                                        let v =
+                                            (st.s1[i1] * st.s2[i2].conj()) * fr_mix * phase_corr;
+                                        st.acc_12[i2] += Complex::new(v.re as f64, v.im as f64);
+                                        phase_corr *= phase_step;
                                     }
                                 }
                             }

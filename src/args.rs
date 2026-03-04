@@ -140,11 +140,24 @@ pub struct Args {
     #[arg(long, value_name = "N", help = "Reader chunk size [frames] (auto when omitted)")]
     pub chunk_frames: Option<usize>,
 
+    #[arg(
+        long = "razoku5bay",
+        help = "Force small I/O chunking at 0.5-second intervals (overrides --chunk-frames)"
+    )]
+    pub razoku5bay: bool,
+
     #[arg(long, value_name = "N", help = "Reader-worker queue depth [chunks] (auto when omitted)")]
     pub pipeline_depth: Option<usize>,
 
-    #[arg(long, help = "Enable per-frame debug logging to file")]
+    #[arg(long, help = "Enable diagnostic debug logging to file (all frames)")]
     pub debug: bool,
+
+    #[arg(
+        long = "stdout",
+        default_value_t = false,
+        help = "Write yi-corr runtime stdout log to ./stdout/stdout_<yyyydddhhmmss>.log"
+    )]
+    pub stdout: bool,
 
     #[arg(long, hide = true, value_name = "N")]
     pub process_index: Option<usize>,

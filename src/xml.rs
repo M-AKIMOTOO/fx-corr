@@ -6,6 +6,13 @@ use roxmltree::{Document, Node};
 use crate::ifile::{IFileData, ProcessEntry};
 use crate::utils::DynError;
 
+#[derive(Clone, Debug)]
+struct ClockEntry {
+    delay_s: f64,
+    rate_sps: f64,
+    epoch: Option<String>,
+}
+
 fn is_tag(node: Node<'_, '_>, tag: &str) -> bool {
     node.is_element() && node.tag_name().name().eq_ignore_ascii_case(tag)
 }
@@ -181,7 +188,7 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
     let ant1_rotation_hz = sp1.map(|n| parse_opt_f64(n, "rotation")).transpose()?.flatten();
     let ant2_rotation_hz = sp2.map(|n| parse_opt_f64(n, "rotation")).transpose()?.flatten();
 
-    let clock_by_key: HashMap<String, (f64, f64)> = doc
+    let clock_by_key: HashMap<String, ClockEntry> = doc
         .descendants()
         .filter(|n| is_tag(*n, "clock"))
         .filter_map(|n| {
@@ -192,11 +199,31 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
             let rate = child_text(n, "rate")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.0);
-            Some((key, (delay, rate)))
+            let epoch = child_text(n, "epoch").map(|s| s.to_string());
+            Some((
+                key,
+                ClockEntry {
+                    delay_s: delay,
+                    rate_sps: rate,
+                    epoch,
+                },
+            ))
         })
         .collect();
-    let (delay1, rate1) = clock_by_key.get(&ant1_key).copied().unwrap_or((0.0, 0.0));
-    let (delay2, rate2) = clock_by_key.get(&ant2_key).copied().unwrap_or((0.0, 0.0));
+    let clock1 = clock_by_key.get(&ant1_key).cloned().unwrap_or(ClockEntry {
+        delay_s: 0.0,
+        rate_sps: 0.0,
+        epoch: None,
+    });
+    let clock2 = clock_by_key.get(&ant2_key).cloned().unwrap_or(ClockEntry {
+        delay_s: 0.0,
+        rate_sps: 0.0,
+        epoch: None,
+    });
+    let delay1 = clock1.delay_s;
+    let rate1 = clock1.rate_sps;
+    let delay2 = clock2.delay_s;
+    let rate2 = clock2.rate_sps;
     let clock_delay_s = Some(delay2 - delay1);
     let clock_rate_sps = Some(rate2 - rate1);
 
@@ -297,6 +324,8 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         ant2_clock_delay_s: Some(delay2),
         ant1_clock_rate_sps: Some(rate1),
         ant2_clock_rate_sps: Some(rate2),
+        ant1_clock_epoch: clock1.epoch,
+        ant2_clock_epoch: clock2.epoch,
         ant1_sideband,
         ant2_sideband,
         ant1_rotation_hz,

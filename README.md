@@ -31,6 +31,14 @@ cd /home/akimoto/program/rust/fx-corr
 cargo build --release
 ```
 
+`fx-corr` now performs configure-like host probing at build time (`build.rs`):
+
+- logical CPU count
+- L3 cache size (Linux `/sys/devices/system/cpu/cpu0/cache/...`)
+
+These build-time values are used as defaults for automatic `yi-corr` tuning
+(`--cpu` omitted, `--chunk-frames` omitted). Manual CLI values still override.
+
 Binaries are created under `target/release/`:
 
 - `target/release/yi-acf`
@@ -104,6 +112,7 @@ Important nodes:
   - `<name>`, `<pos-x>`, `<pos-y>`, `<pos-z>`, `<terminal>`
 - `<clock key="A">`
   - `<delay>`, `<rate>` (seconds, seconds/second)
+  - optional `<epoch>` clock-reference UTC (`delay` is interpreted at this epoch, then propagated to each process epoch using `rate`)
 - `<terminal name="...">`
   - `<speed>` (Hz), `<bit>`, `<level>`
 - `<shuffle key="A">`
@@ -173,6 +182,10 @@ Additionally, a run summary log is appended to:
 
 - `<schedule.xml>.stdout.txt`
 
+For `yi-corr`, full runtime stdout is also streamed when `--stdout` is specified:
+
+- `./stdout/stdout_<yyyydddhhmmss>.log` (created at command start time)
+
 ## Key CLI options
 
 Core:
@@ -190,7 +203,7 @@ Signal/processing:
 - `--level ...`
 - `--shuffle ...`
 - `--sideband LSB|USB`
-- `--coarse <s>`
+- `--coarse <s>` (default: `0.0`)
 - `--delay <samples>`
 - `--rate <Hz>`
 - `--resdelay <samples>`
@@ -198,6 +211,89 @@ Signal/processing:
 - `--rotation ...`
 - `--skip <s>`
 - `--length <s>`
+
+### Delay Compensation Model
+
+`yi-corr` applies delay correction in two parts for each FFT frame:
+
+1. Integer-sample shift in time domain
+2. Fractional-sample phase rotation in frequency domain
+
+Per frame, total delay is evaluated at frame midpoint (`t_mid`) from geometric/clock/residual terms:
+
+- `tau(t) = d + r*t + 0.5*a*t^2` (plus configured clock/residual terms)
+
+Then it is split as:
+
+- `n = round(tau * fs)` (integer samples)
+- `eps = tau - n/fs` (fractional seconds)
+
+This `round` split is intentional because it minimizes fractional residual:
+
+- `eps` is always within about `[-0.5, +0.5]` sample
+- Example: `12.983` samples is handled as `n=13`, `eps=-0.017` sample
+- Example: `12.345` samples is handled as `n=12`, `eps=+0.345` sample
+
+Fractional correction is applied as per-bin complex phase rotation:
+
+- `X(f) <- X(f) * exp(-j*2*pi*f*eps)`
+
+For packed quantized input (for example 2-bit/sample), integer sample shift corresponds to a bit offset conceptually:
+
+- `bit_shift = n * bits_per_sample`
+- For 2-bit sampling: `n=12` samples means `24` bits (`3` bytes)
+
+Implementation note:
+
+- The correlator decodes packed bits to samples first, then applies integer sample shift on decoded samples.
+- This is equivalent to sample-aligned packed-bit shifting for delay compensation, while keeping the code path simple and robust.
+
+### Geometric Delay / Rate / Accel and Doppler Tracking
+
+Geometric terms are computed from:
+
+- antenna ECEF coordinates (`<station><pos-x/pos-y/pos-z>`)
+- source RA/Dec
+- epoch (MJD)
+- Earth rotation (sidereal-time rotation via ERFA)
+
+In other words, geometric delay/rate/accel include Earth-rotation-driven fringe-rate (geometric Doppler tracking term).
+
+Conceptually:
+
+- `tau_geom = -((b2 - b1) · s) / c`
+- `rate_geom` and `accel_geom` are time derivatives of `tau_geom`
+
+Important behavior:
+
+- If both antennas are set to the same coordinates (including both `[0, 0, 0]`), baseline vector is zero.
+- Then geometric delay/rate/accel become approximately zero, so geometric Doppler tracking is effectively disabled.
+- Clock/rate/rotation/user terms are still applied independently; only the geometric component is removed.
+
+Note:
+
+- If station coordinates are omitted in XML, built-in defaults are used (not zero), so geometric tracking remains enabled.
+
+### Cor Normalization (Quantization-Loss Corrected)
+
+`yi-corr` writes `.cor` with a fixed, physically motivated normalization (GICO3-compatible), including quantization-loss correction.
+
+- Core formula:
+  - `inv = 1 / (0.5 * P * nf * fft^2)`
+  - `nf`: number of integrated FFT frames in the sector
+  - `fft`: FFT length
+  - `P`: quantization power term from level map
+- Quantization power terms:
+  - `P11 = mean(level1^2)` for `A1xA1`
+  - `P22 = mean(level2^2)` for `A2xA2`
+  - `P12 = sqrt(P11 * P22)` for `A1xA2`
+- Example (typical 2-bit levels `[-1.5, 0.5, -0.5, 1.5]`):
+  - `mean(level^2) = 1.25` (quantization-loss correction term)
+
+About the `0.5` factor:
+
+- This `0.5` is for **one-sided FFT storage** (`0..Nyquist` bins only in `.cor`).
+- It is **not** the same concept as receiver **LSB/USB sideband** setting.
 
 Performance:
 
@@ -207,7 +303,8 @@ Performance:
 
 Diagnostics:
 
-- `--debug` (writes per-frame debug log)
+- `--stdout` (yi-corr only; write runtime stdout log to `./stdout/stdout_<yyyydddhhmmss>.log`)
+- `--debug` (writes full-frame debug log to `<schedule_dir>/debug_yi-corr/debug_<epoch>.log`)
 - `--mkxml`
 
 Advanced hidden:
@@ -276,6 +373,64 @@ time target/release/yi-corr \
   - Commonly due to storage/cache state, not algorithmic change.
 - Need ACF and XCF together
   - Use `yi-corr` (not `yi-xcf` only).
+
+## External RAID (3 Gbps) operation tip
+
+If raw data is on slow external RAID, total time can be dominated by I/O.
+Use staged continuous processing:
+
+1. stage next scan from external RAID to local fast cache
+2. run `yi-corr` on local cache
+3. overlap 1 and 2 (one-scan-ahead)
+
+Helper:
+
+```bash
+python3 tools/continuous_corr_runner.py \
+  --schedule /path/to/obs.xml \
+  --raw-src-dir /mnt/external/raw \
+  --cache-dir /tmp/yi-corr-cache \
+  --cor-dir /path/to/cor \
+  --yi-corr-bin target/release/yi-corr \
+  --cpu 18 --chunk-frames 65536 --pipeline-depth 8
+```
+
+Notes:
+
+- This keeps correlation throughput near `max(stage I/O, yi-corr compute)`.
+- With two 2-bit streams at 1024 Msps, required input is about 4.096 Gbps; a 3 Gbps link cannot achieve true real-time without reducing data rate.
+
+## Phase Check (No Fixed Offset)
+
+When you want to test phase consistency without fitting a constant offset `C`,
+use:
+
+- `phi_pred = wrap180(360 * f_peak * delta_tau)`
+- `residual = wrap180(phi_obs - phi_pred)`
+
+Helper script:
+
+```bash
+python3 tools/phase_no_offset_check.py \
+  --yi yi-corr-freq.txt \
+  --ref gico3-freq.txt \
+  --debug-dir /path/to/debug_yi-corr \
+  --min-snr 20
+```
+
+Notes:
+
+- By default, rows where yi/ref peak frequency differs are skipped.
+- `delta_tau` is derived from each `debug_*.log` seek diagnostics.
+- If debug logs are unavailable, you can use a fixed sample offset:
+
+```bash
+python3 tools/phase_no_offset_check.py \
+  --yi yi-corr-freq.txt \
+  --ref gico3-freq.txt \
+  --delta-samples 5.3 \
+  --allow-freq-mismatch
+```
 
 ## License
 
