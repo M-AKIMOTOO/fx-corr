@@ -14,10 +14,10 @@ use std::ffi::OsString;
 use std::fs::{read_to_string, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use num_complex::Complex;
@@ -1748,6 +1748,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             io_chunk_frames, io_pipeline_depth
         );
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<Vec<u8>>, String>>(io_pipeline_depth);
+        let xcf_produced_chunks = Arc::new(AtomicUsize::new(0));
+        let xcf_produced_bytes = Arc::new(AtomicU64::new(0));
+        let xcf_consumed_chunks = Arc::new(AtomicUsize::new(0));
         let (r1_p, r2_p, s1_b, s2_b) = (
             a1p.clone(),
             a2p.clone(),
@@ -1755,6 +1758,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             start_s2_byte,
         );
         let (s1_bit, s2_bit) = (start_s1_bit, start_s2_bit);
+        let xcf_produced_chunks_rd = Arc::clone(&xcf_produced_chunks);
+        let xcf_produced_bytes_rd = Arc::clone(&xcf_produced_bytes);
         thread::spawn(move || {
             let mut rd1 = match PackedSampleReader::open(&r1_p, s1_b, s1_bit) {
                 Ok(v) => v,
@@ -1782,9 +1787,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     let _ = tx.send(Err(format!("failed reading ant2 input: {e}")));
                     return;
                 }
+                let chunk_bytes = (b1.len() + b2.len()) as u64;
                 if tx.send(Ok(vec![b1, b2])).is_err() {
                     return;
                 }
+                xcf_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
+                xcf_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
                 nf += n;
             }
         });
@@ -1795,9 +1803,22 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let mut processed = 0;
         let mut dropped_xcf_frames = 0usize;
         let inv_fft2 = 1.0 / (fft_len as f64).powi(2);
+        let xcf_stats_start = Instant::now();
+        let mut xcf_last_report_at = xcf_stats_start;
+        let mut xcf_read_bytes_total: u64 = 0;
+        let mut xcf_last_report_bytes: u64 = 0;
+        let mut xcf_queue_hwm = 0usize;
         for bufs_res in rx {
             let bufs = bufs_res.map_err(|e| std::io::Error::other(format!("xcf reader error: {e}")))?;
+            xcf_consumed_chunks.fetch_add(1, Ordering::Relaxed);
             let (raw1, raw2) = (&bufs[0], &bufs[1]); let nf = raw1.len() / bpf1;
+            xcf_read_bytes_total += (raw1.len() + raw2.len()) as u64;
+            let produced = xcf_produced_chunks.load(Ordering::Relaxed);
+            let consumed = xcf_consumed_chunks.load(Ordering::Relaxed);
+            let queue_fill = produced.saturating_sub(consumed);
+            if queue_fill > xcf_queue_hwm {
+                xcf_queue_hwm = queue_fill;
+            }
             let frame_delays: Vec<FrameDelayEntry> = (0..nf)
                 .map(|i| compute_frame_delay_entry(processed + i, &delay_cfg))
                 .collect();
@@ -1916,8 +1937,43 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             processed += nf;
             print!("\rCorrelating ({}/{})", processed, total_f);
             let _ = std::io::stdout().flush();
+            if !args.compact_logs && xcf_last_report_at.elapsed() >= Duration::from_secs(2) {
+                let elapsed = xcf_stats_start.elapsed().as_secs_f64().max(1e-9);
+                let dt = xcf_last_report_at.elapsed().as_secs_f64().max(1e-9);
+                let avg_mib_s = (xcf_read_bytes_total as f64 / (1024.0 * 1024.0)) / elapsed;
+                let inst_mib_s = ((xcf_read_bytes_total - xcf_last_report_bytes) as f64
+                    / (1024.0 * 1024.0))
+                    / dt;
+                println!(
+                    "\n[info] XCF I/O reader: avg={:.1} MiB/s inst={:.1} MiB/s queue={}/{} hwm={}/{}",
+                    avg_mib_s,
+                    inst_mib_s,
+                    queue_fill,
+                    io_pipeline_depth,
+                    xcf_queue_hwm,
+                    io_pipeline_depth
+                );
+                xcf_last_report_at = Instant::now();
+                xcf_last_report_bytes = xcf_read_bytes_total;
+            }
         }
         println!();
+        if !args.compact_logs {
+            let elapsed = xcf_stats_start.elapsed().as_secs_f64().max(1e-9);
+            let avg_mib_s = (xcf_read_bytes_total as f64 / (1024.0 * 1024.0)) / elapsed;
+            let produced = xcf_produced_chunks.load(Ordering::Relaxed);
+            let consumed = xcf_consumed_chunks.load(Ordering::Relaxed);
+            let queue_fill = produced.saturating_sub(consumed);
+            println!(
+                "[info] XCF I/O reader summary: avg={:.1} MiB/s total={:.1} MiB queue_end={}/{} hwm={}/{}",
+                avg_mib_s,
+                xcf_read_bytes_total as f64 / (1024.0 * 1024.0),
+                queue_fill,
+                io_pipeline_depth,
+                xcf_queue_hwm,
+                io_pipeline_depth
+            );
+        }
         if dropped_xcf_frames > 0 {
             println!(
                 "[warn] XCF skipped {} frame(s) due to decode/FFT errors",
@@ -2099,9 +2155,14 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let sec_counts_for_read = sec_counts.clone();
         let (tx_sec, rx_sec) =
             mpsc::sync_channel::<Result<(Vec<u8>, Vec<u8>), String>>(prefetch_depth);
+        let synth_produced_chunks = Arc::new(AtomicUsize::new(0));
+        let synth_produced_bytes = Arc::new(AtomicU64::new(0));
+        let synth_consumed_chunks = Arc::new(AtomicUsize::new(0));
         let (a1_read, a2_read) = (a1p.clone(), a2p.clone());
         let (s1_b, s2_b) = (start_s1_byte, start_s2_byte);
         let (s1_bit, s2_bit) = (start_s1_bit, start_s2_bit);
+        let synth_produced_chunks_rd = Arc::clone(&synth_produced_chunks);
+        let synth_produced_bytes_rd = Arc::clone(&synth_produced_bytes);
         let reader_handle = thread::spawn(move || {
             let mut pr1 = match PackedSampleReader::open(&a1_read, s1_b, s1_bit) {
                 Ok(v) => v,
@@ -2134,9 +2195,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     let _ = tx_sec.send(Err(format!("failed reading ant2 input: {e}")));
                     return;
                 }
+                let chunk_bytes = (b1.len() + b2.len()) as u64;
                 if tx_sec.send(Ok((b1, b2))).is_err() {
                     return;
                 }
+                synth_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
+                synth_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
             }
         });
         let need_phased_products = write_raw || write_phased_cor || plot_phased;
@@ -2153,6 +2217,11 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         };
         let mut acc_11_total = vec![0.0; fft_len/2+1];
         let mut acc_22_total = vec![0.0; fft_len/2+1];
+        let synth_stats_start = Instant::now();
+        let mut synth_last_report_at = synth_stats_start;
+        let mut synth_read_bytes_total: u64 = 0;
+        let mut synth_last_report_bytes: u64 = 0;
+        let mut synth_queue_hwm = 0usize;
         for (si, &nf) in sec_counts.iter().enumerate() {
             let frame_delays: Vec<FrameDelayEntry> = (0..nf)
                 .map(|i| compute_frame_delay_entry(emitted + i, &delay_cfg))
@@ -2191,8 +2260,16 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     .into())
                 }
             };
+            synth_consumed_chunks.fetch_add(1, Ordering::Relaxed);
             let raw1: &[u8] = &raw1_vec;
             let raw2: &[u8] = &raw2_vec;
+            synth_read_bytes_total += (raw1.len() + raw2.len()) as u64;
+            let produced = synth_produced_chunks.load(Ordering::Relaxed);
+            let consumed = synth_consumed_chunks.load(Ordering::Relaxed);
+            let queue_fill = produced.saturating_sub(consumed);
+            if queue_fill > synth_queue_hwm {
+                synth_queue_hwm = queue_fill;
+            }
             let sector_failures = AtomicUsize::new(0);
             let process_frame = |i: usize, out_f: Option<&mut [u8]>| -> Option<(Vec<f64>, Vec<f64>, Vec<Complex<f64>>, Vec<f64>)> {
                 let d = frame_delays[i];
@@ -2589,6 +2666,25 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 );
             }
             std::io::stdout().flush()?;
+            if !args.compact_logs && synth_last_report_at.elapsed() >= Duration::from_secs(2) {
+                let elapsed = synth_stats_start.elapsed().as_secs_f64().max(1e-9);
+                let dt = synth_last_report_at.elapsed().as_secs_f64().max(1e-9);
+                let avg_mib_s = (synth_read_bytes_total as f64 / (1024.0 * 1024.0)) / elapsed;
+                let inst_mib_s = ((synth_read_bytes_total - synth_last_report_bytes) as f64
+                    / (1024.0 * 1024.0))
+                    / dt;
+                println!(
+                    "\n[info] Synth I/O reader: avg={:.1} MiB/s inst={:.1} MiB/s queue={}/{} hwm={}/{}",
+                    avg_mib_s,
+                    inst_mib_s,
+                    queue_fill,
+                    prefetch_depth,
+                    synth_queue_hwm,
+                    prefetch_depth
+                );
+                synth_last_report_at = Instant::now();
+                synth_last_report_bytes = synth_read_bytes_total;
+            }
             if let Some(acc_ph) = acc_ph_total.as_mut() {
                 for k in 0..acc_ph.len() {
                     acc_ph[k] += batch_ph[k];
@@ -2641,6 +2737,22 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         drop(rx_sec);
         if reader_handle.join().is_err() {
             return Err("synth reader thread panicked".into());
+        }
+        if !args.compact_logs {
+            let elapsed = synth_stats_start.elapsed().as_secs_f64().max(1e-9);
+            let avg_mib_s = (synth_read_bytes_total as f64 / (1024.0 * 1024.0)) / elapsed;
+            let produced = synth_produced_chunks.load(Ordering::Relaxed);
+            let consumed = synth_consumed_chunks.load(Ordering::Relaxed);
+            let queue_fill = produced.saturating_sub(consumed);
+            println!(
+                "[info] Synth I/O reader summary: avg={:.1} MiB/s total={:.1} MiB queue_end={}/{} hwm={}/{}",
+                avg_mib_s,
+                synth_read_bytes_total as f64 / (1024.0 * 1024.0),
+                queue_fill,
+                prefetch_depth,
+                synth_queue_hwm,
+                prefetch_depth
+            );
         }
         if !sec_counts.is_empty() {
             println!();
