@@ -1,0 +1,5 @@
+[build]
+# Optimize generated code for the current host CPU.
+# This improves throughput for FFT/correlation workloads on this machine.
+rustflags = ["-C", "target-cpu=native"]
+

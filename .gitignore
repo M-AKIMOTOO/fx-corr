@@ -1,0 +1,12 @@
+*.png
+target
+*.zip
+*.raw
+*.cor
+cor
+raw
+*.txt
+*.pdf
+*.ps
+
+
