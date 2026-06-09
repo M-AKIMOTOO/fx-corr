@@ -440,11 +440,26 @@ fn ant_lsb_override(original: bool, var: &str) -> bool {
 }
 
 fn fx_integer_delay_enabled() -> bool {
+    // Production default: ON.
+    //
+    // yi-corr uses the same FX delay-correction path for short baselines,
+    // long VLBI baselines, continuum sources, and maser sources.
+    //
+    // Normal path:
+    //   integer sample delay -> raw/decode FFT-window shift
+    //   fractional delay     -> frequency-domain phase slope
+    //
+    // Set YI_FX_INT_DELAY=0/false/no/off only when intentionally reproducing
+    // the old legacy behavior for debugging.
     std::env::var("YI_FX_INT_DELAY")
         .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .map(|v| v != 0)
-        .unwrap_or(false)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off" | "legacy"
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn fx_read_offset_samples() -> i64 {
@@ -3607,15 +3622,33 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             let sector_ref_frame = sector_start_frame + nf / 2;
             let sector_ref =
                 compute_frame_delay_entry(sector_ref_frame, &delay_cfg, delay_cfg.d_seek);
-            let sector_d_seek_samples = (sector_ref.full_rel_s * fs).round() as i128;
-            let delta_samples = sector_d_seek_samples - d_seek_samples;
+
+            // Keep the physical read branch and the delay-model branch
+            // consistent.  In fixed-process mode, both must remain tied to the
+            // initial process d_seek.  Only adaptive-sector read-align is
+            // allowed to move the raw/decode window and update the sector
+            // d_seek.  Otherwise the read branch silently changes at the
+            // +/-0.5 sample boundaries even though the log says fixed-process.
+            let sector_d_seek_samples = if use_sector_readalign {
+                (sector_ref.full_rel_s * fs).round() as i128
+            } else {
+                d_seek_samples
+            };
+            let delta_samples = if use_sector_readalign {
+                sector_d_seek_samples - d_seek_samples
+            } else {
+                0
+            };
+
             let common_samples = sector_start_frame as i128 * fft_len as i128;
             let mut sector_s1 = start_s1_actual_samples as i128 + common_samples;
             let mut sector_s2 = start_s2_actual_samples as i128 + common_samples;
-            if residual_on_ant2 {
-                sector_s2 += delta_samples;
-            } else {
-                sector_s1 -= delta_samples;
+            if use_sector_readalign {
+                if residual_on_ant2 {
+                    sector_s2 += delta_samples;
+                } else {
+                    sector_s1 -= delta_samples;
+                }
             }
             if sector_s1 < 0 || sector_s2 < 0 {
                 return Err(format!(
