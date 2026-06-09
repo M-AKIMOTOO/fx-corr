@@ -117,7 +117,11 @@ fn map_requested_to_core_ids(requested: &[usize]) -> Option<Vec<core_affinity::C
             out.push(*c);
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub struct AffinityRuntime {

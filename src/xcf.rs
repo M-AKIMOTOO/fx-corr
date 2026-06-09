@@ -1,6 +1,6 @@
+use num_complex::Complex;
 use std::cmp::Ordering;
 use std::path::Path;
-use num_complex::Complex;
 
 use crate::plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE, GREEN};
 use crate::utils::{safe_arg, unwrap_phase, DynError, FftHelper};
@@ -56,8 +56,11 @@ pub fn finalize_cross_spectrum(
     let df_hz = sampling_rate_hz / fft_len as f64;
     let freqs_mhz: Vec<f64> = (0..accumulated_cross_spec.len())
         .map(|i| {
-            if is_lsb { (sky_low_mhz + bw_mhz) - (i as f64 * df_hz) / 1e6 }
-            else { sky_low_mhz + (i as f64 * df_hz) / 1e6 }
+            if is_lsb {
+                (sky_low_mhz + bw_mhz) - (i as f64 * df_hz) / 1e6
+            } else {
+                sky_low_mhz + (i as f64 * df_hz) / 1e6
+            }
         })
         .collect();
 
@@ -109,8 +112,10 @@ pub fn finalize_cross_spectrum(
             .iter()
             .map(|r| r.to_degrees())
             .collect();
-        let phase_fit_line_deg: Vec<f64> = phase_fit_line_rad.iter().map(|r| r.to_degrees()).collect();
-        let phase_spectrum_deg: Vec<f64> = phase_spectrum_rad.iter().map(|r| r.to_degrees()).collect();
+        let phase_fit_line_deg: Vec<f64> =
+            phase_fit_line_rad.iter().map(|r| r.to_degrees()).collect();
+        let phase_spectrum_deg: Vec<f64> =
+            phase_spectrum_rad.iter().map(|r| r.to_degrees()).collect();
 
         let phase_plot_freqs: &[f64] = if freqs_mhz.len() > 1 {
             &freqs_mhz[1..]
@@ -214,7 +219,10 @@ pub fn finalize_cross_spectrum(
         println!("\nIntegration finished. Finalizing correlation...");
         let mut full_cross_spec = vec![Complex::new(0.0_f32, 0.0_f32); fft_len];
         for i in 0..half_spec_len {
-            full_cross_spec[i] = Complex::new(accumulated_cross_spec[i].re as f32, accumulated_cross_spec[i].im as f32);
+            full_cross_spec[i] = Complex::new(
+                accumulated_cross_spec[i].re as f32,
+                accumulated_cross_spec[i].im as f32,
+            );
         }
         if fft_len > 1 {
             let mirror_limit = if fft_len % 2 == 0 {

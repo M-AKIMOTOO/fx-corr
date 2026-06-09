@@ -132,8 +132,8 @@ fn split_sec_nsec(unix_sec: i64, extra_sec: f64) -> Result<(u32, u32), DynError>
     } else {
         (sec_i64, nsec_u32)
     };
-    let sec_u32 = u32::try_from(sec_i64)
-        .map_err(|_| "sector sec out of u32 range for .cor sector header")?;
+    let sec_u32 =
+        u32::try_from(sec_i64).map_err(|_| "sector sec out of u32 range for .cor sector header")?;
     let nsec_u32 = u32::try_from(nsec_u32)
         .map_err(|_| "sector nsec out of u32 range for .cor sector header")?;
     Ok((sec_u32, nsec_u32))

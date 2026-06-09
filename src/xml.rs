@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use roxmltree::{Document, Node};
@@ -31,6 +31,15 @@ fn parse_opt_f64(node: Node<'_, '_>, tag: &str) -> Result<Option<f64>, DynError>
     })
 }
 
+fn parse_opt_f64_any(node: Node<'_, '_>, tags: &[&str]) -> Result<Option<f64>, DynError> {
+    for tag in tags {
+        if let Some(value) = parse_opt_f64(node, tag)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
 fn parse_station_ecef(node: Node<'_, '_>) -> Result<Option<[f64; 3]>, DynError> {
     let x = parse_opt_f64(node, "pos-x")?;
     let y = parse_opt_f64(node, "pos-y")?;
@@ -41,53 +50,248 @@ fn parse_station_ecef(node: Node<'_, '_>) -> Result<Option<[f64; 3]>, DynError> 
     })
 }
 
-fn pick_ant_keys<'a>(
+fn process_station_keys<'a>(
     process: Node<'a, 'a>,
     station_by_key: &HashMap<String, Node<'a, 'a>>,
-) -> Result<(String, String), DynError> {
-    if let Some(stations) = child_text(process, "stations") {
-        let keys: Vec<String> = stations
+) -> Result<Vec<String>, DynError> {
+    let keys = if let Some(stations) = child_text(process, "stations") {
+        stations
             .chars()
             .filter(|c| !c.is_whitespace())
             .map(|c| c.to_string())
-            .collect();
-        if keys.len() >= 2 {
-            return Ok((keys[0].clone(), keys[1].clone()));
+            .collect::<Vec<_>>()
+    } else {
+        let mut keys = station_by_key.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    };
+    if keys.len() < 2 {
+        return Err("process/stations must contain at least two station keys".into());
+    }
+    for key in &keys {
+        if !station_by_key.contains_key(key) {
+            return Err(format!("station key '{}' not found", key).into());
         }
     }
-    let mut keys: Vec<String> = station_by_key.keys().cloned().collect();
-    keys.sort();
-    if keys.len() >= 2 {
-        return Ok((keys[0].clone(), keys[1].clone()));
+    Ok(keys)
+}
+
+fn process_baseline_pairs(
+    process: Node<'_, '_>,
+    keys: &[String],
+    station_by_key: &HashMap<String, Node<'_, '_>>,
+) -> Result<Vec<(String, String)>, DynError> {
+    let baseline_text = process
+        .children()
+        .filter(|n| is_tag(*n, "baseline"))
+        .filter_map(|n| n.text())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if baseline_text.is_empty() {
+        let mut pairs = Vec::new();
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                pairs.push((keys[i].clone(), keys[j].clone()));
+            }
+        }
+        return Ok(pairs);
     }
-    Err("failed to determine ant1/ant2 station keys from XML".into())
+
+    let raw_tokens = baseline_text
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    let key_set = keys.iter().cloned().collect::<HashSet<_>>();
+    let mut required = HashSet::new();
+    for i in 0..keys.len() {
+        for j in (i + 1)..keys.len() {
+            required.insert(canonical_pair(&keys[i], &keys[j]));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut pairs = Vec::new();
+    for raw in raw_tokens {
+        let compact = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>();
+        if compact.is_empty() {
+            continue;
+        }
+        if compact.len() % 2 != 0 {
+            return Err(format!(
+                "process/baseline entry '{}' must contain 2 station keys",
+                raw
+            )
+            .into());
+        }
+        let chars = compact.chars().collect::<Vec<_>>();
+        for pair in chars.chunks(2) {
+            let k1 = pair[0].to_string();
+            let k2 = pair[1].to_string();
+            if k1 == k2 {
+                return Err(
+                    format!("process/baseline '{}' uses the same station twice", raw).into(),
+                );
+            }
+            if !station_by_key.contains_key(&k1) {
+                return Err(format!("station key '{}' in process/baseline not found", k1).into());
+            }
+            if !station_by_key.contains_key(&k2) {
+                return Err(format!("station key '{}' in process/baseline not found", k2).into());
+            }
+            if !key_set.contains(&k1) || !key_set.contains(&k2) {
+                return Err(format!(
+                    "process/baseline '{}' is not contained in process/stations",
+                    raw
+                )
+                .into());
+            }
+            let closure_pair = canonical_pair(&k1, &k2);
+            if !seen.insert(closure_pair.clone()) {
+                return Err(format!(
+                    "process/baseline contains duplicate closure pair {}{}",
+                    closure_pair.0, closure_pair.1
+                )
+                .into());
+            }
+            pairs.push((k1, k2));
+        }
+    }
+    if pairs.is_empty() {
+        return Err("process/baseline did not contain any station-key pairs".into());
+    }
+    if seen != required {
+        let mut missing = required
+            .difference(&seen)
+            .map(|(a, b)| format!("{a}{b}"))
+            .collect::<Vec<_>>();
+        missing.sort();
+        let mut extra = seen
+            .difference(&required)
+            .map(|(a, b)| format!("{a}{b}"))
+            .collect::<Vec<_>>();
+        extra.sort();
+        let mut detail = Vec::new();
+        if !missing.is_empty() {
+            detail.push(format!("missing {}", missing.join(",")));
+        }
+        if !extra.is_empty() {
+            detail.push(format!("extra {}", extra.join(",")));
+        }
+        return Err(format!(
+            "process/baseline must form closure over process/stations ({})",
+            detail.join("; ")
+        )
+        .into());
+    }
+    Ok(pairs)
+}
+
+fn canonical_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
+fn push_process_entries(
+    out: &mut Vec<ProcessEntry>,
+    process: Node<'_, '_>,
+    keys: &[String],
+    station_by_key: &HashMap<String, Node<'_, '_>>,
+    source_radec_by_name: &HashMap<String, (String, String)>,
+) -> Result<(), DynError> {
+    let epoch = child_text(process, "epoch")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "2000".to_string());
+    let skip_sec = child_text(process, "skip")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let length_sec = child_text(process, "length").and_then(|s| s.trim().parse::<f64>().ok());
+    let object = child_text(process, "object").map(|s| s.trim().to_string());
+    let (ra, dec) = object
+        .as_ref()
+        .and_then(|obj| source_radec_by_name.get(obj))
+        .map(|(ra, dec)| (Some(ra.clone()), Some(dec.clone())))
+        .unwrap_or((None, None));
+
+    for (ant1_key, ant2_key) in process_baseline_pairs(process, keys, station_by_key)? {
+        let stations = format!("{}{}", ant1_key, ant2_key);
+        out.push(ProcessEntry {
+            epoch: epoch.clone(),
+            skip_sec,
+            length_sec,
+            object: object.clone(),
+            stations: Some(stations),
+            ra: ra.clone(),
+            dec: dec.clone(),
+            ant1_station_key: Some(ant1_key),
+            ant2_station_key: Some(ant2_key),
+        });
+    }
+    Ok(())
 }
 
 pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
+    parse_xml_schedule_for_process(path, None)
+}
+
+pub fn parse_xml_schedule_for_process(
+    path: &PathBuf,
+    selected_process_index: Option<usize>,
+) -> Result<IFileData, DynError> {
     let xml = std::fs::read_to_string(path)?;
     let doc = Document::parse(&xml)?;
 
-    let process_nodes: Vec<_> = doc.descendants().filter(|n| is_tag(*n, "process")).collect();
-    let process = *process_nodes
-        .first()
-        .ok_or("process node not found in XML schedule")?;
+    let eop_node = doc
+        .descendants()
+        .find(|n| is_tag(*n, "eop") || is_tag(*n, "earth-orientation"));
+    let delay_model_node = doc
+        .descendants()
+        .find(|n| is_tag(*n, "delay-model") || is_tag(*n, "delay_model"));
+    let dut1_s = eop_node
+        .map(|n| parse_opt_f64_any(n, &["dut1"]))
+        .transpose()?
+        .flatten();
+    let tt_utc_s = eop_node
+        .map(|n| parse_opt_f64_any(n, &["tt-utc", "tt_utc", "ttutc"]))
+        .transpose()?
+        .flatten();
+    let xp_arcsec = eop_node
+        .map(|n| parse_opt_f64_any(n, &["xp", "xpolar", "xp_arcsec"]))
+        .transpose()?
+        .flatten();
+    let yp_arcsec = eop_node
+        .map(|n| parse_opt_f64_any(n, &["yp", "ypolar", "yp_arcsec"]))
+        .transpose()?
+        .flatten();
+    let model_time_offset_s = delay_model_node
+        .map(|n| {
+            parse_opt_f64_any(
+                n,
+                &[
+                    "time-offset",
+                    "time_offset",
+                    "model-time-offset",
+                    "model_time_offset",
+                ],
+            )
+        })
+        .transpose()?
+        .flatten();
 
-    let process_epochs = process_nodes
-        .iter()
-        .filter_map(|p| child_text(*p, "epoch"))
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    let source_name = child_text(process, "object").map(|s| s.trim().to_string());
-    let epoch = child_text(process, "epoch").map(|s| s.trim().to_string());
-    let process_skip_sec = child_text(process, "skip")
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<f64>())
-        .transpose()?;
-    let process_length_sec = child_text(process, "length")
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<f64>())
-        .transpose()?;
+    let process_nodes: Vec<_> = doc
+        .descendants()
+        .filter(|n| is_tag(*n, "process"))
+        .collect();
+    if process_nodes.is_empty() {
+        return Err("process node not found in XML schedule".into());
+    }
 
     let station_by_key: HashMap<String, Node<'_, '_>> = doc
         .descendants()
@@ -95,7 +299,58 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         .filter_map(|n| n.attribute("key").map(|k| (k.trim().to_string(), n)))
         .collect();
 
-    let (ant1_key, ant2_key) = pick_ant_keys(process, &station_by_key)?;
+    let terminal_by_name: HashMap<String, Node<'_, '_>> = doc
+        .descendants()
+        .filter(|n| is_tag(*n, "terminal"))
+        .filter_map(|n| n.attribute("name").map(|name| (name.trim().to_string(), n)))
+        .collect();
+
+    let source_radec_by_name: HashMap<String, (String, String)> = doc
+        .descendants()
+        .filter(|n| is_tag(*n, "source"))
+        .filter_map(|n| {
+            let name = n.attribute("name")?.trim().to_string();
+            let ra = child_text(n, "ra")?.trim().to_string();
+            let dec = child_text(n, "dec")?.trim().to_string();
+            Some((name, (ra, dec)))
+        })
+        .collect();
+
+    let mut processes = Vec::new();
+    for process in &process_nodes {
+        let keys = process_station_keys(*process, &station_by_key)?;
+        push_process_entries(
+            &mut processes,
+            *process,
+            &keys,
+            &station_by_key,
+            &source_radec_by_name,
+        )?;
+    }
+    if processes.is_empty() {
+        return Err("no station baselines found in XML process entries".into());
+    }
+
+    let selected_process = if let Some(idx) = selected_process_index {
+        processes.get(idx).cloned().ok_or_else(|| {
+            format!(
+                "--process-index {} out of range (0..{})",
+                idx,
+                processes.len().saturating_sub(1)
+            )
+        })?
+    } else {
+        processes[0].clone()
+    };
+    let ant1_key = selected_process
+        .ant1_station_key
+        .clone()
+        .ok_or("selected process missing ant1 station key")?;
+    let ant2_key = selected_process
+        .ant2_station_key
+        .clone()
+        .ok_or("selected process missing ant2 station key")?;
+
     let station1 = *station_by_key
         .get(&ant1_key)
         .ok_or_else(|| format!("station key '{}' not found", ant1_key))?;
@@ -107,12 +362,6 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
     let ant2_station_name = child_text(station2, "name").map(|s| s.to_string());
     let ant1_ecef_m = parse_station_ecef(station1)?;
     let ant2_ecef_m = parse_station_ecef(station2)?;
-
-    let terminal_by_name: HashMap<String, Node<'_, '_>> = doc
-        .descendants()
-        .filter(|n| is_tag(*n, "terminal"))
-        .filter_map(|n| n.attribute("name").map(|name| (name.trim().to_string(), n)))
-        .collect();
 
     let term1_name = child_text(station1, "terminal").map(|s| s.to_string());
     let term2_name = child_text(station2, "terminal").map(|s| s.to_string());
@@ -128,7 +377,6 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         .or_else(|| term2.and_then(|t| child_text(t, "speed")))
         .map(|v| v.parse::<f64>())
         .transpose()?;
-
     let ant1_bit = term1
         .and_then(|t| child_text(t, "bit"))
         .map(|v| v.parse::<usize>())
@@ -137,9 +385,12 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         .and_then(|t| child_text(t, "bit"))
         .map(|v| v.parse::<usize>())
         .transpose()?;
-
-    let ant1_level = term1.and_then(|t| child_text(t, "level")).map(|s| s.to_string());
-    let ant2_level = term2.and_then(|t| child_text(t, "level")).map(|s| s.to_string());
+    let ant1_level = term1
+        .and_then(|t| child_text(t, "level"))
+        .map(|s| s.to_string());
+    let ant2_level = term2
+        .and_then(|t| child_text(t, "level"))
+        .map(|s| s.to_string());
 
     let shuffle_by_key: HashMap<String, String> = doc
         .descendants()
@@ -166,7 +417,7 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         .map(|v| v.parse::<usize>())
         .transpose()?;
 
-    let default_sideband = if frequency_hz < 0.0 { "LSB" } else { "USB" };
+    let default_sideband = "USB";
     let special_by_key: HashMap<String, Node<'_, '_>> = stream
         .children()
         .filter(|n| is_tag(*n, "special"))
@@ -174,7 +425,6 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         .collect();
     let sp1 = special_by_key.get(&ant1_key).copied();
     let sp2 = special_by_key.get(&ant2_key).copied();
-
     let ant1_sideband = Some(
         sp1.and_then(|n| child_text(n, "sideband"))
             .unwrap_or(default_sideband)
@@ -185,8 +435,22 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
             .unwrap_or(default_sideband)
             .to_uppercase(),
     );
-    let ant1_rotation_hz = sp1.map(|n| parse_opt_f64(n, "rotation")).transpose()?.flatten();
-    let ant2_rotation_hz = sp2.map(|n| parse_opt_f64(n, "rotation")).transpose()?.flatten();
+    let ant1_rotation_hz = sp1
+        .map(|n| parse_opt_f64(n, "rotation"))
+        .transpose()?
+        .flatten();
+    let ant2_rotation_hz = sp2
+        .map(|n| parse_opt_f64(n, "rotation"))
+        .transpose()?
+        .flatten();
+    let ant1_rotation2_hz = sp1
+        .map(|n| parse_opt_f64(n, "rotation2"))
+        .transpose()?
+        .flatten();
+    let ant2_rotation2_hz = sp2
+        .map(|n| parse_opt_f64(n, "rotation2"))
+        .transpose()?
+        .flatten();
 
     let clock_by_key: HashMap<String, ClockEntry> = doc
         .descendants()
@@ -227,6 +491,7 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
     let clock_delay_s = Some(delay2 - delay1);
     let clock_rate_sps = Some(rate2 - rate1);
 
+    let source_name = selected_process.object.clone();
     let source_node = if let Some(name) = source_name.as_deref() {
         doc.descendants()
             .find(|n| is_tag(*n, "source") && n.attribute("name").map(str::trim) == Some(name))
@@ -235,59 +500,23 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         doc.descendants().find(|n| is_tag(*n, "source"))
     }
     .ok_or("source node not found in XML schedule")?;
-    let ra = child_text(source_node, "ra").ok_or("source/ra missing")?.to_string();
-    let dec = child_text(source_node, "dec").ok_or("source/dec missing")?.to_string();
+    let ra = selected_process
+        .ra
+        .clone()
+        .or_else(|| child_text(source_node, "ra").map(|s| s.to_string()))
+        .ok_or("source/ra missing")?;
+    let dec = selected_process
+        .dec
+        .clone()
+        .or_else(|| child_text(source_node, "dec").map(|s| s.to_string()))
+        .ok_or("source/dec missing")?;
 
-    let source_radec_by_name: HashMap<String, (String, String)> = doc
-        .descendants()
-        .filter(|n| is_tag(*n, "source"))
-        .filter_map(|n| {
-            let name = n.attribute("name")?.trim().to_string();
-            let ra = child_text(n, "ra")?.trim().to_string();
-            let dec = child_text(n, "dec")?.trim().to_string();
-            Some((name, (ra, dec)))
-        })
-        .collect();
-
-    let processes: Vec<ProcessEntry> = process_nodes
+    let process_epochs = processes
         .iter()
-        .filter_map(|p| {
-            let epoch = child_text(*p, "epoch")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "2000".to_string());
-            let skip_sec = child_text(*p, "skip")
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let length_sec = child_text(*p, "length")
-                .and_then(|s| s.trim().parse::<f64>().ok());
-            let object = child_text(*p, "object").map(|s| s.trim().to_string());
-            let stations = child_text(*p, "stations").map(|s| s.trim().to_string());
-            if let Some(st) = stations.as_ref() {
-                let stn = st.replace(char::is_whitespace, "");
-                if !stn.contains(&ant1_key) || !stn.contains(&ant2_key) {
-                    return None;
-                }
-            }
-            let (ra_opt, dec_opt) = if let Some(obj) = object.as_ref() {
-                if let Some((ra, dec)) = source_radec_by_name.get(obj) {
-                    (Some(ra.clone()), Some(dec.clone()))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
-            Some(ProcessEntry {
-                epoch,
-                skip_sec,
-                length_sec,
-                object,
-                stations,
-                ra: ra_opt,
-                dec: dec_opt,
-            })
-        })
-        .collect();
+        .map(|p| p.epoch.clone())
+        .collect::<Vec<_>>();
+    let process_skip_sec = Some(selected_process.skip_sec);
+    let process_length_sec = selected_process.length_sec;
 
     let bw_mhz = sampling_hz.map(|fs| fs / 2e6);
     let ant1_bw_mhz = bw_mhz;
@@ -306,7 +535,7 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
     Ok(IFileData {
         ra,
         dec,
-        epoch,
+        epoch: Some(selected_process.epoch.clone()),
         source: source_name,
         stream_label,
         fft,
@@ -330,6 +559,8 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         ant2_sideband,
         ant1_rotation_hz,
         ant2_rotation_hz,
+        ant1_rotation2_hz,
+        ant2_rotation2_hz,
         ant1_center_mhz,
         ant2_center_mhz,
         ant1_bw_mhz,
@@ -344,6 +575,11 @@ pub fn parse_xml_schedule(path: &PathBuf) -> Result<IFileData, DynError> {
         process_skip_sec,
         process_length_sec,
         processes,
+        model_time_offset_s,
+        dut1_s,
+        tt_utc_s,
+        xp_arcsec,
+        yp_arcsec,
     })
 }
 
@@ -396,6 +632,10 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
   <clock key="A"><delay>0</delay><rate>0</rate></clock>
   <clock key="B"><delay>0</delay><rate>0</rate></clock>
 
+  <!-- EDIT: Earth orientation and delay-model reference -->
+  <eop><dut1>0.0</dut1><tt-utc>69.184</tt-utc><xp>0.0</xp><yp>0.0</yp></eop>
+  <delay-model><time-offset>0.0</time-offset></delay-model>
+
   <!-- EDIT: terminal settings -->
   <terminal name="term1"><speed>1024000000</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,+0.5,+1.5</level></terminal>
   <terminal name="term2"><speed>1024000000</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,+0.5,+1.5</level></terminal>
@@ -411,12 +651,12 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
   <stream>
     <frequency>0</frequency>
     <fft>16384</fft>
-    <special key="A"><rotation>0</rotation><sideband>LSB</sideband></special>
-    <special key="B"><rotation>0</rotation><sideband>LSB</sideband></special>
+    <special key="A"><rotation>0</rotation></special>
+    <special key="B"><rotation>0</rotation></special>
   </stream>
 
   <!-- EDIT: process -->
-  <process><epoch>2000/001 00:00:00</epoch><length>1</length><object>TARGET</object><stations>AB</stations></process>
+  <process><epoch>2000/001 00:00:00</epoch><length>1</length><object>TARGET</object><stations>AB</stations><baseline>AB</baseline></process>
 </schedule>
 "#;
     std::fs::write(path, template)?;

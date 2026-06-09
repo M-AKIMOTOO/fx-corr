@@ -440,31 +440,11 @@ fn ant_lsb_override(original: bool, var: &str) -> bool {
 }
 
 fn fx_integer_delay_enabled() -> bool {
-    // Production default: ON.
-    //
-    // yi-corr must use the same FX delay-correction path for short baselines,
-    // long baselines, continuum sources, and maser sources.
-    //
-    // The normal path is:
-    //
-    //   read-align
-    //   + per-frame integer sample tracking
-    //   + fractional-delay phase slope
-    //
-    // The old path, where the full residual delay is left only in the post-FFT
-    // phase slope, is retained only as a diagnostic/compatibility mode.
-    //
-    // Set YI_FX_INT_DELAY=0/false/no/off only when intentionally reproducing
-    // the legacy behavior for debugging.
     std::env::var("YI_FX_INT_DELAY")
         .ok()
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(false)
 }
 
 fn fx_read_offset_samples() -> i64 {
@@ -542,8 +522,6 @@ struct DelayEvalConfig {
     clock2_rate_sps: f64,
     d_seek: f64,
     residual_on_ant2: bool,
-    fixed_process_int1: i64,
-    fixed_process_int2: i64,
     // Opt-in experiment: use process-start read alignment and update the
     // time-domain integer delay cumulatively whenever the residual exceeds
     // one sample.  Default is false to preserve the stable fixed-process
@@ -574,7 +552,7 @@ fn compute_frame_delay_entry(
 ) -> FrameDelayEntry {
     let t_mid_local = (frame_idx as f64 + 0.5) * cfg.frame_dt + cfg.model_time_offset_s;
     let t_mid = t_mid_local + cfg.time_offset_s;
-    let (tau1, tau2, _tau1_for_fringe, _tau2_for_fringe, full_rel_dbg, residual_dbg) =
+    let (tau1, tau2, tau1_for_fringe, tau2_for_fringe, full_rel_dbg, residual_dbg) =
         if let Some(gd_table) = cfg.geom_delay_table_1s.as_deref() {
             let sec_idx = t_mid_local.floor().max(0.0) as usize;
             let frac = t_mid_local - sec_idx as f64;
@@ -663,52 +641,14 @@ fn compute_frame_delay_entry(
             let frac1_s = (residual_samples - seek_delta_samples as f64) / cfg.fs;
             (seek_delta_samples, frac1_s, 0, 0.0)
         }
-    } else if cfg.geom_delay_table_1s.is_some() {
-        // Fixed-process read-align with the 1-second XML/geometric delay table.
-        //
-        // The XML delay model is still evaluated for every FFT frame and is
-        // still applied as a continuous spectral phase slope.  Residual delay
-        // and residual rate may therefore drift in the downstream fringe
-        // search, which is acceptable.
-        //
-        // What must not happen is a per-frame integer-branch jump.  If the
-        // residual delay is rounded frame-by-frame, int1/int2 changes whenever
-        // the residual crosses +/-0.5 sample.  In fixed-process read-align the
-        // raw read branch is not changed at that point, so the XCF phase origin
-        // is not continuous and the output shows simultaneous jumps in
-        // amplitude, fringe phase, and residual delay.
-        //
-        // Therefore keep the time-domain integer branch fixed and apply only
-        // the remaining fractional residual as a continuous phase slope.
-        {
-            let residual_samples = residual_dbg * cfg.fs;
-
-            if cfg.residual_on_ant2 {
-                // Fixed-process read-align keeps one integer branch for the
-                // whole process window.  This avoids per-frame integer-branch
-                // jumps while still allowing the XML delay model to be applied
-                // continuously through the remaining fractional phase slope.
-                let i2 = cfg.fixed_process_int2;
-                let f2 = -(residual_samples - i2 as f64) / cfg.fs;
-
-                // Adopted fixed-process behavior:
-                // keep the same integer decode branch throughout the process
-                // window, and apply only the remaining fractional residual as
-                // a continuous phase slope.  This suppresses the residual-rate
-                // drift and preserves a stable fringe phase.
-                (0, 0.0, i2, f2)
-            } else {
-                let i1 = cfg.fixed_process_int1;
-                let f1 = (residual_samples - i1 as f64) / cfg.fs;
-
-                // Same convention for the ant1-delayed branch.
-                (i1, f1, 0, 0.0)
-            }
-        }
     } else if cfg.fx_integer_delay {
         let (i1, f1) = split_delay_to_integer_and_fractional(tau1, cfg.fs);
         let (i2, f2) = split_delay_to_integer_and_fractional(tau2, cfg.fs);
         (i1, f1, i2, f2)
+    } else if cfg.geom_delay_table_1s.is_some() {
+        // Legacy fixed-process mode, enabled only by YI_FX_INT_DELAY=0.
+        // This keeps the full residual delay in the post-FFT phase slope.
+        (0, tau1, 0, tau2)
     } else {
         let (i1, f1) = split_delay_to_integer_and_fractional(tau1, cfg.fs);
         let (i2, f2) = split_delay_to_integer_and_fractional(tau2, cfg.fs);
@@ -729,8 +669,8 @@ fn compute_frame_delay_entry(
         // per-frame integer delay split.  The integer part has already been
         // applied as a time-domain sample shift, so only the remaining
         // fractional delay should contribute to the per-frame LO phase.
-        fr_lo1: carrier_phase_from_delay(cfg.lo1_hz, frac1),
-        fr_lo2: carrier_phase_from_delay(cfg.lo2_hz, frac2),
+        fr_lo1: carrier_phase_from_delay(cfg.lo1_hz, tau1_for_fringe),
+        fr_lo2: carrier_phase_from_delay(cfg.lo2_hz, tau2_for_fringe),
     }
 }
 
@@ -2866,38 +2806,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     if samples_per_word1 == 0 || samples_per_word2 == 0 {
         return Err("invalid samples-per-word while decoding input".into());
     }
-    // Production seek policy:
-    //
-    // The raw reader must report the *actual* sample position used by the
-    // input stream. For packed 2-bit/4-bit/etc. data, keep the initial file
-    // seek aligned to a 32-bit backend word and carry the difference between
-    // desired and actual sample positions as an explicit seek residual.
-    //
-    // This restores the stable v2.0.11 behavior:
-    //
-    //   desired ant2 = 2047 sample
-    //   actual  ant2 = 2032 sample
-    //   residual     = -15 sample
-    //
-    // The residual must remain in the delay bookkeeping; otherwise the
-    // correlator can enter a different delay branch and produce sector-scale
-    // discontinuities in amplitude, phase, and residual delay.
-    let align_down_to_word = |sample: u64, samples_per_word: u64| -> u64 {
-        if samples_per_word <= 1 {
-            sample
-        } else {
-            (sample / samples_per_word) * samples_per_word
-        }
-    };
-
-    let start_s1_actual_samples = align_down_to_word(start_s1_samples, samples_per_word1);
-    let start_s2_actual_samples = align_down_to_word(start_s2_samples, samples_per_word2);
-
-    let start_s1_residual_samples =
-        (start_s1_actual_samples as i128 - start_s1_samples as i128) as i64;
-    let start_s2_residual_samples =
-        (start_s2_actual_samples as i128 - start_s2_samples as i128) as i64;
-
+    // Seek at the exact sample requested by the delay model.
+    // PackedSampleReader accepts bit offsets, so 32-bit word alignment is not needed here.
+    let start_s1_actual_samples = start_s1_samples;
+    let start_s2_actual_samples = start_s2_samples;
+    let start_s1_residual_samples = 0_i64;
+    let start_s2_residual_samples = 0_i64;
     let start_s1_bits = sample_to_total_bits(start_s1_actual_samples, bit1)?;
     let start_s2_bits = sample_to_total_bits(start_s2_actual_samples, bit2)?;
     let start_s1_byte = start_s1_bits / 8;
@@ -2914,7 +2828,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     );
     if start_s1_residual_samples != 0 || start_s2_residual_samples != 0 {
         println!(
-            "[info] Word-aligned seek residual: ant1={} sample(s), ant2={} sample(s)",
+            "[info] Bit-exact seek residual: ant1={} sample(s), ant2={} sample(s)",
             start_s1_residual_samples, start_s2_residual_samples
         );
     }
@@ -3020,16 +2934,6 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         clock2_rate_sps,
         d_seek,
         residual_on_ant2,
-        fixed_process_int1: if residual_on_ant2 {
-            0
-        } else {
-            (residual_base * fs).round() as i64
-        },
-        fixed_process_int2: if residual_on_ant2 {
-            (residual_base * fs).round() as i64
-        } else {
-            0
-        },
         fx_start_cumulative_seek,
         net_d1_base,
         total_rate1_base,
@@ -3042,10 +2946,6 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         fx_integer_delay: fx_integer_delay_enabled(),
     };
     println!("[info] Delay model cache: per-sector streaming evaluation");
-    println!(
-        "[info] Fixed-process integer branch: ant1={} sample, ant2={} sample",
-        delay_cfg.fixed_process_int1, delay_cfg.fixed_process_int2
-    );
     let source_name = selected_process
         .as_ref()
         .and_then(|p| p.object.clone())
@@ -3702,41 +3602,20 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let mut sector_start_frame = 0usize;
         for &nf in &sec_counts_for_read {
             // Track the sector-level read anchor using the delay at the sector midpoint.
-            // In adaptive-sector mode, the remaining per-frame residual is
-            // evaluated relative to this sector d_seek. In fixed-process mode,
-            // the physical read branch is kept fixed for the whole process.
+            // The remaining per-frame residual is split into integer + fractional
+            // parts relative to this sector d_seek.
             let sector_ref_frame = sector_start_frame + nf / 2;
             let sector_ref =
                 compute_frame_delay_entry(sector_ref_frame, &delay_cfg, delay_cfg.d_seek);
-
-            // Important:
-            //
-            // In fixed-process read-align mode, the raw read branch must remain
-            // fixed for the whole process window.  The XML delay model is still
-            // evaluated continuously and applied as a phase slope, but the
-            // physical input sample start must not be rounded again sector by
-            // sector.  Otherwise the branch changes at integer-sample crossings
-            // and produces apparent jumps in fringe phase and residual delay.
-            //
-            // Only adaptive-sector read-align is allowed to update the physical
-            // read branch at sector boundaries.
-            let sector_d_seek_samples = if use_sector_readalign {
-                (sector_ref.full_rel_s * fs).round() as i128
-            } else {
-                d_seek_samples
-            };
+            let sector_d_seek_samples = (sector_ref.full_rel_s * fs).round() as i128;
             let delta_samples = sector_d_seek_samples - d_seek_samples;
-
             let common_samples = sector_start_frame as i128 * fft_len as i128;
             let mut sector_s1 = start_s1_actual_samples as i128 + common_samples;
             let mut sector_s2 = start_s2_actual_samples as i128 + common_samples;
-
-            if use_sector_readalign {
-                if residual_on_ant2 {
-                    sector_s2 += delta_samples;
-                } else {
-                    sector_s1 -= delta_samples;
-                }
+            if residual_on_ant2 {
+                sector_s2 += delta_samples;
+            } else {
+                sector_s1 -= delta_samples;
             }
             if sector_s1 < 0 || sector_s2 < 0 {
                 return Err(format!(
@@ -3748,24 +3627,11 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             let logical_s1 = sector_s1 as u64;
             let logical_s2 = sector_s2 as u64;
 
-            // Sector prefetch must obey the same actual-sample rule as the
-            // initial read-align. Keep the physical file seek word-aligned,
-            // but leave logical_s1/logical_s2 untouched. decode_shifted_frame
-            // then sees the true actual chunk start and extracts the requested
-            // logical FFT frame from within the padded chunk.
-            //
-            // Use one FFT frame as padding. This is intentionally conservative:
-            // the physical read starts before the logical FFT frame, and the
-            // read length also extends after the payload. The logical frame
-            // index itself is not changed.
-            let sector_margin_samples = fft_len as u64;
-            let read_s1_nominal = logical_s1.saturating_sub(sector_margin_samples);
-            let read_s2_nominal = logical_s2.saturating_sub(sector_margin_samples);
-            let read_s1 = align_down_to_word(read_s1_nominal, samples_per_word1);
-            let read_s2 = align_down_to_word(read_s2_nominal, samples_per_word2);
+            let read_s1 = logical_s1;
+            let read_s2 = logical_s2;
             let payload_samples = nf as u64 * fft_len as u64;
-            let read_n1 = (logical_s1 - read_s1) + payload_samples + sector_margin_samples;
-            let read_n2 = (logical_s2 - read_s2) + payload_samples + sector_margin_samples;
+            let read_n1 = payload_samples;
+            let read_n2 = payload_samples;
             sector_read_starts.push((read_s1, read_s2));
             sector_read_sample_counts.push((read_n1, read_n2));
             sector_d_seeks.push(sector_d_seek_samples as f64 / fs);

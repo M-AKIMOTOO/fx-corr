@@ -1,7 +1,28 @@
 use crate::utils::DynError;
-use erfa::aliases::{eraAnp, eraC2s, eraGmst06, eraGst06a, eraPmat06, eraRxp, eraS2c};
+use erfa::aliases::{eraAnp, eraC2s, eraEpv00, eraGmst06, eraGst06a, eraPmat06, eraRxp, eraS2c};
 
 const C: f64 = 299792458.0; // Speed of light in m/s
+
+const ARCSEC_TO_RAD: f64 = std::f64::consts::PI / (180.0 * 3600.0);
+
+#[derive(Clone, Copy, Debug)]
+pub struct EarthOrientation {
+    pub dut1_s: f64,
+    pub tt_minus_utc_s: f64,
+    pub xp_arcsec: f64,
+    pub yp_arcsec: f64,
+}
+
+impl Default for EarthOrientation {
+    fn default() -> Self {
+        Self {
+            dut1_s: 0.0,
+            tt_minus_utc_s: 69.184,
+            xp_arcsec: 0.0,
+            yp_arcsec: 0.0,
+        }
+    }
+}
 
 // Fixed ECEF coordinates for Yamaguchi interferometer (meters)
 pub const YAMAGU32_ECEF: [f64; 3] = [-3502544.587, 3950966.235, 3566381.192];
@@ -18,7 +39,7 @@ pub const YAMAGU34_ECEF: [f64; 3] = [-3502567.576, 3950885.734, 3566449.115];
 //   tau_baseline = tau_2 - tau_1
 // ----------------------------------
 
-fn parse_packed_hhmmss(value: f64) -> Result<(f64, f64, f64), DynError> { 
+fn parse_packed_hhmmss(value: f64) -> Result<(f64, f64, f64), DynError> {
     let abs = value.abs();
     let h = (abs / 10000.0).floor();
     let rem = abs - h * 10000.0;
@@ -275,6 +296,7 @@ fn mjd_to_jd_split(mjd: f64) -> (f64, f64) {
 
 /// Precess J2000 mean RA/Dec to mean equator/equinox of date.
 /// Uses ERFA IAU 2006 precession matrix.
+#[allow(dead_code)]
 pub fn precess_j2000_to_mean_of_date(ra_j2000: f64, dec_j2000: f64, mjd: f64) -> (f64, f64) {
     let (date1, date2) = mjd_to_jd_split(mjd);
     let p_j2000 = eraS2c(ra_j2000, dec_j2000);
@@ -287,21 +309,55 @@ pub fn precess_j2000_to_mean_of_date(ra_j2000: f64, dec_j2000: f64, mjd: f64) ->
 // Calculate Greenwich Mean Sidereal Time (GMST) in radians from MJD
 #[allow(dead_code)]
 pub fn mjd_to_gmst(mjd: f64) -> f64 {
-    let (ut1a, ut1b) = mjd_to_jd_split(mjd);
-    // We do not have external UT1-UTC and TT-UTC here.
-    // For delay tracking, use the same split for UT1 and TT in ERFA.
-    eraAnp(eraGmst06(ut1a, ut1b, ut1a, ut1b))
+    mjd_to_gmst_with_eop(mjd, EarthOrientation::default())
 }
 
+pub fn mjd_to_gmst_with_eop(mjd_utc: f64, eop: EarthOrientation) -> f64 {
+    let mjd_ut1 = mjd_utc + eop.dut1_s / 86400.0;
+    let mjd_tt = mjd_utc + eop.tt_minus_utc_s / 86400.0;
+    let (ut1a, ut1b) = mjd_to_jd_split(mjd_ut1);
+    let (tta, ttb) = mjd_to_jd_split(mjd_tt);
+    eraAnp(eraGmst06(ut1a, ut1b, tta, ttb))
+}
+
+fn polar_motion_to_itrs(v_tirs: [f64; 3], eop: EarthOrientation) -> [f64; 3] {
+    let xp = eop.xp_arcsec * ARCSEC_TO_RAD;
+    let yp = eop.yp_arcsec * ARCSEC_TO_RAD;
+    if xp == 0.0 && yp == 0.0 {
+        return v_tirs;
+    }
+
+    // Approximate inverse polar-motion transform from TIRS to ITRS:
+    // W ~= R2(-xp) R1(-yp), so W^T ~= R1(yp) R2(xp).
+    let (sxp, cxp) = xp.sin_cos();
+    let (syp, cyp) = yp.sin_cos();
+    let r2_xp = [
+        cxp * v_tirs[0] + sxp * v_tirs[2],
+        v_tirs[1],
+        -sxp * v_tirs[0] + cxp * v_tirs[2],
+    ];
+    [
+        r2_xp[0],
+        cyp * r2_xp[1] - syp * r2_xp[2],
+        syp * r2_xp[1] + cyp * r2_xp[2],
+    ]
+}
+
+#[allow(dead_code)]
 fn source_vector_itrs(ra: f64, dec: f64, mjd: f64) -> [f64; 3] {
-    // Mean-of-date equinox path:
-    // source coordinates are precessed to date, then rotated by apparent sidereal time.
-    let (ut1a, ut1b) = mjd_to_jd_split(mjd);
-    let gst = eraAnp(eraGst06a(ut1a, ut1b, ut1a, ut1b));
+    source_vector_itrs_with_eop(ra, dec, mjd, EarthOrientation::default())
+}
+
+fn source_vector_itrs_with_eop(ra: f64, dec: f64, mjd_utc: f64, eop: EarthOrientation) -> [f64; 3] {
+    let mjd_ut1 = mjd_utc + eop.dut1_s / 86400.0;
+    let mjd_tt = mjd_utc + eop.tt_minus_utc_s / 86400.0;
+    let (ut1a, ut1b) = mjd_to_jd_split(mjd_ut1);
+    let (tta, ttb) = mjd_to_jd_split(mjd_tt);
+    let gst = eraAnp(eraGst06a(ut1a, ut1b, tta, ttb));
     let ha = gst - ra;
     let (sd, cd) = dec.sin_cos();
     let (sh, ch) = ha.sin_cos();
-    [cd * ch, -cd * sh, sd]
+    polar_motion_to_itrs([cd * ch, -cd * sh, sd], eop)
 }
 
 // Helper function to calculate single antenna delay
@@ -311,12 +367,23 @@ fn calculate_single_antenna_delay(
     dec: f64, // radians
     mjd: f64,
 ) -> f64 {
-    let s = source_vector_itrs(ra, dec, mjd);
+    calculate_single_antenna_delay_with_eop(ant_xyz, ra, dec, mjd, EarthOrientation::default())
+}
+
+fn calculate_single_antenna_delay_with_eop(
+    ant_xyz: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    eop: EarthOrientation,
+) -> f64 {
+    let s = source_vector_itrs_with_eop(ra, dec, mjd, eop);
     -1.0 * (ant_xyz[0] * s[0] + ant_xyz[1] * s[1] + ant_xyz[2] * s[2]) / C
 }
 
 // Helper function to calculate baseline geometric delay directly.
 // This avoids subtracting two large antenna delays for short baselines.
+#[allow(dead_code)]
 fn calculate_baseline_delay(
     ant1_xyz: [f64; 3],
     ant2_xyz: [f64; 3],
@@ -324,13 +391,57 @@ fn calculate_baseline_delay(
     dec: f64,
     mjd: f64,
 ) -> f64 {
-    let s = source_vector_itrs(ra, dec, mjd);
+    calculate_baseline_delay_with_eop(
+        ant1_xyz,
+        ant2_xyz,
+        ra,
+        dec,
+        mjd,
+        EarthOrientation::default(),
+    )
+}
+
+fn earth_velocity_dot_source_over_c(ra: f64, dec: f64, mjd_utc: f64, eop: EarthOrientation) -> f64 {
+    const AU_M: f64 = 149_597_870_700.0;
+    let mjd_tt = mjd_utc + eop.tt_minus_utc_s / 86400.0;
+    let (tta, ttb) = mjd_to_jd_split(mjd_tt);
+    let (_status, _pvh, pvb) = eraEpv00(tta, ttb);
+    let s = eraS2c(ra, dec);
+    let v_mps = [
+        pvb[1][0] * AU_M / 86400.0,
+        pvb[1][1] * AU_M / 86400.0,
+        pvb[1][2] * AU_M / 86400.0,
+    ];
+    (v_mps[0] * s[0] + v_mps[1] * s[1] + v_mps[2] * s[2]) / C
+}
+
+fn calculate_baseline_delay_with_eop(
+    ant1_xyz: [f64; 3],
+    ant2_xyz: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    eop: EarthOrientation,
+) -> f64 {
+    let s = source_vector_itrs_with_eop(ra, dec, mjd, eop);
 
     let bx = ant2_xyz[0] - ant1_xyz[0];
     let by = ant2_xyz[1] - ant1_xyz[1];
     let bz = ant2_xyz[2] - ant1_xyz[2];
 
     -1.0 * (bx * s[0] + by * s[1] + bz * s[2]) / C
+}
+
+fn calculate_baseline_delay_barycentric_with_eop(
+    ant1_xyz: [f64; 3],
+    ant2_xyz: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    eop: EarthOrientation,
+) -> f64 {
+    let geocentric_delay = calculate_baseline_delay_with_eop(ant1_xyz, ant2_xyz, ra, dec, mjd, eop);
+    geocentric_delay * (1.0 - earth_velocity_dot_source_over_c(ra, dec, mjd, eop))
 }
 
 #[allow(dead_code)]
@@ -350,6 +461,7 @@ pub fn calculate_antenna_delay_and_derivatives(
     (delay_t, rate, accel)
 }
 
+#[allow(dead_code)]
 pub fn calculate_geometric_delay_and_derivatives(
     ant1_xyz: [f64; 3],
     ant2_xyz: [f64; 3],
@@ -357,23 +469,82 @@ pub fn calculate_geometric_delay_and_derivatives(
     dec: f64, // radians
     mjd: f64,
 ) -> (f64, f64, f64, f64, f64) {
+    calculate_geometric_delay_and_derivatives_with_eop(
+        ant1_xyz,
+        ant2_xyz,
+        ra,
+        dec,
+        mjd,
+        EarthOrientation::default(),
+    )
+}
+
+pub fn calculate_geometric_delay_and_derivatives_with_eop(
+    ant1_xyz: [f64; 3],
+    ant2_xyz: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    eop: EarthOrientation,
+) -> (f64, f64, f64, f64, f64) {
+    calculate_geometric_delay_and_derivatives_anchored_with_eop(
+        ant1_xyz, ant2_xyz, ra, dec, mjd, mjd, eop,
+    )
+}
+
+pub fn calculate_geometric_delay_and_derivatives_anchored_with_eop(
+    ant1_xyz: [f64; 3],
+    ant2_xyz: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    reference_mjd: f64,
+    eop: EarthOrientation,
+) -> (f64, f64, f64, f64, f64) {
     // (delay_ant1, delay_ant2, geometric_delay, geometric_rate, geometric_accel)
-    let dt_s = 1.0; // Time step for numerical differentiation (1 second)
-    let dt_mjd = dt_s / 86400.0; // Convert dt to MJD units
+    // The absolute read-align delay remains geocentric at reference_mjd.
+    // The Earth-velocity term is applied as a differential delay so its rate
+    // contribution is preserved without injecting a large constant sample shift.
+    let dt_s = 1.0;
+    let dt_mjd = dt_s / 86400.0;
 
-    // Calculate delays at t-dt, t, t+dt
-    let geom_delay_minus_dt = calculate_baseline_delay(ant1_xyz, ant2_xyz, ra, dec, mjd - dt_mjd);
+    let bary_ref = calculate_baseline_delay_barycentric_with_eop(
+        ant1_xyz,
+        ant2_xyz,
+        ra,
+        dec,
+        reference_mjd,
+        eop,
+    );
+    let geo_ref =
+        calculate_baseline_delay_with_eop(ant1_xyz, ant2_xyz, ra, dec, reference_mjd, eop);
+    let bary_delay_minus_dt = calculate_baseline_delay_barycentric_with_eop(
+        ant1_xyz,
+        ant2_xyz,
+        ra,
+        dec,
+        mjd - dt_mjd,
+        eop,
+    );
 
-    let delay1_t = calculate_single_antenna_delay(ant1_xyz, ra, dec, mjd);
-    let delay2_t = calculate_single_antenna_delay(ant2_xyz, ra, dec, mjd);
-    let geom_delay_t = calculate_baseline_delay(ant1_xyz, ant2_xyz, ra, dec, mjd);
+    let delay1_t = calculate_single_antenna_delay_with_eop(ant1_xyz, ra, dec, mjd, eop);
+    let delay2_t = calculate_single_antenna_delay_with_eop(ant2_xyz, ra, dec, mjd, eop);
+    let bary_delay_t =
+        calculate_baseline_delay_barycentric_with_eop(ant1_xyz, ant2_xyz, ra, dec, mjd, eop);
+    let geom_delay_t = geo_ref + (bary_delay_t - bary_ref);
 
-    let geom_delay_plus_dt = calculate_baseline_delay(ant1_xyz, ant2_xyz, ra, dec, mjd + dt_mjd);
+    let bary_delay_plus_dt = calculate_baseline_delay_barycentric_with_eop(
+        ant1_xyz,
+        ant2_xyz,
+        ra,
+        dec,
+        mjd + dt_mjd,
+        eop,
+    );
 
-    // Calculate derivatives
-    let geometric_rate = (geom_delay_plus_dt - geom_delay_minus_dt) / (2.0 * dt_s);
+    let geometric_rate = (bary_delay_plus_dt - bary_delay_minus_dt) / (2.0 * dt_s);
     let geometric_accel =
-        (geom_delay_plus_dt - 2.0 * geom_delay_t + geom_delay_minus_dt) / (dt_s * dt_s);
+        (bary_delay_plus_dt - 2.0 * bary_delay_t + bary_delay_minus_dt) / (dt_s * dt_s);
 
     (
         delay1_t,

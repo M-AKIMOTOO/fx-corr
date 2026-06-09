@@ -15,6 +15,8 @@ pub struct ProcessEntry {
     pub stations: Option<String>,
     pub ra: Option<String>,
     pub dec: Option<String>,
+    pub ant1_station_key: Option<String>,
+    pub ant2_station_key: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -46,6 +48,8 @@ pub struct IFileData {
     pub ant2_sideband: Option<String>,
     pub ant1_rotation_hz: Option<f64>,
     pub ant2_rotation_hz: Option<f64>,
+    pub ant1_rotation2_hz: Option<f64>,
+    pub ant2_rotation2_hz: Option<f64>,
     pub ant1_center_mhz: Option<f64>,
     pub ant2_center_mhz: Option<f64>,
     pub ant1_bw_mhz: Option<f64>,
@@ -60,9 +64,17 @@ pub struct IFileData {
     pub process_skip_sec: Option<f64>,
     pub process_length_sec: Option<f64>,
     pub processes: Vec<ProcessEntry>,
+    pub model_time_offset_s: Option<f64>,
+    pub dut1_s: Option<f64>,
+    pub tt_utc_s: Option<f64>,
+    pub xp_arcsec: Option<f64>,
+    pub yp_arcsec: Option<f64>,
 }
 
-fn parse_optional_f64(params: &HashMap<String, String>, keys: &[&str]) -> Result<Option<f64>, DynError> {
+fn parse_optional_f64(
+    params: &HashMap<String, String>,
+    keys: &[&str],
+) -> Result<Option<f64>, DynError> {
     for key in keys {
         if let Some(value) = params.get(*key) {
             return Ok(Some(value.trim().parse::<f64>()?));
@@ -76,9 +88,15 @@ fn parse_clock_pair(clock_raw: &str) -> Result<(Option<f64>, Option<f64>), DynEr
         .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .filter(|s| !s.is_empty())
         .collect();
-    if parts.is_empty() { return Ok((None, None)); }
+    if parts.is_empty() {
+        return Ok((None, None));
+    }
     let delay = Some(parts[0].parse::<f64>()?);
-    let rate = if parts.len() >= 2 { Some(parts[1].parse::<f64>()?) } else { None };
+    let rate = if parts.len() >= 2 {
+        Some(parts[1].parse::<f64>()?)
+    } else {
+        None
+    };
     Ok((delay, rate))
 }
 
@@ -122,20 +140,39 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
     for line in reader.lines() {
         let line = line?;
         let line = line.splitn(2, '#').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with(';') { continue; }
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
         if let Some(index) = line.find('=') {
             let (key, value) = line.split_at(index);
             let key = key.trim().to_ascii_lowercase().replace('_', "");
-            let value = value.trim_start_matches('=').trim().trim_matches('"').trim_matches('\'').to_string();
+            let value = value
+                .trim_start_matches('=')
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
             params.insert(key, value);
         }
     }
     let mut clock_delay_s = parse_optional_f64(&params, &["clockdelay", "clockoffset"])?;
     let mut clock_rate_sps = parse_optional_f64(&params, &["clockrate", "clockdrift"])?;
-    let ant1_clock_delay_s = parse_optional_f64(&params, &["ant1clockdelay", "clock1delay", "station1clockdelay"])?;
-    let ant2_clock_delay_s = parse_optional_f64(&params, &["ant2clockdelay", "clock2delay", "station2clockdelay"])?;
-    let ant1_clock_rate_sps = parse_optional_f64(&params, &["ant1clockrate", "clock1rate", "station1clockrate"])?;
-    let ant2_clock_rate_sps = parse_optional_f64(&params, &["ant2clockrate", "clock2rate", "station2clockrate"])?;
+    let ant1_clock_delay_s = parse_optional_f64(
+        &params,
+        &["ant1clockdelay", "clock1delay", "station1clockdelay"],
+    )?;
+    let ant2_clock_delay_s = parse_optional_f64(
+        &params,
+        &["ant2clockdelay", "clock2delay", "station2clockdelay"],
+    )?;
+    let ant1_clock_rate_sps = parse_optional_f64(
+        &params,
+        &["ant1clockrate", "clock1rate", "station1clockrate"],
+    )?;
+    let ant2_clock_rate_sps = parse_optional_f64(
+        &params,
+        &["ant2clockrate", "clock2rate", "station2clockrate"],
+    )?;
     let clock_epoch = params.get("clockepoch").cloned();
     let ant1_clock_epoch = params
         .get("ant1clockepoch")
@@ -166,32 +203,56 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
     )?;
     if let Some(clock_raw) = params.get("clock") {
         let (d, r) = parse_clock_pair(clock_raw)?;
-        if clock_delay_s.is_none() { clock_delay_s = d; }
-        if clock_rate_sps.is_none() { clock_rate_sps = r; }
+        if clock_delay_s.is_none() {
+            clock_delay_s = d;
+        }
+        if clock_rate_sps.is_none() {
+            clock_rate_sps = r;
+        }
     }
-    let ra = params.get("ra").or_else(|| params.get("srcra")).ok_or("ra missing")?.clone();
-    let dec = params.get("dec").or_else(|| params.get("srcdec")).ok_or("dec missing")?.clone();
-    let epoch = params.get("epoch").or_else(|| params.get("scanepoch")).cloned();
+    let ra = params
+        .get("ra")
+        .or_else(|| params.get("srcra"))
+        .ok_or("ra missing")?
+        .clone();
+    let dec = params
+        .get("dec")
+        .or_else(|| params.get("srcdec"))
+        .ok_or("dec missing")?
+        .clone();
+    let epoch = params
+        .get("epoch")
+        .or_else(|| params.get("scanepoch"))
+        .cloned();
     let process_skip_sec = parse_optional_f64(&params, &["skip", "processskip"])?;
     let process_length_sec = parse_optional_f64(&params, &["length", "processlength"])?;
     Ok(IFileData {
         ra: ra.clone(),
         dec: dec.clone(),
         epoch: epoch.clone(),
-        source: params.get("source").or_else(|| params.get("object")).cloned(),
+        source: params
+            .get("source")
+            .or_else(|| params.get("object"))
+            .cloned(),
         stream_label: params
             .get("streamlabel")
             .or_else(|| params.get("label"))
             .cloned(),
         fft: params.get("fft").map(|v| v.parse()).transpose()?,
-        sampling_hz: params.get("samplinghz").or_else(|| params.get("fs")).map(|v| v.parse()).transpose()?,
+        sampling_hz: params
+            .get("samplinghz")
+            .or_else(|| params.get("fs"))
+            .map(|v| v.parse())
+            .transpose()?,
         ant1_bit: params.get("bit").map(|v| v.parse()).transpose()?,
         ant2_bit: params.get("bit").map(|v| v.parse()).transpose()?,
         ant1_level: params.get("level").cloned(),
         ant2_level: params.get("level").cloned(),
         ant1_shuffle: params.get("shuffle").cloned(),
         ant2_shuffle: params.get("shuffle").cloned(),
-        obsfreq_mhz, clock_delay_s, clock_rate_sps,
+        obsfreq_mhz,
+        clock_delay_s,
+        clock_rate_sps,
         ant1_clock_delay_s,
         ant2_clock_delay_s,
         ant1_clock_rate_sps,
@@ -200,13 +261,42 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         ant2_clock_epoch,
         ant1_sideband: params.get("sideband").cloned(),
         ant2_sideband: params.get("sideband").cloned(),
-        ant1_rotation_hz: parse_optional_f64(&params, &["ant1rotationhz", "rotation1hz", "rotation"])?,
-        ant2_rotation_hz: parse_optional_f64(&params, &["ant2rotationhz", "rotation2hz", "rotation"])?,
-        ant1_center_mhz: None, ant2_center_mhz: None, ant1_bw_mhz: None, ant2_bw_mhz: None,
-        ant1_station_name: params.get("ant1").or_else(|| params.get("station1")).cloned(),
-        ant2_station_name: params.get("ant2").or_else(|| params.get("station2")).cloned(),
-        ant1_station_key: params.get("ant1key").or_else(|| params.get("station1key")).cloned(),
-        ant2_station_key: params.get("ant2key").or_else(|| params.get("station2key")).cloned(),
+        ant1_rotation_hz: parse_optional_f64(
+            &params,
+            &["ant1rotationhz", "rotation1hz", "rotation"],
+        )?,
+        ant2_rotation_hz: parse_optional_f64(
+            &params,
+            &["ant2rotationhz", "rotation2hz", "rotation"],
+        )?,
+        ant1_rotation2_hz: parse_optional_f64(
+            &params,
+            &["ant1rotation2hz", "rotation1_2hz", "rotation2"],
+        )?,
+        ant2_rotation2_hz: parse_optional_f64(
+            &params,
+            &["ant2rotation2hz", "rotation2_2hz", "rotation2"],
+        )?,
+        ant1_center_mhz: None,
+        ant2_center_mhz: None,
+        ant1_bw_mhz: None,
+        ant2_bw_mhz: None,
+        ant1_station_name: params
+            .get("ant1")
+            .or_else(|| params.get("station1"))
+            .cloned(),
+        ant2_station_name: params
+            .get("ant2")
+            .or_else(|| params.get("station2"))
+            .cloned(),
+        ant1_station_key: params
+            .get("ant1key")
+            .or_else(|| params.get("station1key"))
+            .cloned(),
+        ant2_station_key: params
+            .get("ant2key")
+            .or_else(|| params.get("station2key"))
+            .cloned(),
         ant1_ecef_m,
         ant2_ecef_m,
         process_epochs: epoch.clone().into_iter().collect(),
@@ -216,17 +306,52 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
             epoch: epoch.clone().unwrap_or_else(|| "2000".to_string()),
             skip_sec: process_skip_sec.unwrap_or(0.0),
             length_sec: process_length_sec,
-            object: params.get("source").or_else(|| params.get("object")).cloned(),
+            object: params
+                .get("source")
+                .or_else(|| params.get("object"))
+                .cloned(),
             stations: params.get("stations").cloned(),
             ra: Some(ra.clone()),
             dec: Some(dec.clone()),
+            ant1_station_key: params
+                .get("ant1key")
+                .or_else(|| params.get("station1key"))
+                .cloned(),
+            ant2_station_key: params
+                .get("ant2key")
+                .or_else(|| params.get("station2key"))
+                .cloned(),
         }],
+        model_time_offset_s: parse_optional_f64(
+            &params,
+            &["modeltimeoffset", "model_time_offset", "model-time-offset"],
+        )?,
+        dut1_s: parse_optional_f64(&params, &["dut1"])?,
+        tt_utc_s: parse_optional_f64(&params, &["ttutc", "tt_utc", "tt-utc"])?,
+        xp_arcsec: parse_optional_f64(&params, &["xp", "xpolar", "xp_arcsec"])?,
+        yp_arcsec: parse_optional_f64(&params, &["yp", "ypolar", "yp_arcsec"])?,
     })
 }
 
-pub fn parse_ifile(path: &PathBuf) -> Result<IFileData, DynError> {
-    if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("xml")).unwrap_or(false) {
-        return crate::xml::parse_xml_schedule(path);
+pub fn parse_ifile_for_process(
+    path: &PathBuf,
+    process_index: Option<usize>,
+) -> Result<IFileData, DynError> {
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("xml"))
+        .unwrap_or(false)
+    {
+        return if let Some(idx) = process_index {
+            crate::xml::parse_xml_schedule_for_process(path, Some(idx))
+        } else {
+            crate::xml::parse_xml_schedule(path)
+        };
     }
     parse_ifile_kv(path)
+}
+
+pub fn parse_ifile(path: &PathBuf) -> Result<IFileData, DynError> {
+    parse_ifile_for_process(path, None)
 }

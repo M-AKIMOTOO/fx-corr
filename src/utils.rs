@@ -25,17 +25,32 @@ impl FftHelper {
         let forward_r2c = planner_r2c.plan_fft_forward(len);
         let inverse_c2r = planner_r2c.plan_fft_inverse(len);
         let inverse_c2c = planner_c2c.plan_fft_inverse(len);
-        Self { len, forward_r2c, inverse_c2r, inverse_c2c }
+        Self {
+            len,
+            forward_r2c,
+            inverse_c2r,
+            inverse_c2c,
+        }
     }
     pub fn inverse_c2c(&self, spectrum: &mut [Complex<f32>]) -> Result<(), DynError> {
-        if spectrum.len() != self.len { return Err("Spectrum length mismatch".into()); }
+        if spectrum.len() != self.len {
+            return Err("Spectrum length mismatch".into());
+        }
         self.inverse_c2c.process(spectrum);
         let scale = 1.0_f32 / self.len as f32;
-        for value in spectrum.iter_mut() { *value *= scale; }
+        for value in spectrum.iter_mut() {
+            *value *= scale;
+        }
         Ok(())
     }
-    pub fn forward_r2c_process(&self, input: &mut [f32], output: &mut [Complex<f32>]) -> Result<(), DynError> {
-        if input.len() != self.len || output.len() != self.len / 2 + 1 { return Err("Length mismatch".into()); }
+    pub fn forward_r2c_process(
+        &self,
+        input: &mut [f32],
+        output: &mut [Complex<f32>],
+    ) -> Result<(), DynError> {
+        if input.len() != self.len || output.len() != self.len / 2 + 1 {
+            return Err("Length mismatch".into());
+        }
         self.forward_r2c.process(input, output)?;
         Ok(())
     }
@@ -57,11 +72,19 @@ impl FftHelper {
             .process_with_scratch(input, output, &mut scratch.forward_r2c)?;
         Ok(())
     }
-    pub fn inverse_c2r_process(&self, spectrum: &mut [Complex<f32>], output: &mut [f32]) -> Result<(), DynError> {
-        if spectrum.len() != self.len / 2 + 1 || output.len() != self.len { return Err("Length mismatch".into()); }
+    pub fn inverse_c2r_process(
+        &self,
+        spectrum: &mut [Complex<f32>],
+        output: &mut [f32],
+    ) -> Result<(), DynError> {
+        if spectrum.len() != self.len / 2 + 1 || output.len() != self.len {
+            return Err("Length mismatch".into());
+        }
         self.inverse_c2r.process(spectrum, output)?;
         let scale = 1.0_f32 / self.len as f32;
-        for value in output.iter_mut() { *value *= scale; }
+        for value in output.iter_mut() {
+            *value *= scale;
+        }
         Ok(())
     }
 }
@@ -102,11 +125,16 @@ pub fn apply_delay_and_rate_regular_bins_range(
     start_bin: usize,
     end_bin: usize,
 ) {
-    if spectrum.is_empty() { return; }
+    if spectrum.is_empty() {
+        return;
+    }
     let end = end_bin.min(spectrum.len());
     let start = start_bin.min(end);
-    if start >= end { return; }
-    let total_delay_at_time = delay_seconds + delay_rate * frame_time + 0.5 * geometric_accel * frame_time.powi(2);
+    if start >= end {
+        return;
+    }
+    let total_delay_at_time =
+        delay_seconds + delay_rate * frame_time + 0.5 * geometric_accel * frame_time.powi(2);
     // Standard VLBI sign: exp(-j * 2*PI * f * tau)
     // If we have flipped LSB to USB in time-domain, we use USB sign (-).
     // If not flipped, LSB uses positive sign (+).
@@ -114,7 +142,10 @@ pub fn apply_delay_and_rate_regular_bins_range(
     let phase_step = sign * 2.0 * PI * freq_step_hz * total_delay_at_time;
     let mut rot = Complex::from_polar(1.0_f32, (phase_step * start as f64) as f32);
     let bin_rot_step = Complex::from_polar(1.0_f32, phase_step as f32);
-    for bin in spectrum[start..end].iter_mut() { *bin *= rot; rot *= bin_rot_step; }
+    for bin in spectrum[start..end].iter_mut() {
+        *bin *= rot;
+        rot *= bin_rot_step;
+    }
     if fft_len % 2 == 0 {
         let nyquist_idx = fft_len / 2;
         if nyquist_idx >= start && nyquist_idx < end && nyquist_idx < spectrum.len() {
@@ -123,6 +154,7 @@ pub fn apply_delay_and_rate_regular_bins_range(
     }
 }
 
+#[allow(dead_code)]
 pub fn apply_integer_sample_shift_zerofill(samples: &mut [f32], shift_samples: i64) {
     if samples.is_empty() || shift_samples == 0 {
         return;
@@ -153,8 +185,20 @@ pub struct DecodePlan {
     packed2_lut16_usb: Option<Box<[[f32; 8]]>>,
     packed2_lut16_lsb_flip: Option<Box<[[f32; 8]]>>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)] enum ShuffleKind { Identity, PairSwap, Generic }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)] enum DecodeFastKind { Generic, Packed1, Packed2, Packed4, Packed8 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShuffleKind {
+    Identity,
+    PairSwap,
+    Generic,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeFastKind {
+    Generic,
+    Packed1,
+    Packed2,
+    Packed4,
+    Packed8,
+}
 
 #[inline]
 fn apply_shuffle_word(mut word: u32, plan: &DecodePlan) -> u32 {
@@ -170,12 +214,24 @@ fn apply_shuffle_word(mut word: u32, plan: &DecodePlan) -> u32 {
     word
 }
 
-pub fn build_decode_plan(bits: usize, shuffle_in: &[usize], levels: &[f64]) -> Result<DecodePlan, DynError> {
+pub fn build_decode_plan(
+    bits: usize,
+    shuffle_in: &[usize],
+    levels: &[f64],
+) -> Result<DecodePlan, DynError> {
     let mut input_shifts = [0u32; 32];
-    for (idx, &mapped) in shuffle_in.iter().enumerate() { input_shifts[idx] = mapped as u32; }
+    for (idx, &mapped) in shuffle_in.iter().enumerate() {
+        input_shifts[idx] = mapped as u32;
+    }
     let is_identity = shuffle_in.iter().enumerate().all(|(i, &v)| i == v);
     let is_pair_swap = shuffle_in.iter().enumerate().all(|(i, &v)| (i ^ 1) == v);
-    let kind = if is_identity { ShuffleKind::Identity } else if is_pair_swap { ShuffleKind::PairSwap } else { ShuffleKind::Generic };
+    let kind = if is_identity {
+        ShuffleKind::Identity
+    } else if is_pair_swap {
+        ShuffleKind::PairSwap
+    } else {
+        ShuffleKind::Generic
+    };
     let fast_kind = match bits {
         1 => DecodeFastKind::Packed1,
         2 => DecodeFastKind::Packed2,
@@ -184,7 +240,8 @@ pub fn build_decode_plan(bits: usize, shuffle_in: &[usize], levels: &[f64]) -> R
         _ => DecodeFastKind::Generic,
     };
     let levels_f32 = levels.iter().map(|&v| v as f32).collect::<Vec<_>>();
-    let (packed2_lut16_usb, packed2_lut16_lsb_flip) = if bits == 2 && kind == ShuffleKind::Identity {
+    let (packed2_lut16_usb, packed2_lut16_lsb_flip) = if bits == 2 && kind == ShuffleKind::Identity
+    {
         let mut lut_usb = vec![[0.0_f32; 8]; 1 << 16].into_boxed_slice();
         let mut lut_lsb_flip = vec![[0.0_f32; 8]; 1 << 16].into_boxed_slice();
         for word in 0u32..(1u32 << 16) {
@@ -218,6 +275,7 @@ pub fn decode_block_into_with_plan(
     plan: &DecodePlan,
     output: &mut [f32],
     lsb_to_usb: bool,
+    first_sample_odd: bool,
 ) -> Result<(), DynError> {
     if output.len() < samples {
         return Err(format!("output buffer too short: {} < {}", output.len(), samples).into());
@@ -225,7 +283,7 @@ pub fn decode_block_into_with_plan(
     let level_map = plan.levels_f32.as_slice();
 
     let mut out_idx = 0usize;
-    let mut odd = false;
+    let mut odd = first_sample_odd;
 
     match plan.fast_kind {
         DecodeFastKind::Packed1 => {
@@ -233,10 +291,14 @@ pub fn decode_block_into_with_plan(
                 let mut word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 word = apply_shuffle_word(word, plan);
                 for _ in 0..32 {
-                    if out_idx >= samples { break; }
+                    if out_idx >= samples {
+                        break;
+                    }
                     let code = (word & 0x1) as usize;
                     let mut val = level_map[code];
-                    if lsb_to_usb && odd { val = -val; }
+                    if lsb_to_usb && odd {
+                        val = -val;
+                    }
                     output[out_idx] = val;
                     out_idx += 1;
                     odd = !odd;
@@ -245,7 +307,7 @@ pub fn decode_block_into_with_plan(
             }
         }
         DecodeFastKind::Packed2 => {
-            if plan.shuffle_kind == ShuffleKind::Identity {
+            if plan.shuffle_kind == ShuffleKind::Identity && !(lsb_to_usb && first_sample_odd) {
                 let lut = if lsb_to_usb {
                     plan.packed2_lut16_lsb_flip
                         .as_ref()
@@ -302,10 +364,14 @@ pub fn decode_block_into_with_plan(
                     let mut word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     word = apply_shuffle_word(word, plan);
                     for _ in 0..16 {
-                        if out_idx >= samples { break; }
+                        if out_idx >= samples {
+                            break;
+                        }
                         let code = (word & 0x3) as usize;
                         let mut val = level_map[code];
-                        if lsb_to_usb && odd { val = -val; }
+                        if lsb_to_usb && odd {
+                            val = -val;
+                        }
                         output[out_idx] = val;
                         out_idx += 1;
                         odd = !odd;
@@ -319,10 +385,14 @@ pub fn decode_block_into_with_plan(
                 let mut word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 word = apply_shuffle_word(word, plan);
                 for _ in 0..8 {
-                    if out_idx >= samples { break; }
+                    if out_idx >= samples {
+                        break;
+                    }
                     let code = (word & 0xF) as usize;
                     let mut val = level_map[code];
-                    if lsb_to_usb && odd { val = -val; }
+                    if lsb_to_usb && odd {
+                        val = -val;
+                    }
                     output[out_idx] = val;
                     out_idx += 1;
                     odd = !odd;
@@ -335,10 +405,14 @@ pub fn decode_block_into_with_plan(
                 let mut word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 word = apply_shuffle_word(word, plan);
                 for _ in 0..4 {
-                    if out_idx >= samples { break; }
+                    if out_idx >= samples {
+                        break;
+                    }
                     let code = (word & 0xFF) as usize;
                     let mut val = level_map[code];
-                    if lsb_to_usb && odd { val = -val; }
+                    if lsb_to_usb && odd {
+                        val = -val;
+                    }
                     output[out_idx] = val;
                     out_idx += 1;
                     odd = !odd;
@@ -352,13 +426,18 @@ pub fn decode_block_into_with_plan(
             let mut acc = 0u64;
             let mut acc_bits = 0;
             for chunk in raw.chunks_exact(4) {
-                let word = apply_shuffle_word(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]), plan);
+                let word = apply_shuffle_word(
+                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                    plan,
+                );
                 acc |= (word as u64) << acc_bits;
                 acc_bits += 32;
                 while acc_bits >= bits && out_idx < samples {
                     let code = (acc & code_mask) as usize;
                     let mut val = level_map[code];
-                    if lsb_to_usb && odd { val = -val; }
+                    if lsb_to_usb && odd {
+                        val = -val;
+                    }
                     output[out_idx] = val;
                     out_idx += 1;
                     odd = !odd;
@@ -375,7 +454,13 @@ pub fn decode_block_into_with_plan(
     Ok(())
 }
 
-pub fn quantise_frame(samples: &[f32], bits: usize, levels: &[f64], shuffle_out: &[usize], output: &mut Vec<u8>) -> Result<(), DynError> {
+pub fn quantise_frame(
+    samples: &[f32],
+    bits: usize,
+    levels: &[f64],
+    shuffle_out: &[usize],
+    output: &mut Vec<u8>,
+) -> Result<(), DynError> {
     output.clear();
     let code_mask = (1u64 << bits) - 1;
     let mut bit_acc = 0u64;
@@ -385,16 +470,22 @@ pub fn quantise_frame(samples: &[f32], bits: usize, levels: &[f64], shuffle_out:
         let mut min_err = f32::MAX;
         for (idx, &lv) in levels.iter().enumerate() {
             let err = (val - lv as f32).abs();
-            if err < min_err { min_err = err; best_idx = idx; }
+            if err < min_err {
+                min_err = err;
+                best_idx = idx;
+            }
         }
         bit_acc |= (best_idx as u64 & code_mask) << acc_bits;
         acc_bits += bits;
         while acc_bits >= 32 {
             let word = (bit_acc & 0xFFFF_FFFF) as u32;
             let mut shuffled = 0u32;
-            for (pos, &target) in shuffle_out.iter().enumerate() { shuffled |= ((word >> pos) & 1) << target; }
+            for (pos, &target) in shuffle_out.iter().enumerate() {
+                shuffled |= ((word >> pos) & 1) << target;
+            }
             output.extend_from_slice(&shuffled.to_le_bytes());
-            bit_acc >>= 32; acc_bits -= 32;
+            bit_acc >>= 32;
+            acc_bits -= 32;
         }
     }
     if acc_bits > 0 {
@@ -416,10 +507,20 @@ pub fn unwrap_phase(phase: &[f64]) -> Vec<f64> {
         let mut offset = 0.0;
         for i in 1..phase.len() {
             let diff = phase[i] - phase[i - 1];
-            if diff > PI { offset -= 2.0 * PI; } else if diff < -PI { offset += 2.0 * PI; }
+            if diff > PI {
+                offset -= 2.0 * PI;
+            } else if diff < -PI {
+                offset += 2.0 * PI;
+            }
             unwrapped.push(phase[i] + offset);
         }
     }
     unwrapped
 }
-pub fn safe_arg(z: &Complex<f64>) -> f64 { if z.re == 0.0 && z.im == 0.0 { 0.0 } else { z.arg() } }
+pub fn safe_arg(z: &Complex<f64>) -> f64 {
+    if z.re == 0.0 && z.im == 0.0 {
+        0.0
+    } else {
+        z.arg()
+    }
+}
