@@ -1,7 +1,7 @@
 
 [package]
 name = "fx-corr"
-version = "1.0.0"
+version = "3.0.13"
 edition = "2021"
 description = "FX correlator toolkit (ACF/XCF/Phased/Corr)"
 authors = ["Masanori AKIMOTO"]
@@ -25,6 +25,14 @@ path = "src/main.rs"
 [[bin]]
 name = "yi-corr"
 path = "src/main.rs"
+
+[[bin]]
+name = "xtask"
+path = "xtask/main.rs"
+
+[[bin]]
+name = "cargo-fx-corr"
+path = "xtask/cargo_fx_corr.rs"
 
 [dependencies]
 clap = { version = "4.5.47", features = ["derive"] }

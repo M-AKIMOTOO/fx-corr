@@ -10,3 +10,33 @@ raw
 *.ps
 
 
+
+# local data / outputs
+data/
+raw/
+cor/
+cor_*/
+debug_yi-corr/
+*.raw
+*.vdif
+*.cor
+*.log
+*.tsv
+
+# temporary patches / backups
+*.before_*
+*.orig
+*.rej
+*.patch
+src/*.before_*
+src/*.orig
+src/*.rej
+src/main_current.rs
+src/main_debug_each_sec.rs
+src/main_now.rs
+src/main_phasefix_tau.rs
+patch/
+patch_*.py
+
+# Rust build
+target/
