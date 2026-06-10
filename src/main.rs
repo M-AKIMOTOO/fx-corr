@@ -520,6 +520,10 @@ struct FrameDelayEntry {
 #[derive(Clone, Copy)]
 struct GeomDelaySample {
     delay_s: f64,
+    rate_sps: f64,
+    accel_sps2: f64,
+    jerk_sps3: f64,
+    snap_sps4: f64,
 }
 
 struct DelayEvalConfig {
@@ -570,10 +574,17 @@ fn compute_frame_delay_entry(
     let (tau1, tau2, tau1_for_fringe, tau2_for_fringe, full_rel_dbg, residual_dbg) =
         if let Some(gd_table) = cfg.geom_delay_table_1s.as_deref() {
             let sec_idx = t_mid_local.floor().max(0.0) as usize;
-            let frac = t_mid_local - sec_idx as f64;
             let i0 = sec_idx.min(gd_table.len().saturating_sub(1));
-            let i1 = (i0 + 1).min(gd_table.len().saturating_sub(1));
-            let gd_t = gd_table[i0].delay_s * (1.0 - frac) + gd_table[i1].delay_s * frac;
+            let dt = t_mid_local - i0 as f64;
+            let gd0 = gd_table[i0];
+            let dt2 = dt * dt;
+            let dt3 = dt2 * dt;
+            let dt4 = dt2 * dt2;
+            let gd_t = gd0.delay_s
+                + gd0.rate_sps * dt
+                + 0.5 * gd0.accel_sps2 * dt2
+                + (1.0 / 6.0) * gd0.jerk_sps3 * dt3
+                + (1.0 / 24.0) * gd0.snap_sps4 * dt4;
             let net_d_rel_no_clock_t = gd_t
                 + cfg.coarse_delay_s
                 + cfg.delay_user_samples / cfg.fs
@@ -2896,9 +2907,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     };
     let geom_delay_table_1s: Option<Arc<[GeomDelaySample]>> = gdi.as_ref().map(|v| {
         let total_duration_sec = total_f as f64 * frame_dt + model_time_offset_s.abs();
+
+        // Need extra guard points because rate/accel/jerk/snap are obtained
+        // by finite differences from the 1-s geometric-delay grid.
         let n_update_secs = total_duration_sec.ceil().max(1.0) as usize;
-        let n_points = n_update_secs + 1;
-        let mut table = Vec::with_capacity(n_points);
+        let n_points = n_update_secs + 5;
+
+        // delay_grid[i] is evaluated at:
+        //   t_abs = total_skip_sec + i [s]
+        //
+        // The grid spacing is exactly 1 s, so finite-difference denominators
+        // are unity in SI units.
+        let mut delay_grid = Vec::with_capacity(n_points);
         for sec in 0..n_points {
             let t_abs_sec = total_skip_sec + sec as f64;
             let mjd_t = v.mjd + t_abs_sec / 86400.0;
@@ -2914,14 +2934,73 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     v.mjd,
                     earth_orientation,
                 );
-            table.push(GeomDelaySample { delay_s: gd_t });
+            delay_grid.push(gd_t);
         }
+
+        let n = delay_grid.len();
+
+        let deriv1 = |i: usize| -> f64 {
+            if n < 2 {
+                0.0
+            } else if i == 0 {
+                delay_grid[1] - delay_grid[0]
+            } else if i + 1 >= n {
+                delay_grid[n - 1] - delay_grid[n - 2]
+            } else {
+                0.5 * (delay_grid[i + 1] - delay_grid[i - 1])
+            }
+        };
+
+        let deriv2 = |i: usize| -> f64 {
+            if n < 3 {
+                0.0
+            } else if i == 0 {
+                delay_grid[2] - 2.0 * delay_grid[1] + delay_grid[0]
+            } else if i + 1 >= n {
+                delay_grid[n - 1] - 2.0 * delay_grid[n - 2] + delay_grid[n - 3]
+            } else {
+                delay_grid[i + 1] - 2.0 * delay_grid[i] + delay_grid[i - 1]
+            }
+        };
+
+        let deriv3 = |i: usize| -> f64 {
+            if n < 5 {
+                0.0
+            } else {
+                let ii = i.clamp(2, n - 3);
+                0.5 * (delay_grid[ii + 2] - 2.0 * delay_grid[ii + 1] + 2.0 * delay_grid[ii - 1]
+                    - delay_grid[ii - 2])
+            }
+        };
+
+        let deriv4 = |i: usize| -> f64 {
+            if n < 5 {
+                0.0
+            } else {
+                let ii = i.clamp(2, n - 3);
+                delay_grid[ii + 2] - 4.0 * delay_grid[ii + 1] + 6.0 * delay_grid[ii]
+                    - 4.0 * delay_grid[ii - 1]
+                    + delay_grid[ii - 2]
+            }
+        };
+
+        let mut table = Vec::with_capacity(n_points);
+        for i in 0..n_points {
+            table.push(GeomDelaySample {
+                delay_s: delay_grid[i],
+                rate_sps: deriv1(i),
+                accel_sps2: deriv2(i),
+                jerk_sps3: deriv3(i),
+                snap_sps4: deriv4(i),
+            });
+        }
+
         Arc::from(table.into_boxed_slice())
     });
     let extra_delay_rate_sps = (rotation_fringe_hz + rate_user_hz) / (obs_mhz * 1e6);
     if geom_delay_table_1s.is_some() {
         println!(
-            "[info] Delay model refinement: 1-second geometric-delay/rate/accel table enabled (quadratic per-frame eval, process scope, {} entries, model-time offset {:+.3} s)",
+            "[info] Delay model refinement: 1-second geometric-delay/rate/accel/jerk/snap table enabled (quartic per-frame eval, process scope, {} entries, model-time offset {:+.3} s)",
             geom_delay_table_1s.as_ref().map(|t| t.len()).unwrap_or(0), model_time_offset_s
         );
         println!(
