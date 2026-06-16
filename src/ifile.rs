@@ -355,6 +355,8 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         .cloned();
     let process_skip_sec = parse_optional_f64(&params, &["skip", "processskip"])?;
     let process_length_sec = parse_optional_f64(&params, &["length", "processlength"])?;
+    let output_hz =
+        parse_optional_f64(&params, &["output", "outputhz", "outratehz", "coroutputhz"])?;
     Ok(IFileData {
         ra: ra.clone(),
         dec: dec.clone(),
@@ -368,7 +370,7 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
             .or_else(|| params.get("label"))
             .cloned(),
         fft: params.get("fft").map(|v| v.parse()).transpose()?,
-        output_sec: parse_optional_f64(&params, &["output", "out", "inttime", "integration"])?,
+        output_sec: output_hz,
         sampling_hz: params
             .get("samplinghz")
             .or_else(|| params.get("fs"))

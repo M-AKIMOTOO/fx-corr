@@ -468,7 +468,7 @@ pub fn parse_xml_schedule_for_process(
     let fft = child_text(stream, "fft")
         .map(|v| v.parse::<usize>())
         .transpose()?;
-    let output_sec = child_text(stream, "output")
+    let output_hz = child_text(stream, "output")
         .map(parse_f64_text)
         .transpose()?;
 
@@ -636,7 +636,7 @@ pub fn parse_xml_schedule_for_process(
         source: source_name,
         stream_label,
         fft,
-        output_sec,
+        output_sec: output_hz,
         sampling_hz,
         ant1_bit,
         ant2_bit,

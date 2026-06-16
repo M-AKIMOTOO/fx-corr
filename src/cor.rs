@@ -254,7 +254,13 @@ impl CorWriter {
         spectrum: &[Complex<f32>],
         model: Option<CorSectorModel>,
     ) -> Result<(), DynError> {
-        self.write_sector_with_model_at(timestamp_unix_sec, 0.0, effective_integ_time_s, spectrum, model)
+        self.write_sector_with_model_at(
+            timestamp_unix_sec,
+            0.0,
+            effective_integ_time_s,
+            spectrum,
+            model,
+        )
     }
 
     pub fn write_sector_with_model_at(

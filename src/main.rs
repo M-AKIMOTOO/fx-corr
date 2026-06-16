@@ -1681,6 +1681,12 @@ fn print_schedule_summary(
             ("stream fft".to_string(), fmt_opt(d.fft)),
             ("stream output [s]".to_string(), fmt_opt_f64(d.output_sec)),
             (
+                "stream output rate".to_string(),
+                d.output_sec
+                    .map(|v| format!("{v:.9} Hz ({:.9} s)", 1.0 / v))
+                    .unwrap_or_else(|| "1.000000000 Hz (1.000000000 s)".to_string()),
+            ),
+            (
                 "stream sampling".to_string(),
                 format!(
                     "xml {} / runtime {}",
@@ -4274,14 +4280,17 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             None
         };
         let frame_sec = fft_len as f64 / fs;
-        let output_sec = d.output_sec.unwrap_or(1.0);
-        if !output_sec.is_finite() || output_sec <= 0.0 {
+        let output_hz = if_d.as_ref().and_then(|d| d.output_sec).unwrap_or(1.0);
+
+        if !output_hz.is_finite() || output_hz <= 0.0 {
             return Err(format!(
-                "stream/output must be a positive finite integration time [s], got {}",
-                output_sec
+                "stream/output must be positive finite rate [Hz], got {}",
+                output_hz
             )
             .into());
         }
+
+        let output_sec = 1.0 / output_hz;
         let frames_per_sector = (output_sec / frame_sec).round().max(1.0) as usize;
         let actual_output_sec = frames_per_sector as f64 * frame_sec;
         let mut sec_counts = Vec::new();
@@ -4292,7 +4301,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             remaining -= nf;
         }
         println!(
-            "[info] Output integration: XML stream/output requested {:.9} s, actual {:.9} s, frames/sector {}, sectors {}",
+            "[info] Output integration: XML stream/output requested {:.9} Hz, actual {:.9} s, frames/sector {}, sectors {}",
             output_sec,
             actual_output_sec,
             frames_per_sector,
@@ -4671,7 +4680,13 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 );
             }
             if let Some(dw) = dbg_writer.as_mut() {
-                writeln!(dw, "[sec {}] frames={} start_frame={}", si + 1, nf, emitted)?;
+                writeln!(
+                    dw,
+                    "[sector {}] frames={} start_frame={}",
+                    si + 1,
+                    nf,
+                    emitted
+                )?;
                 for i in 0..nf {
                     let d = frame_delays[i];
                     writeln!(
