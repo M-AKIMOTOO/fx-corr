@@ -405,21 +405,19 @@ The `3.0.0` correction makes the read-align and residual-delay paths stable:
    residual = +0.501323111 sample -> int=(0,0), frac2=-0.501323111
    ```
 
-3. **The XCF phase correction keeps the full model delay branch continuous.**
-   The large read-align delay changes the raw samples being read, but it does
-   not by itself create a phase slope inside the FFT input array.  The phase
-   correction therefore includes the delay absorbed by read alignment.  For
-   the common case where the residual is applied to antenna 2, this is
-   equivalent to using:
+3. **The XCF phase correction uses the residual fractional delay.**
+   The large read-align delay is already represented by the decoded sample
+   window.  Applying it again as a baseband phase slope decorrelates the XCF.
+   After the integer sample shift, only the remaining sub-sample term is used:
 
    ```text
-   phase_delay1 = 0
-   phase_delay2 = -full_rel
+   phase_delay1 = frac1
+   phase_delay2 = frac2
    ```
 
-   In implementation terms this can also be written as
-   `phase_delay2 = frac2 - read_align_delay`; after the `3.0.0` residual path
-   change, this is equivalent to `-full_rel` and remains continuous.
+   The carrier/fringe phase may keep a continuous delay branch for phase origin
+   bookkeeping, but the per-bin XCF phase slope must stay on the fractional
+   residual left after integer delay tracking.
 
 After these changes, validation over 200 seconds showed that both `fringe` and
 `frinZ --search deep --add` stayed on the same residual-delay branch through the
@@ -1457,6 +1455,64 @@ known:
 
 If omitted, yi-corr uses DUT1=0, TT-UTC=69.184, xp=0, yp=0, and
 time-offset=0.0 s; no empirical GICO3-matching delay offset is applied by default.
+
+#### EOP file operation plan
+
+For detection-oriented VLBI correlation, EOP is an a priori model: it only has
+to keep the signal inside the delay/rate search window and avoid decorrelation
+over the requested coherent integration time. It is not the final geodetic EOP
+solution. A higher-quality EOP model improves long integrations and reduces the
+load on fringe fitting, but yi-corr should still be able to run in an approximate
+mode when the purpose is first detection.
+
+The preferred precise/operational EOP source is IERS rapid/standard
+`finals2000A.data`:
+
+```text
+https://data.iers.org/products/eop/rapid/standard/finals2000A.data
+```
+
+Downloaded EOP tables are time-dependent input data, not Rust source files. Do
+not place `finals2000A.data` under `src/`; `src/eop.rs` should contain only the
+parser, interpolation, cache-selection, and optional-update logic. A practical
+local layout is:
+
+```text
+data/eop/finals2000A.data                  # current local default
+data/eop/archive/finals2000A-YYYYMMDD.data # downloaded snapshots
+```
+
+Old snapshots are important because they preserve the exact Bulletin A prediction
+state used by an earlier correlation run. Automatic network access, if
+implemented, must be opt-in only, for example with `YI_EOP_AUTO_DOWNLOAD=1`, and
+must not silently replace the EOP used for a run. The run log should record the
+EOP file path, snapshot name or timestamp, selected MJD rows, interpolated
+DUT1/xp/yp values, TT-UTC, and whether Bulletin A prediction or Bulletin B final
+values were used.
+
+Implemented EOP modes:
+
+```text
+YI_EOP_MODE=auto    use XML/file EOP when available; otherwise run approximate + warning
+YI_EOP_MODE=strict  require XML/file EOP; fail if unavailable or outside table range
+YI_EOP_MODE=none    force approximate EOP: DUT1=0, xp=0, yp=0, TT-UTC from fallback
+```
+
+Implemented precedence:
+
+```text
+1. XML <eop> explicit values, when present
+2. XML <eop file="..."> or YI_EOP_FILE, interpolated from finals2000A.data
+3. data/eop/finals2000A.data, when present
+4. CLI fallback values --dut1, --tt-utc, --xp, --yp
+5. Environment overrides YI_DUT1_S, YI_TT_UTC_S, YI_XP_ARCSEC, YI_YP_ARCSEC
+6. Approximate EOP only when YI_EOP_MODE=auto/none allows it
+```
+
+For `finals2000A.data`, use Bulletin B values when available for past dates and
+fall back to Bulletin A rapid/predicted values for recent or future dates. In
+first-detection workflows, missing or stale EOP should be a logged warning rather
+than a hard error unless strict mode is selected.
 
 #### Source coordinates: J2000 header vs delay-model coordinates
 

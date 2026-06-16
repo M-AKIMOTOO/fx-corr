@@ -10,6 +10,9 @@ use crate::utils::DynError;
 struct ClockEntry {
     delay_s: f64,
     rate_sps: f64,
+    accel_sps2: f64,
+    jerk_sps3: f64,
+    snap_sps4: f64,
     epoch: Option<String>,
 }
 
@@ -24,9 +27,41 @@ fn child_text<'a>(node: Node<'a, 'a>, tag: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+fn parse_f64_text(raw: &str) -> Result<f64, DynError> {
+    let normalized = raw.trim().replace(
+        ['\u{2212}', '\u{ff0d}', '\u{fe63}', '\u{2013}', '\u{2014}'],
+        "-",
+    );
+    normalized.parse::<f64>().map_err(|e| {
+        format!("invalid numeric value '{raw}' (normalized '{normalized}'): {e}").into()
+    })
+}
+
+fn parse_optional_child_f64(node: Node<'_, '_>, tag: &str, default: f64) -> Result<f64, DynError> {
+    match child_text(node, tag) {
+        Some(v) if !v.is_empty() => parse_f64_text(v),
+        _ => Ok(default),
+    }
+}
+
+fn parse_optional_child_f64_any(
+    node: Node<'_, '_>,
+    tags: &[&str],
+    default: f64,
+) -> Result<f64, DynError> {
+    for tag in tags {
+        if let Some(v) = child_text(node, tag) {
+            if !v.is_empty() {
+                return parse_f64_text(v);
+            }
+        }
+    }
+    Ok(default)
+}
+
 fn parse_opt_f64(node: Node<'_, '_>, tag: &str) -> Result<Option<f64>, DynError> {
     Ok(match child_text(node, tag) {
-        Some(v) if !v.is_empty() => Some(v.parse::<f64>()?),
+        Some(v) if !v.is_empty() => Some(parse_f64_text(v)?),
         _ => None,
     })
 }
@@ -210,9 +245,12 @@ fn push_process_entries(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "2000".to_string());
     let skip_sec = child_text(process, "skip")
-        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(parse_f64_text)
+        .transpose()?
         .unwrap_or(0.0);
-    let length_sec = child_text(process, "length").and_then(|s| s.trim().parse::<f64>().ok());
+    let length_sec = child_text(process, "length")
+        .map(parse_f64_text)
+        .transpose()?;
     let object = child_text(process, "object").map(|s| s.trim().to_string());
     let (ra, dec) = object
         .as_ref()
@@ -254,6 +292,20 @@ pub fn parse_xml_schedule_for_process(
     let delay_model_node = doc
         .descendants()
         .find(|n| is_tag(*n, "delay-model") || is_tag(*n, "delay_model"));
+    let eop_file = eop_node.and_then(|n| {
+        n.attribute("file")
+            .or_else(|| n.attribute("path"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                child_text(n, "file")
+                    .or_else(|| child_text(n, "path"))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            })
+    });
     let dut1_s = eop_node
         .map(|n| parse_opt_f64_any(n, &["dut1"]))
         .transpose()?
@@ -416,6 +468,9 @@ pub fn parse_xml_schedule_for_process(
     let fft = child_text(stream, "fft")
         .map(|v| v.parse::<usize>())
         .transpose()?;
+    let output_sec = child_text(stream, "output")
+        .map(parse_f64_text)
+        .transpose()?;
 
     let default_sideband = "USB";
     let special_by_key: HashMap<String, Node<'_, '_>> = stream
@@ -455,41 +510,83 @@ pub fn parse_xml_schedule_for_process(
     let clock_by_key: HashMap<String, ClockEntry> = doc
         .descendants()
         .filter(|n| is_tag(*n, "clock"))
-        .filter_map(|n| {
-            let key = n.attribute("key")?.trim().to_string();
-            let delay = child_text(n, "delay")
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let rate = child_text(n, "rate")
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
+        .map(|n| -> Result<Option<(String, ClockEntry)>, DynError> {
+            let Some(key_attr) = n.attribute("key") else {
+                return Ok(None);
+            };
+            let key = key_attr.trim().to_string();
+            let delay = match parse_optional_child_f64(n, "delay", 0.0) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            let rate = match parse_optional_child_f64(n, "rate", 0.0) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            let accel = match parse_optional_child_f64_any(
+                n,
+                &["accel", "acel", "acceleration", "accel_sps2"],
+                0.0,
+            ) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            let jerk = match parse_optional_child_f64_any(n, &["jerk", "jerk_sps3"], 0.0) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            let snap = match parse_optional_child_f64_any(n, &["snap", "snap_sps4"], 0.0) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
             let epoch = child_text(n, "epoch").map(|s| s.to_string());
-            Some((
+            Ok(Some((
                 key,
                 ClockEntry {
                     delay_s: delay,
                     rate_sps: rate,
+                    accel_sps2: accel,
+                    jerk_sps3: jerk,
+                    snap_sps4: snap,
                     epoch,
                 },
-            ))
+            )))
         })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
     let clock1 = clock_by_key.get(&ant1_key).cloned().unwrap_or(ClockEntry {
         delay_s: 0.0,
         rate_sps: 0.0,
+        accel_sps2: 0.0,
+        jerk_sps3: 0.0,
+        snap_sps4: 0.0,
         epoch: None,
     });
     let clock2 = clock_by_key.get(&ant2_key).cloned().unwrap_or(ClockEntry {
         delay_s: 0.0,
         rate_sps: 0.0,
+        accel_sps2: 0.0,
+        jerk_sps3: 0.0,
+        snap_sps4: 0.0,
         epoch: None,
     });
     let delay1 = clock1.delay_s;
     let rate1 = clock1.rate_sps;
+    let accel1 = clock1.accel_sps2;
+    let jerk1 = clock1.jerk_sps3;
+    let snap1 = clock1.snap_sps4;
     let delay2 = clock2.delay_s;
     let rate2 = clock2.rate_sps;
+    let accel2 = clock2.accel_sps2;
+    let jerk2 = clock2.jerk_sps3;
+    let snap2 = clock2.snap_sps4;
     let clock_delay_s = Some(delay2 - delay1);
     let clock_rate_sps = Some(rate2 - rate1);
+    let clock_accel_sps2 = Some(accel2 - accel1);
+    let clock_jerk_sps3 = Some(jerk2 - jerk1);
+    let clock_snap_sps4 = Some(snap2 - snap1);
 
     let source_name = selected_process.object.clone();
     let source_node = if let Some(name) = source_name.as_deref() {
@@ -539,6 +636,7 @@ pub fn parse_xml_schedule_for_process(
         source: source_name,
         stream_label,
         fft,
+        output_sec,
         sampling_hz,
         ant1_bit,
         ant2_bit,
@@ -549,10 +647,19 @@ pub fn parse_xml_schedule_for_process(
         obsfreq_mhz,
         clock_delay_s,
         clock_rate_sps,
+        clock_accel_sps2,
+        clock_jerk_sps3,
+        clock_snap_sps4,
         ant1_clock_delay_s: Some(delay1),
         ant2_clock_delay_s: Some(delay2),
         ant1_clock_rate_sps: Some(rate1),
         ant2_clock_rate_sps: Some(rate2),
+        ant1_clock_accel_sps2: Some(accel1),
+        ant2_clock_accel_sps2: Some(accel2),
+        ant1_clock_jerk_sps3: Some(jerk1),
+        ant2_clock_jerk_sps3: Some(jerk2),
+        ant1_clock_snap_sps4: Some(snap1),
+        ant2_clock_snap_sps4: Some(snap2),
         ant1_clock_epoch: clock1.epoch,
         ant2_clock_epoch: clock2.epoch,
         ant1_sideband,
@@ -580,6 +687,7 @@ pub fn parse_xml_schedule_for_process(
         tt_utc_s,
         xp_arcsec,
         yp_arcsec,
+        eop_file,
     })
 }
 
@@ -633,7 +741,8 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
   <clock key="B"><delay>0</delay><rate>0</rate></clock>
 
   <!-- EDIT: Earth orientation and delay-model reference -->
-  <eop><dut1>0.0</dut1><tt-utc>69.184</tt-utc><xp>0.0</xp><yp>0.0</yp></eop>
+  <!-- Use either explicit values or a local IERS finals2000A.data file. -->
+  <eop file="data/eop/finals2000A.data"/>
   <delay-model><time-offset>0.0</time-offset></delay-model>
 
   <!-- EDIT: terminal settings -->
@@ -651,6 +760,7 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
   <stream>
     <frequency>0</frequency>
     <fft>16384</fft>
+    <output>1.0</output>
     <special key="A"><rotation>0</rotation></special>
     <special key="B"><rotation>0</rotation></special>
   </stream>

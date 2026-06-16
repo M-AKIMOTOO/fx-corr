@@ -2,6 +2,7 @@ mod acf;
 mod affinity;
 mod args;
 mod cor;
+mod eop;
 mod geom;
 mod ifile;
 mod plot;
@@ -127,8 +128,18 @@ fn carrier_phase_from_delay(f_hz: f64, tau_s: f64) -> Complex<f32> {
     }
 }
 
-fn delay_seconds_at_time(d_s: f64, r_sps: f64, a_sps2: f64, t_s: f64) -> f64 {
-    d_s + r_sps * t_s + 0.5 * a_sps2 * t_s.powi(2)
+fn delay_seconds_at_time(
+    d_s: f64,
+    r_sps: f64,
+    a_sps2: f64,
+    j_sps3: f64,
+    s_sps4: f64,
+    t_s: f64,
+) -> f64 {
+    let t2 = t_s * t_s;
+    let t3 = t2 * t_s;
+    let t4 = t2 * t2;
+    d_s + r_sps * t_s + 0.5 * a_sps2 * t2 + (1.0 / 6.0) * j_sps3 * t3 + (1.0 / 24.0) * s_sps4 * t4
 }
 
 fn split_delay_to_integer_and_fractional(delay_seconds: f64, fs_hz: f64) -> (i64, f64) {
@@ -469,11 +480,83 @@ fn fx_read_offset_samples() -> i64 {
         .unwrap_or(0)
 }
 
+fn env_f64_override(name: &str, default: f64) -> Result<f64, DynError> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(default)
+            } else {
+                trimmed
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid {name}='{trimmed}': {e}").into())
+            }
+        }
+        Err(_) => Ok(default),
+    }
+}
+
 fn fx_delay_phase_offset_samples() -> f64 {
     std::env::var("YI_FX_DELAY_PHASE_OFFSET")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(0.0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FringeStopFreqMode {
+    Low,
+    Center,
+    High,
+    Obs,
+    Baseband,
+    SidebandEdge,
+}
+
+impl FringeStopFreqMode {
+    fn from_env() -> Result<Self, DynError> {
+        let raw = std::env::var("YI_FRINGE_STOP_FREQ_MODE").unwrap_or_else(|_| "low".to_string());
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "low" | "data-low" | "current" | "default" => Ok(Self::Low),
+            "center" | "centre" | "data-center" => Ok(Self::Center),
+            "high" | "data-high" => Ok(Self::High),
+            "obs" | "obsfreq" | "xml" | "ref" | "reference" => Ok(Self::Obs),
+            "baseband" | "zero" | "none" => Ok(Self::Baseband),
+            "sideband-edge" | "sb-edge" => Ok(Self::SidebandEdge),
+            other => Err(format!(
+                "invalid YI_FRINGE_STOP_FREQ_MODE='{other}' (use low, center, high, obs, baseband, or sideband-edge)"
+            )
+            .into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Center => "center",
+            Self::High => "high",
+            Self::Obs => "obsfreq",
+            Self::Baseband => "baseband",
+            Self::SidebandEdge => "sideband-edge",
+        }
+    }
+
+    fn carrier_mhz(self, data_low_mhz: f64, bw_mhz: f64, obs_mhz: f64, is_lsb: bool) -> f64 {
+        match self {
+            Self::Low => data_low_mhz,
+            Self::Center => data_low_mhz + 0.5 * bw_mhz,
+            Self::High => data_low_mhz + bw_mhz,
+            Self::Obs => obs_mhz,
+            Self::Baseband => 0.0,
+            Self::SidebandEdge => {
+                if is_lsb {
+                    data_low_mhz + bw_mhz
+                } else {
+                    data_low_mhz
+                }
+            }
+        }
+    }
 }
 
 fn xcf_phase_start_and_step(
@@ -486,12 +569,9 @@ fn xcf_phase_start_and_step(
     // Equivalent to rotating s1/s2 spectra independently and then forming
     // s1 * conj(s2).
     //
-    // Important: phase_delay*_s is NOT always only the fractional residual.
-    // When an integer/common delay is absorbed by moving the file read window
-    // (d_seek / sector_d_seek), that shift is not present as a time-domain
-    // shift inside the FFT input array.  Its baseband linear phase must still
-    // be included here, otherwise the XCF/.cor phase jumps when the read
-    // alignment changes between sectors.
+    // Apply the residual sub-sample delay left after integer sample tracking.
+    // The large read-align component is already represented by the decoded
+    // sample window and must not be applied again as a baseband phase slope.
     let two_pi_df = -2.0_f64 * std::f64::consts::PI * df_hz;
     let step1 = two_pi_df * phase_delay1_s;
     let step2 = two_pi_df * phase_delay2_s;
@@ -526,19 +606,97 @@ struct GeomDelaySample {
     snap_sps4: f64,
 }
 
+fn solve_5x5(mut a: [[f64; 5]; 5], mut b: [f64; 5]) -> Option<[f64; 5]> {
+    for col in 0..5 {
+        let mut pivot = col;
+        let mut pivot_abs = a[col][col].abs();
+        for row in (col + 1)..5 {
+            let v = a[row][col].abs();
+            if v > pivot_abs {
+                pivot = row;
+                pivot_abs = v;
+            }
+        }
+        if pivot_abs < 1.0e-24 {
+            return None;
+        }
+        if pivot != col {
+            a.swap(col, pivot);
+            b.swap(col, pivot);
+        }
+        let inv = 1.0 / a[col][col];
+        for j in col..5 {
+            a[col][j] *= inv;
+        }
+        b[col] *= inv;
+        for row in 0..5 {
+            if row == col {
+                continue;
+            }
+            let f = a[row][col];
+            if f == 0.0 {
+                continue;
+            }
+            for j in col..5 {
+                a[row][j] -= f * a[col][j];
+            }
+            b[row] -= f * b[col];
+        }
+    }
+    Some(b)
+}
+
+fn local_quartic_derivatives(
+    delay_grid: &[f64],
+    center_idx: usize,
+    radius: usize,
+) -> (f64, f64, f64, f64) {
+    let center = delay_grid[center_idx];
+    let start = center_idx.saturating_sub(radius);
+    let end = (center_idx + radius).min(delay_grid.len().saturating_sub(1));
+    let mut normal = [[0.0_f64; 5]; 5];
+    let mut rhs = [0.0_f64; 5];
+    for idx in start..=end {
+        let x = idx as f64 - center_idx as f64;
+        let y = delay_grid[idx] - center;
+        let mut p = [1.0_f64; 9];
+        for k in 1..p.len() {
+            p[k] = p[k - 1] * x;
+        }
+        for r in 0..5 {
+            rhs[r] += p[r] * y;
+            for c in 0..5 {
+                normal[r][c] += p[r + c];
+            }
+        }
+    }
+    if let Some(c) = solve_5x5(normal, rhs) {
+        (c[1], 2.0 * c[2], 6.0 * c[3], 24.0 * c[4])
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    }
+}
+
 struct DelayEvalConfig {
     frame_dt: f64,
     model_time_offset_s: f64,
     fs: f64,
     time_offset_s: f64,
     geom_delay_table_1s: Option<Arc<[GeomDelaySample]>>,
+    geom_poly_order: u8,
     coarse_delay_s: f64,
     delay_user_samples: f64,
     extra_delay_rate_sps: f64,
     clock1_delay_s: f64,
     clock1_rate_sps: f64,
+    clock1_accel_sps2: f64,
+    clock1_jerk_sps3: f64,
+    clock1_snap_sps4: f64,
     clock2_delay_s: f64,
     clock2_rate_sps: f64,
+    clock2_accel_sps2: f64,
+    clock2_jerk_sps3: f64,
+    clock2_snap_sps4: f64,
     d_seek: f64,
     residual_on_ant2: bool,
     // Opt-in experiment: use process-start read alignment and update the
@@ -549,9 +707,13 @@ struct DelayEvalConfig {
     net_d1_base: f64,
     total_rate1_base: f64,
     total_accel1_base: f64,
+    total_jerk1_base: f64,
+    total_snap1_base: f64,
     net_d2_base: f64,
     total_rate2_base: f64,
     total_accel2_base: f64,
+    total_jerk2_base: f64,
+    total_snap2_base: f64,
     lo1_hz: f64,
     lo2_hz: f64,
     fx_integer_delay: bool,
@@ -582,15 +744,38 @@ fn compute_frame_delay_entry(
             let dt4 = dt2 * dt2;
             let gd_t = gd0.delay_s
                 + gd0.rate_sps * dt
-                + 0.5 * gd0.accel_sps2 * dt2
-                + (1.0 / 6.0) * gd0.jerk_sps3 * dt3
-                + (1.0 / 24.0) * gd0.snap_sps4 * dt4;
+                + if cfg.geom_poly_order >= 2 {
+                    0.5 * gd0.accel_sps2 * dt2
+                } else {
+                    0.0
+                }
+                + if cfg.geom_poly_order >= 3 {
+                    (1.0 / 6.0) * gd0.jerk_sps3 * dt3
+                } else {
+                    0.0
+                }
+                + if cfg.geom_poly_order >= 4 {
+                    (1.0 / 24.0) * gd0.snap_sps4 * dt4
+                } else {
+                    0.0
+                };
             let net_d_rel_no_clock_t = gd_t
                 + cfg.coarse_delay_s
                 + cfg.delay_user_samples / cfg.fs
                 + cfg.extra_delay_rate_sps * t_mid;
-            let clock1_t = cfg.clock1_delay_s + cfg.clock1_rate_sps * t_mid;
-            let clock2_t = cfg.clock2_delay_s + cfg.clock2_rate_sps * t_mid;
+            let t2 = t_mid * t_mid;
+            let t3 = t2 * t_mid;
+            let t4 = t2 * t2;
+            let clock1_t = cfg.clock1_delay_s
+                + cfg.clock1_rate_sps * t_mid
+                + 0.5 * cfg.clock1_accel_sps2 * t2
+                + (1.0 / 6.0) * cfg.clock1_jerk_sps3 * t3
+                + (1.0 / 24.0) * cfg.clock1_snap_sps4 * t4;
+            let clock2_t = cfg.clock2_delay_s
+                + cfg.clock2_rate_sps * t_mid
+                + 0.5 * cfg.clock2_accel_sps2 * t2
+                + (1.0 / 6.0) * cfg.clock2_jerk_sps3 * t3
+                + (1.0 / 24.0) * cfg.clock2_snap_sps4 * t4;
             // Apply only relative clock delay/rate to avoid large common-mode shifts.
             // Large absolute per-station clocks can exceed small FFT frame length and
             // zero-fill whole frames even though the baseline-relative delay is small.
@@ -607,12 +792,16 @@ fn compute_frame_delay_entry(
                 cfg.net_d1_base,
                 cfg.total_rate1_base,
                 cfg.total_accel1_base,
+                cfg.total_jerk1_base,
+                cfg.total_snap1_base,
                 t_mid,
             );
             let tau2_res = delay_seconds_at_time(
                 cfg.net_d2_base,
                 cfg.total_rate2_base,
                 cfg.total_accel2_base,
+                cfg.total_jerk2_base,
+                cfg.total_snap2_base,
                 t_mid,
             );
             if cfg.residual_on_ant2 {
@@ -691,10 +880,9 @@ fn compute_frame_delay_entry(
         int2,
         frac1,
         frac2,
-        // Keep the carrier / fringe phase origin consistent with the
-        // per-frame integer delay split.  The integer part has already been
-        // applied as a time-domain sample shift, so only the remaining
-        // fractional delay should contribute to the per-frame LO phase.
+        // Keep the carrier / fringe phase origin tied to the continuous
+        // pre-read-align delay branch.  The baseband XCF phase slope uses
+        // only the residual fractional delay left after integer sample tracking.
         fr_lo1: carrier_phase_from_delay(cfg.lo1_hz, tau1_for_fringe),
         fr_lo2: carrier_phase_from_delay(cfg.lo2_hz, tau2_for_fringe),
     }
@@ -1314,9 +1502,12 @@ struct ScheduleGlobalView<'a> {
     geom_delay_s: f64,
     geom_rate_sps: f64,
     geom_accel_sps2: f64,
+    geom_eval_offset_s: f64,
+    read_align_ref_offset_s: f64,
     geom_rate_hz_at_obs: f64,
     rel_clock_delay_s: f64,
     rel_clock_rate_sps: f64,
+    clock_epoch_mode: &'a str,
     coarse_delay_s: f64,
     coarse_delay_samples: f64,
     res_delay_input_samples: f64,
@@ -1359,8 +1550,18 @@ struct ScheduleAntennaView<'a> {
     shuffle_ext: &'a [usize],
     sideband: &'a str,
     rotation_hz: f64,
+    clock_epoch: Option<&'a str>,
+    clock_epoch_dt_s: Option<f64>,
+    clock_delay_raw_s: f64,
+    clock_rate_raw_sps: f64,
+    clock_accel_raw_sps2: f64,
+    clock_jerk_raw_sps3: f64,
+    clock_snap_raw_sps4: f64,
     clock_delay_s: f64,
     clock_rate_sps: f64,
+    clock_accel_sps2: f64,
+    clock_jerk_sps3: f64,
+    clock_snap_sps4: f64,
     center_mhz: Option<f64>,
     bw_mhz: Option<f64>,
 }
@@ -1478,6 +1679,7 @@ fn print_schedule_summary(
                 },
             ),
             ("stream fft".to_string(), fmt_opt(d.fft)),
+            ("stream output [s]".to_string(), fmt_opt_f64(d.output_sec)),
             (
                 "stream sampling".to_string(),
                 format!(
@@ -1517,6 +1719,13 @@ fn print_schedule_summary(
             format!("{:.6e} s/s^2", gv.geom_accel_sps2),
         ),
         (
+            "geom eval offset".to_string(),
+            format!(
+                "start {:+.3} s, read-align {:+.3} s",
+                gv.geom_eval_offset_s, gv.read_align_ref_offset_s
+            ),
+        ),
+        (
             "geom rate @obsfreq".to_string(),
             format!("{:.6} Hz", gv.geom_rate_hz_at_obs),
         ),
@@ -1527,6 +1736,7 @@ fn print_schedule_summary(
                 gv.rel_clock_delay_s, gv.rel_clock_rate_sps
             ),
         ),
+        ("clock epoch mode".to_string(), gv.clock_epoch_mode.to_string()),
         (
             "coarse/res-delay".to_string(),
             format!(
@@ -1676,9 +1886,63 @@ fn print_schedule_summary(
             format!("{} / {}", a2.sideband, fmt_hz_to_mhz(a2.rotation_hz)),
         ),
         (
-            "clock delay/rate".to_string(),
-            format!("{:.6e} / {:.6e}", a1.clock_delay_s, a1.clock_rate_sps),
-            format!("{:.6e} / {:.6e}", a2.clock_delay_s, a2.clock_rate_sps),
+            "clock epoch".to_string(),
+            a1.clock_epoch
+                .map(|ep| {
+                    format!(
+                        "{} (dt to process {:+.3} s)",
+                        ep,
+                        a1.clock_epoch_dt_s.unwrap_or(0.0)
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string()),
+            a2.clock_epoch
+                .map(|ep| {
+                    format!(
+                        "{} (dt to process {:+.3} s)",
+                        ep,
+                        a2.clock_epoch_dt_s.unwrap_or(0.0)
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "clock XML delay/rate/accel/jerk/snap".to_string(),
+            format!(
+                "{:.6e} / {:.6e} / {:.6e} / {:.6e} / {:.6e}",
+                a1.clock_delay_raw_s,
+                a1.clock_rate_raw_sps,
+                a1.clock_accel_raw_sps2,
+                a1.clock_jerk_raw_sps3,
+                a1.clock_snap_raw_sps4
+            ),
+            format!(
+                "{:.6e} / {:.6e} / {:.6e} / {:.6e} / {:.6e}",
+                a2.clock_delay_raw_s,
+                a2.clock_rate_raw_sps,
+                a2.clock_accel_raw_sps2,
+                a2.clock_jerk_raw_sps3,
+                a2.clock_snap_raw_sps4
+            ),
+        ),
+        (
+            "clock effective delay/rate/accel/jerk/snap".to_string(),
+            format!(
+                "{:.6e} / {:.6e} / {:.6e} / {:.6e} / {:.6e}",
+                a1.clock_delay_s,
+                a1.clock_rate_sps,
+                a1.clock_accel_sps2,
+                a1.clock_jerk_sps3,
+                a1.clock_snap_sps4
+            ),
+            format!(
+                "{:.6e} / {:.6e} / {:.6e} / {:.6e} / {:.6e}",
+                a2.clock_delay_s,
+                a2.clock_rate_sps,
+                a2.clock_accel_sps2,
+                a2.clock_jerk_sps3,
+                a2.clock_snap_sps4
+            ),
         ),
         (
             "freq range [MHz]".to_string(),
@@ -2017,6 +2281,79 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         args.yp
     };
 
+    let explicit_xml_eop = if schedule_param_source_xml {
+        if_d.as_ref().is_some_and(|d| {
+            d.dut1_s.is_some()
+                || d.tt_utc_s.is_some()
+                || d.xp_arcsec.is_some()
+                || d.yp_arcsec.is_some()
+        })
+    } else {
+        false
+    };
+    let explicit_env_eop = ["YI_DUT1_S", "YI_TT_UTC_S", "YI_XP_ARCSEC", "YI_YP_ARCSEC"]
+        .iter()
+        .all(|name| std::env::var_os(name).is_some());
+    let eop_mode = std::env::var("YI_EOP_MODE")
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_ascii_lowercase();
+    if !matches!(eop_mode.as_str(), "auto" | "strict" | "none") {
+        return Err(format!("invalid YI_EOP_MODE='{eop_mode}' (use auto, strict, or none)").into());
+    }
+    let mut dut1_s = dut1_s;
+    let mut tt_utc_s = tt_utc_s;
+    let mut xp_arcsec = xp_arcsec;
+    let mut yp_arcsec = yp_arcsec;
+    if !explicit_xml_eop && !explicit_env_eop && eop_mode != "none" {
+        let eop_path = if_d
+            .as_ref()
+            .and_then(|d| d.eop_file.clone())
+            .or_else(|| std::env::var_os("YI_EOP_FILE").map(PathBuf::from))
+            .or_else(|| {
+                let default = PathBuf::from("data/eop/finals2000A.data");
+                default.exists().then_some(default)
+            });
+        if let Some(path) = eop_path {
+            match eop::interpolate_finals2000a(&path, geom::parse_epoch_to_mjd(&ep_i)?) {
+                Ok(v) => {
+                    dut1_s = v.dut1_s;
+                    tt_utc_s = v.tt_utc_s;
+                    xp_arcsec = v.xp_arcsec;
+                    yp_arcsec = v.yp_arcsec;
+                    println!(
+                        "[info] EOP file: {} MJD {:.1}..{:.1} {}..{} -> DUT1={:+.6}s TT-UTC={:+.6}s xp={:+.6}arcsec yp={:+.6}arcsec",
+                        v.source,
+                        v.mjd0,
+                        v.mjd1,
+                        v.kind0.as_str(),
+                        v.kind1.as_str(),
+                        dut1_s,
+                        tt_utc_s,
+                        xp_arcsec,
+                        yp_arcsec
+                    );
+                }
+                Err(e) if eop_mode == "strict" => return Err(e),
+                Err(e) => {
+                    println!(
+                        "[warn] EOP file unavailable for this epoch ({e}); using fallback DUT1/TT-UTC/xp/yp"
+                    );
+                }
+            }
+        } else if eop_mode == "strict" {
+            return Err("YI_EOP_MODE=strict requires XML <eop file=...>, YI_EOP_FILE, or data/eop/finals2000A.data".into());
+        } else {
+            println!(
+                "[warn] no EOP file specified/found; using fallback DUT1/TT-UTC/xp/yp (YI_EOP_MODE=auto)"
+            );
+        }
+    }
+
+    let dut1_s = env_f64_override("YI_DUT1_S", dut1_s)?;
+    let tt_utc_s = env_f64_override("YI_TT_UTC_S", tt_utc_s)?;
+    let xp_arcsec = env_f64_override("YI_XP_ARCSEC", xp_arcsec)?;
+    let yp_arcsec = env_f64_override("YI_YP_ARCSEC", yp_arcsec)?;
+
     let mut gdi: Option<GDI> = None;
     struct GDI {
         ra: f64,
@@ -2044,6 +2381,44 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         xp_arcsec,
         yp_arcsec,
     };
+    let geom_delay_mode = match std::env::var("YI_GEOM_DELAY_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "anchored" | "mixed" | "default" => geom::GeometricDelayMode::Anchored,
+            "bary" | "barycentric" | "absolute-barycentric" => {
+                geom::GeometricDelayMode::Barycentric
+            }
+            "vlbi-minus" | "barycentric-minus" | "first-order-minus" => {
+                geom::GeometricDelayMode::VlbiMinus
+            }
+            "vlbi-plus" | "barycentric-plus" | "first-order-plus" | "vlbi" => {
+                geom::GeometricDelayMode::VlbiPlus
+            }
+            "geo" | "geocentric" | "absolute-geocentric" => geom::GeometricDelayMode::Geocentric,
+            other => {
+                return Err(format!(
+                    "invalid YI_GEOM_DELAY_MODE='{other}' (use anchored, barycentric, vlbi-minus, vlbi-plus, or geocentric)"
+                )
+                .into())
+            }
+        },
+        Err(_) => geom::GeometricDelayMode::Anchored,
+    };
+    let source_vector_mode = match std::env::var("YI_SOURCE_VECTOR_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "mean" | "mean-gast" | "precess-gast" | "default" => {
+                geom::SourceVectorMode::MeanGast
+            }
+            "pnm" | "pnm-gast" | "true-gast" => geom::SourceVectorMode::PnmGast,
+            "pnm-era" | "era" | "c2t" | "c2t-era" => geom::SourceVectorMode::PnmEra,
+            other => {
+                return Err(format!(
+                    "invalid YI_SOURCE_VECTOR_MODE='{other}' (use mean-gast, pnm-gast, or pnm-era)"
+                )
+                .into())
+            }
+        },
+        Err(_) => geom::SourceVectorMode::MeanGast,
+    };
     if let (Some(ra_s), Some(dec_s)) = (ra_in, dec_in) {
         let (ra_raw, dec_raw, mjd) = (
             geom::parse_ra(&ra_s)?,
@@ -2054,13 +2429,20 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         // Keep the original J2000 coordinates for .cor headers separately.
         let mjd_tt = mjd + tt_utc_s / 86400.0;
         let (ra, dec) = geom::precess_j2000_to_mean_of_date(ra_raw, dec_raw, mjd_tt);
-        let (_, _, gd, gr, ga) = geom::calculate_geometric_delay_and_derivatives_with_eop(
+        let (ra_model, dec_model) = match source_vector_mode {
+            geom::SourceVectorMode::MeanGast => (ra, dec),
+            geom::SourceVectorMode::PnmGast | geom::SourceVectorMode::PnmEra => (ra_raw, dec_raw),
+        };
+        let (_, _, gd, gr, ga) = geom::calculate_geometric_delay_and_derivatives_full_with_eop(
             ant1_ecef,
             ant2_ecef,
-            ra,
-            dec,
+            ra_model,
+            dec_model,
+            mjd,
             mjd,
             earth_orientation,
+            geom_delay_mode,
+            source_vector_mode,
         );
         gdi = Some(GDI {
             ra,
@@ -2075,6 +2457,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     }
     let clock_delay_rel_legacy_s = if_d.as_ref().and_then(|d| d.clock_delay_s).unwrap_or(0.0);
     let clock_rate_rel_legacy_sps = if_d.as_ref().and_then(|d| d.clock_rate_sps).unwrap_or(0.0);
+    let clock_accel_rel_legacy_sps2 = if_d
+        .as_ref()
+        .and_then(|d| d.clock_accel_sps2)
+        .unwrap_or(0.0);
+    let clock_jerk_rel_legacy_sps3 = if_d.as_ref().and_then(|d| d.clock_jerk_sps3).unwrap_or(0.0);
+    let clock_snap_rel_legacy_sps4 = if_d.as_ref().and_then(|d| d.clock_snap_sps4).unwrap_or(0.0);
     let clock1_delay_base_s = if_d
         .as_ref()
         .and_then(|d| d.ant1_clock_delay_s)
@@ -2091,6 +2479,38 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         .as_ref()
         .and_then(|d| d.ant2_clock_rate_sps)
         .unwrap_or(clock1_rate_sps + clock_rate_rel_legacy_sps);
+    let clock1_rate_raw_sps = clock1_rate_sps;
+    let clock2_rate_raw_sps = clock2_rate_sps;
+    let clock1_accel_sps2_from_meta = if_d
+        .as_ref()
+        .and_then(|d| d.ant1_clock_accel_sps2)
+        .unwrap_or(0.0);
+    let clock2_accel_sps2_from_meta = if_d
+        .as_ref()
+        .and_then(|d| d.ant2_clock_accel_sps2)
+        .unwrap_or(clock1_accel_sps2_from_meta + clock_accel_rel_legacy_sps2);
+    let clock1_jerk_sps3_from_meta = if_d
+        .as_ref()
+        .and_then(|d| d.ant1_clock_jerk_sps3)
+        .unwrap_or(0.0);
+    let clock2_jerk_sps3_from_meta = if_d
+        .as_ref()
+        .and_then(|d| d.ant2_clock_jerk_sps3)
+        .unwrap_or(clock1_jerk_sps3_from_meta + clock_jerk_rel_legacy_sps3);
+    let clock1_snap_sps4_from_meta = if_d
+        .as_ref()
+        .and_then(|d| d.ant1_clock_snap_sps4)
+        .unwrap_or(0.0);
+    let clock2_snap_sps4_from_meta = if_d
+        .as_ref()
+        .and_then(|d| d.ant2_clock_snap_sps4)
+        .unwrap_or(clock1_snap_sps4_from_meta + clock_snap_rel_legacy_sps4);
+    let clock1_accel_raw_sps2 = clock1_accel_sps2_from_meta;
+    let clock2_accel_raw_sps2 = clock2_accel_sps2_from_meta;
+    let clock1_jerk_raw_sps3 = clock1_jerk_sps3_from_meta;
+    let clock2_jerk_raw_sps3 = clock2_jerk_sps3_from_meta;
+    let clock1_snap_raw_sps4 = clock1_snap_sps4_from_meta;
+    let clock2_snap_raw_sps4 = clock2_snap_sps4_from_meta;
     let clock1_epoch = if_d
         .as_ref()
         .and_then(|d| d.ant1_clock_epoch.as_deref())
@@ -2099,34 +2519,129 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         .as_ref()
         .and_then(|d| d.ant2_clock_epoch.as_deref())
         .map(|s| s.to_string());
-    let clock1_epoch_offset_s = if let Some(ep) = clock1_epoch.as_deref() {
-        let (clock_unix, _) = epoch_to_yyyydddhhmmss(ep)
-            .map_err(|e| format!("invalid ant1 clock epoch '{}': {}", ep, e))?;
-        Some((c_unix_base - clock_unix) as f64)
-    } else {
-        None
+    let parse_clock_epoch_offset = |station: &str,
+                                    ep: Option<&str>|
+     -> Result<Option<f64>, DynError> {
+        let Some(ep) = ep else {
+            return Ok(None);
+        };
+        let ep_trim = ep.trim();
+        match ep_trim.to_ascii_lowercase().as_str() {
+            "" | "process" | "process-epoch" | "scan" | "scan-epoch" | "current" => Ok(Some(0.0)),
+            _ => {
+                let (clock_unix, _) = epoch_to_yyyydddhhmmss(ep_trim)
+                    .map_err(|e| format!("invalid {station} clock epoch '{}': {}", ep_trim, e))?;
+                Ok(Some((c_unix_base - clock_unix) as f64))
+            }
+        }
     };
-    let clock2_epoch_offset_s = if let Some(ep) = clock2_epoch.as_deref() {
-        let (clock_unix, _) = epoch_to_yyyydddhhmmss(ep)
-            .map_err(|e| format!("invalid ant2 clock epoch '{}': {}", ep, e))?;
-        Some((c_unix_base - clock_unix) as f64)
-    } else {
-        None
+    let clock1_epoch_offset_s = parse_clock_epoch_offset("ant1", clock1_epoch.as_deref())?;
+    let clock2_epoch_offset_s = parse_clock_epoch_offset("ant2", clock2_epoch.as_deref())?;
+    let clock_epoch_mode = match std::env::var("YI_CLOCK_EPOCH_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "process" | "process-epoch" | "frinz" | "residual" => "process",
+            "clock" | "clock-epoch" | "propagate" | "absolute" => "clock",
+            other => {
+                return Err(
+                    format!("invalid YI_CLOCK_EPOCH_MODE='{other}' (use process or clock)").into(),
+                )
+            }
+        },
+        Err(_) => "clock",
     };
-    // Clock delay/rate are defined at each <clock><epoch>; if present, propagate
-    // delay to the process epoch before per-frame evaluation.
-    let clock1_delay_s =
-        clock1_delay_base_s + clock1_rate_sps * clock1_epoch_offset_s.unwrap_or(0.0);
-    let clock2_delay_s =
-        clock2_delay_base_s + clock2_rate_sps * clock2_epoch_offset_s.unwrap_or(0.0);
+    let propagate_clock_epoch = clock_epoch_mode == "clock";
+
+    // XML clock terms are defined at their own clock epoch.  Propagate them to
+    // the process epoch before per-frame evaluation.  Use
+    // YI_CLOCK_EPOCH_MODE=process only for empirical frinZ residual corrections
+    // that have already been solved at the process epoch.
+    let clock1_dt0 = if propagate_clock_epoch {
+        clock1_epoch_offset_s.unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let clock2_dt0 = if propagate_clock_epoch {
+        clock2_epoch_offset_s.unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let clock1_dt0_2 = clock1_dt0 * clock1_dt0;
+    let clock1_dt0_3 = clock1_dt0_2 * clock1_dt0;
+    let clock1_dt0_4 = clock1_dt0_2 * clock1_dt0_2;
+    let clock2_dt0_2 = clock2_dt0 * clock2_dt0;
+    let clock2_dt0_3 = clock2_dt0_2 * clock2_dt0;
+    let clock2_dt0_4 = clock2_dt0_2 * clock2_dt0_2;
+    let clock1_delay_s = clock1_delay_base_s
+        + clock1_rate_sps * clock1_dt0
+        + 0.5 * clock1_accel_sps2_from_meta * clock1_dt0_2
+        + (1.0 / 6.0) * clock1_jerk_sps3_from_meta * clock1_dt0_3
+        + (1.0 / 24.0) * clock1_snap_sps4_from_meta * clock1_dt0_4;
+    let clock2_delay_s = clock2_delay_base_s
+        + clock2_rate_sps * clock2_dt0
+        + 0.5 * clock2_accel_sps2_from_meta * clock2_dt0_2
+        + (1.0 / 6.0) * clock2_jerk_sps3_from_meta * clock2_dt0_3
+        + (1.0 / 24.0) * clock2_snap_sps4_from_meta * clock2_dt0_4;
+    let clock1_rate_sps = clock1_rate_sps
+        + clock1_accel_sps2_from_meta * clock1_dt0
+        + 0.5 * clock1_jerk_sps3_from_meta * clock1_dt0_2
+        + (1.0 / 6.0) * clock1_snap_sps4_from_meta * clock1_dt0_3;
+    let clock2_rate_sps = clock2_rate_sps
+        + clock2_accel_sps2_from_meta * clock2_dt0
+        + 0.5 * clock2_jerk_sps3_from_meta * clock2_dt0_2
+        + (1.0 / 6.0) * clock2_snap_sps4_from_meta * clock2_dt0_3;
+    let clock1_accel_sps2_from_meta = clock1_accel_sps2_from_meta
+        + clock1_jerk_sps3_from_meta * clock1_dt0
+        + 0.5 * clock1_snap_sps4_from_meta * clock1_dt0_2;
+    let clock2_accel_sps2_from_meta = clock2_accel_sps2_from_meta
+        + clock2_jerk_sps3_from_meta * clock2_dt0
+        + 0.5 * clock2_snap_sps4_from_meta * clock2_dt0_2;
+    let clock1_jerk_sps3_from_meta =
+        clock1_jerk_sps3_from_meta + clock1_snap_sps4_from_meta * clock1_dt0;
+    let clock2_jerk_sps3_from_meta =
+        clock2_jerk_sps3_from_meta + clock2_snap_sps4_from_meta * clock2_dt0;
+    // Optional relative clock polynomial offsets for engineering tests.
+    // Production clock acceleration should be supplied in XML / ifile metadata.
+    // These offsets are applied with t=0 at the process epoch and
+    // t=skip+local_time in per-frame evaluation.
+    let parse_env_f64 = |name: &str, default: f64| -> Result<f64, DynError> {
+        match std::env::var(name) {
+            Ok(v) => v
+                .trim()
+                .parse::<f64>()
+                .map_err(|e| format!("invalid {name}='{v}': {e}").into()),
+            Err(_) => Ok(default),
+        }
+    };
+    let rel_clock_delay_offset_s = parse_env_f64("YI_REL_CLOCK_DELAY_S", 0.0)?;
+    let rel_clock_rate_offset_sps = parse_env_f64("YI_REL_CLOCK_RATE_SPS", 0.0)?;
+    let rel_clock_accel_sps2 = parse_env_f64("YI_REL_CLOCK_ACCEL_SPS2", 0.0)?;
+    let rel_clock_jerk_sps3 = parse_env_f64("YI_REL_CLOCK_JERK_SPS3", 0.0)?;
+    let rel_clock_snap_sps4 = parse_env_f64("YI_REL_CLOCK_SNAP_SPS4", 0.0)?;
+    let clock1_accel_sps2 =
+        clock1_accel_sps2_from_meta + parse_env_f64("YI_CLOCK1_ACCEL_SPS2", 0.0)?;
+    let clock2_accel_sps2 = clock2_accel_sps2_from_meta
+        + parse_env_f64("YI_CLOCK2_ACCEL_SPS2", 0.0)?
+        + rel_clock_accel_sps2;
+    let clock1_jerk_sps3 = clock1_jerk_sps3_from_meta + parse_env_f64("YI_CLOCK1_JERK_SPS3", 0.0)?;
+    let clock2_jerk_sps3 = clock2_jerk_sps3_from_meta
+        + parse_env_f64("YI_CLOCK2_JERK_SPS3", 0.0)?
+        + rel_clock_jerk_sps3;
+    let clock1_snap_sps4 = clock1_snap_sps4_from_meta + parse_env_f64("YI_CLOCK1_SNAP_SPS4", 0.0)?;
+    let clock2_snap_sps4 = clock2_snap_sps4_from_meta
+        + parse_env_f64("YI_CLOCK2_SNAP_SPS4", 0.0)?
+        + rel_clock_snap_sps4;
+    let clock1_delay_s = clock1_delay_s;
+    let clock2_delay_s = clock2_delay_s + rel_clock_delay_offset_s;
+    let clock1_rate_sps = clock1_rate_sps;
+    let clock2_rate_sps = clock2_rate_sps + rel_clock_rate_offset_sps;
     let clock_delay_s = clock2_delay_s - clock1_delay_s;
     let clock_rate_sps = clock2_rate_sps - clock1_rate_sps;
+    let clock_accel_sps2 = clock2_accel_sps2 - clock1_accel_sps2;
+    let clock_jerk_sps3 = clock2_jerk_sps3 - clock1_jerk_sps3;
+    let clock_snap_sps4 = clock2_snap_sps4 - clock1_snap_sps4;
     let coarse_delay_s = args.coarse.unwrap_or(DEFAULT_COARSE_DELAY_S);
     let delay_user_samples = args.delay + args.resdelay;
     let rate_user_hz = args.rate + args.resrate;
-    let net_d_rel_no_clock0 = gd0 + coarse_delay_s + delay_user_samples / fs;
-    let net_d0 = net_d_rel_no_clock0 + clock_delay_s;
-
     let rot1_regular = if_d
         .as_ref()
         .and_then(|d| d.ant1_rotation_hz)
@@ -2174,8 +2689,11 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let rotation_bins2 = (rot2 / (fs / fft_len as f64)).round() as isize;
     let a1_corr_low = a1_data_low - rot1 / 1e6;
     let a2_corr_low = a2_data_low - rot2 / 1e6;
-    let lo1_hz = a1_data_low * 1e6;
-    let lo2_hz = a2_data_low * 1e6;
+    let fringe_stop_freq_mode = FringeStopFreqMode::from_env()?;
+    let lo1_mhz = fringe_stop_freq_mode.carrier_mhz(a1_data_low, bw, obs_mhz, lsb1_raw);
+    let lo2_mhz = fringe_stop_freq_mode.carrier_mhz(a2_data_low, bw, obs_mhz, lsb2_raw);
+    let lo1_hz = lo1_mhz * 1e6;
+    let lo2_hz = lo2_mhz * 1e6;
     let ba = if rotation_hermitian_mode {
         compute_band_alignment(
             fft_len,
@@ -2276,6 +2794,44 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let (o_dir, o_path) = resolve_output_layout(&args, &c_tag, run_mode)?;
     let process_window_sec = args.length.or(xml_length_sec);
 
+    let eval_geom_at_elapsed = |elapsed_s: f64| -> Result<(f64, f64, f64), DynError> {
+        if let Some(v) = gdi.as_ref() {
+            let mjd_t = v.mjd + elapsed_s / 86400.0;
+            let mjd_tt_t = mjd_t + tt_utc_s / 86400.0;
+            let (ra_t, dec_t) = match source_vector_mode {
+                geom::SourceVectorMode::MeanGast => {
+                    geom::precess_j2000_to_mean_of_date(v.ra_raw, v.dec_raw, mjd_tt_t)
+                }
+                geom::SourceVectorMode::PnmGast | geom::SourceVectorMode::PnmEra => {
+                    (v.ra_raw, v.dec_raw)
+                }
+            };
+            let (_, _, gd_t, gr_t, ga_t) =
+                geom::calculate_geometric_delay_and_derivatives_full_with_eop(
+                    ant1_ecef,
+                    ant2_ecef,
+                    ra_t,
+                    dec_t,
+                    mjd_t,
+                    v.mjd,
+                    earth_orientation,
+                    geom_delay_mode,
+                    source_vector_mode,
+                );
+            Ok((gd_t, gr_t, ga_t))
+        } else {
+            Ok((
+                gd0 + gr0 * elapsed_s + 0.5 * ga0 * elapsed_s * elapsed_s,
+                gr0 + ga0 * elapsed_s,
+                ga0,
+            ))
+        }
+    };
+    let (geom_delay_at_start_s, geom_rate_at_start_sps, geom_accel_at_start_sps2) =
+        eval_geom_at_elapsed(total_skip_sec)?;
+    let net_d_rel_no_clock0 = geom_delay_at_start_s + coarse_delay_s + delay_user_samples / fs;
+    let net_d0 = net_d_rel_no_clock0 + clock_delay_s;
+
     let total_samples1 = (f1_m.len() * 8) / bit1 as u64;
     let total_samples2 = (f2_m.len() * 8) / bit2 as u64;
 
@@ -2320,11 +2876,21 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let rotation_fringe_hz_for_align = -((rot1 - rot2) - rotation_shift_hz_for_align);
     let extra_delay_rate_sps_for_align =
         (rotation_fringe_hz_for_align + rate_user_hz) / (obs_mhz * 1e6);
-    let geom_delay_at_align_s = gd0
-        + gr0 * read_align_ref_local_s
-        + 0.5 * ga0 * read_align_ref_local_s * read_align_ref_local_s;
-    let clock1_align_s = clock1_delay_s + clock1_rate_sps * read_align_ref_local_s;
-    let clock2_align_s = clock2_delay_s + clock2_rate_sps * read_align_ref_local_s;
+    let (geom_delay_at_align_s, _geom_rate_at_align_sps, _geom_accel_at_align_sps2) =
+        eval_geom_at_elapsed(read_align_ref_local_s)?;
+    let align_t2 = read_align_ref_local_s * read_align_ref_local_s;
+    let align_t3 = align_t2 * read_align_ref_local_s;
+    let align_t4 = align_t2 * align_t2;
+    let clock1_align_s = clock1_delay_s
+        + clock1_rate_sps * read_align_ref_local_s
+        + 0.5 * clock1_accel_sps2 * align_t2
+        + (1.0 / 6.0) * clock1_jerk_sps3 * align_t3
+        + (1.0 / 24.0) * clock1_snap_sps4 * align_t4;
+    let clock2_align_s = clock2_delay_s
+        + clock2_rate_sps * read_align_ref_local_s
+        + 0.5 * clock2_accel_sps2 * align_t2
+        + (1.0 / 6.0) * clock2_jerk_sps3 * align_t3
+        + (1.0 / 24.0) * clock2_snap_sps4 * align_t4;
     let read_align_delay_s = geom_delay_at_align_s
         + coarse_delay_s
         + delay_user_samples / fs
@@ -2420,7 +2986,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         .unwrap_or(b'2');
     let schedule_mode = if_d.is_some();
     let correction_sign = -1.0f64; // Correct ant1 toward ant2 while geometric model is (ant2 - ant1).
-    let geometric_rate_hz = correction_sign * gr0 * obs_mhz * 1e6;
+    let geometric_rate_hz = correction_sign * geom_rate_at_start_sps * obs_mhz * 1e6;
     let clock_rate_hz = clock_rate_sps * obs_mhz * 1e6;
     let df_hz = fs / fft_len as f64;
     let rotation_delta_hz = rot1 - rot2; // ant1 - ant2
@@ -2449,15 +3015,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     if schedule_mode {
         if let (Some(sch), Some(meta)) = (&args.schedule, &if_d) {
             let gv = ScheduleGlobalView {
-                source_frame: "J2000 (fixed)",
+                source_frame: "J2000 catalog; delay model precessed to date",
                 process_skip_sec: Some(xml_skip_sec),
                 process_length_sec: xml_length_sec,
-                geom_delay_s: gd0,
-                geom_rate_sps: gr0,
-                geom_accel_sps2: ga0,
-                geom_rate_hz_at_obs: gr0 * obs_mhz * 1e6,
+                geom_delay_s: geom_delay_at_start_s,
+                geom_rate_sps: geom_rate_at_start_sps,
+                geom_accel_sps2: geom_accel_at_start_sps2,
+                geom_eval_offset_s: total_skip_sec,
+                read_align_ref_offset_s: read_align_ref_local_s,
+                geom_rate_hz_at_obs: geom_rate_at_start_sps * obs_mhz * 1e6,
                 rel_clock_delay_s: clock_delay_s,
                 rel_clock_rate_sps: clock_rate_sps,
+                clock_epoch_mode,
                 coarse_delay_s,
                 coarse_delay_samples: coarse_delay_s * fs,
                 res_delay_input_samples: delay_user_samples,
@@ -2502,8 +3071,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 shuffle_ext: &sh1_ext,
                 sideband: &sb1_s,
                 rotation_hz: rot1,
+                clock_epoch: clock1_epoch.as_deref(),
+                clock_epoch_dt_s: clock1_epoch_offset_s,
+                clock_delay_raw_s: clock1_delay_base_s,
+                clock_rate_raw_sps: clock1_rate_raw_sps,
+                clock_accel_raw_sps2: clock1_accel_raw_sps2,
+                clock_jerk_raw_sps3: clock1_jerk_raw_sps3,
+                clock_snap_raw_sps4: clock1_snap_raw_sps4,
                 clock_delay_s: clock1_delay_s,
                 clock_rate_sps: clock1_rate_sps,
+                clock_accel_sps2: clock1_accel_sps2,
+                clock_jerk_sps3: clock1_jerk_sps3,
+                clock_snap_sps4: clock1_snap_sps4,
                 center_mhz: meta.ant1_center_mhz,
                 bw_mhz: meta.ant1_bw_mhz,
             };
@@ -2519,8 +3098,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 shuffle_ext: &sh2_ext,
                 sideband: &sb2_s,
                 rotation_hz: rot2,
+                clock_epoch: clock2_epoch.as_deref(),
+                clock_epoch_dt_s: clock2_epoch_offset_s,
+                clock_delay_raw_s: clock2_delay_base_s,
+                clock_rate_raw_sps: clock2_rate_raw_sps,
+                clock_accel_raw_sps2: clock2_accel_raw_sps2,
+                clock_jerk_raw_sps3: clock2_jerk_raw_sps3,
+                clock_snap_raw_sps4: clock2_snap_raw_sps4,
                 clock_delay_s: clock2_delay_s,
                 clock_rate_sps: clock2_rate_sps,
+                clock_accel_sps2: clock2_accel_sps2,
+                clock_jerk_sps3: clock2_jerk_sps3,
+                clock_snap_sps4: clock2_snap_sps4,
                 center_mhz: meta.ant2_center_mhz,
                 bw_mhz: meta.ant2_bw_mhz,
             };
@@ -2572,19 +3161,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 info.ra.to_degrees(),
                 info.dec.to_degrees()
             );
-            println!("  source-frame: J2000 (fixed)");
+            println!("  source-frame: J2000 catalog; delay model precessed to date");
             println!("  epoch:      {}", ep_i);
-            println!("  geom-delay: {:.6e} s ({} - {})", gd0, a2_name, a1_name);
+            println!(
+                "  geom-eval:  start t={:+.3}s, read-align t={:+.3}s",
+                total_skip_sec, read_align_ref_local_s
+            );
+            println!(
+                "  geom-delay: {:.6e} s ({} - {})",
+                geom_delay_at_start_s, a2_name, a1_name
+            );
             println!(
                 "  geom-rate:  {:.6e} s/s ({} - {}) => {:.6} Hz @ obsfreq",
-                gr0,
+                geom_rate_at_start_sps,
                 a2_name,
                 a1_name,
-                gr0 * obs_mhz * 1e6
+                geom_rate_at_start_sps * obs_mhz * 1e6
             );
             println!(
                 "  geom-accel: {:.6e} s/s^2 ({} - {})",
-                ga0, a2_name, a1_name
+                geom_accel_at_start_sps2, a2_name, a1_name
             );
         }
         println!(
@@ -2649,8 +3245,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             a2_name
         );
         println!(
-            "  phase-freq: {:.3} MHz ({}) / {:.3} MHz ({}) (pre-FFT raw delay/rate carriers)",
-            a1_data_low, a1_name, a2_data_low, a2_name
+            "  phase-freq: {:.3} MHz ({}) / {:.3} MHz ({}) mode={} (pre-FFT raw delay/rate carriers)",
+            lo1_mhz,
+            a1_name,
+            lo2_mhz,
+            a2_name,
+            fringe_stop_freq_mode.label()
         );
         println!("  bw:         {:.3} MHz", bw);
         println!(
@@ -2869,6 +3469,14 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         "[info] Residual delay correction target: {}",
         if residual_on_ant2 { "ant2" } else { "ant1" }
     );
+    println!(
+        "[info] Fringe-stop carrier frequency: mode={} {}={:.6} MHz {}={:.6} MHz",
+        fringe_stop_freq_mode.label(),
+        a1_name,
+        lo1_mhz,
+        a2_name,
+        lo2_mhz
+    );
     let residual_base = net_d_rel_no_clock0 + clock_delay_s - d_seek;
     println!(
         "[info] Delay residual after read-align: {:+.6} samples ({:+.9e} s)",
@@ -2894,7 +3502,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     } else {
         0.0
     };
-    let total_accel_base = correction_sign * ga0;
+    let total_accel_base = correction_sign * geom_accel_at_start_sps2 + clock_accel_sps2;
+    let total_jerk_base = clock_jerk_sps3;
+    let total_snap_base = clock_snap_sps4;
     let total_accel1_base = if residual_on_ant2 {
         0.0
     } else {
@@ -2902,6 +3512,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     };
     let total_accel2_base = if residual_on_ant2 {
         -total_accel_base
+    } else {
+        0.0
+    };
+    let total_jerk1_base = if residual_on_ant2 {
+        0.0
+    } else {
+        total_jerk_base
+    };
+    let total_jerk2_base = if residual_on_ant2 {
+        -total_jerk_base
+    } else {
+        0.0
+    };
+    let total_snap1_base = if residual_on_ant2 {
+        0.0
+    } else {
+        total_snap_base
+    };
+    let total_snap2_base = if residual_on_ant2 {
+        -total_snap_base
     } else {
         0.0
     };
@@ -2918,14 +3548,24 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         //
         // The grid spacing is exactly 1 s, so finite-difference denominators
         // are unity in SI units.
-        let mut delay_grid = Vec::with_capacity(n_points);
-        for sec in 0..n_points {
+        // Keep guard points on both sides so rate/accel/jerk/snap are
+        // evaluated by a local quartic fit even at the process edges.
+        let guard = 10isize;
+        let mut delay_grid = Vec::with_capacity(n_points + 2 * guard as usize);
+        for sec in -guard..(n_points as isize + guard) {
             let t_abs_sec = total_skip_sec + sec as f64;
             let mjd_t = v.mjd + t_abs_sec / 86400.0;
             let mjd_tt_t = mjd_t + tt_utc_s / 86400.0;
-            let (ra_t, dec_t) = geom::precess_j2000_to_mean_of_date(v.ra_raw, v.dec_raw, mjd_tt_t);
+            let (ra_t, dec_t) = match source_vector_mode {
+                geom::SourceVectorMode::MeanGast => {
+                    geom::precess_j2000_to_mean_of_date(v.ra_raw, v.dec_raw, mjd_tt_t)
+                }
+                geom::SourceVectorMode::PnmGast | geom::SourceVectorMode::PnmEra => {
+                    (v.ra_raw, v.dec_raw)
+                }
+            };
             let (_, _, gd_t, _gr_t, _ga_t) =
-                geom::calculate_geometric_delay_and_derivatives_anchored_with_eop(
+                geom::calculate_geometric_delay_and_derivatives_full_with_eop(
                     ant1_ecef,
                     ant2_ecef,
                     ra_t,
@@ -2933,84 +3573,71 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     mjd_t,
                     v.mjd,
                     earth_orientation,
+                    geom_delay_mode,
+                    source_vector_mode,
                 );
             delay_grid.push(gd_t);
         }
 
-        let n = delay_grid.len();
-
-        let deriv1 = |i: usize| -> f64 {
-            if n < 2 {
-                0.0
-            } else if i == 0 {
-                delay_grid[1] - delay_grid[0]
-            } else if i + 1 >= n {
-                delay_grid[n - 1] - delay_grid[n - 2]
-            } else {
-                0.5 * (delay_grid[i + 1] - delay_grid[i - 1])
-            }
+        let sample = |i: usize, offset: isize| -> f64 {
+            let idx = i as isize + guard + offset;
+            delay_grid[idx as usize]
         };
 
-        let deriv2 = |i: usize| -> f64 {
-            if n < 3 {
-                0.0
-            } else if i == 0 {
-                delay_grid[2] - 2.0 * delay_grid[1] + delay_grid[0]
-            } else if i + 1 >= n {
-                delay_grid[n - 1] - 2.0 * delay_grid[n - 2] + delay_grid[n - 3]
-            } else {
-                delay_grid[i + 1] - 2.0 * delay_grid[i] + delay_grid[i - 1]
-            }
-        };
-
-        let deriv3 = |i: usize| -> f64 {
-            if n < 5 {
-                0.0
-            } else {
-                let ii = i.clamp(2, n - 3);
-                0.5 * (delay_grid[ii + 2] - 2.0 * delay_grid[ii + 1] + 2.0 * delay_grid[ii - 1]
-                    - delay_grid[ii - 2])
-            }
-        };
-
-        let deriv4 = |i: usize| -> f64 {
-            if n < 5 {
-                0.0
-            } else {
-                let ii = i.clamp(2, n - 3);
-                delay_grid[ii + 2] - 4.0 * delay_grid[ii + 1] + 6.0 * delay_grid[ii]
-                    - 4.0 * delay_grid[ii - 1]
-                    + delay_grid[ii - 2]
-            }
-        };
-
+        let fit_radius = guard as usize;
         let mut table = Vec::with_capacity(n_points);
         for i in 0..n_points {
+            let center_idx = i + guard as usize;
+            let (rate_sps, accel_sps2, jerk_sps3, snap_sps4) =
+                local_quartic_derivatives(&delay_grid, center_idx, fit_radius);
             table.push(GeomDelaySample {
-                delay_s: delay_grid[i],
-                rate_sps: deriv1(i),
-                accel_sps2: deriv2(i),
-                jerk_sps3: deriv3(i),
-                snap_sps4: deriv4(i),
+                delay_s: sample(i, 0),
+                rate_sps,
+                accel_sps2,
+                jerk_sps3,
+                snap_sps4,
             });
         }
 
         Arc::from(table.into_boxed_slice())
     });
     let extra_delay_rate_sps = (rotation_fringe_hz + rate_user_hz) / (obs_mhz * 1e6);
+    let geom_poly_order = match std::env::var("YI_GEOM_POLY_ORDER") {
+        Ok(v) => {
+            let order = v
+                .trim()
+                .parse::<u8>()
+                .map_err(|e| format!("invalid YI_GEOM_POLY_ORDER='{v}': {e}"))?;
+            if !(1..=4).contains(&order) {
+                return Err(format!(
+                    "invalid YI_GEOM_POLY_ORDER='{v}': expected 1..4 (1=rate, 2=accel, 3=jerk, 4=snap)"
+                )
+                .into());
+            }
+            order
+        }
+        Err(_) => 4,
+    };
     if geom_delay_table_1s.is_some() {
         println!(
-            "[info] Delay model refinement: 1-second geometric-delay/rate/accel/jerk/snap table enabled (quartic per-frame eval, process scope, {} entries, model-time offset {:+.3} s)",
-            geom_delay_table_1s.as_ref().map(|t| t.len()).unwrap_or(0), model_time_offset_s
+            "[info] Delay model refinement: 1-second geometric-delay/rate/accel/jerk/snap table enabled (per-frame eval order {}, process scope, {} entries, model-time offset {:+.3} s)",
+            geom_poly_order,
+            geom_delay_table_1s.as_ref().map(|t| t.len()).unwrap_or(0),
+            model_time_offset_s
         );
         println!(
-            "[info] Earth orientation model: DUT1={:+.6}s TT-UTC={:+.6}s xp={:+.6}arcsec yp={:+.6}arcsec",
-            dut1_s, tt_utc_s, xp_arcsec, yp_arcsec
+            "[info] Earth orientation model: DUT1={:+.6}s TT-UTC={:+.6}s xp={:+.6}arcsec yp={:+.6}arcsec source-vector={} delay-mode={}",
+            dut1_s,
+            tt_utc_s,
+            xp_arcsec,
+            yp_arcsec,
+            source_vector_mode.label(),
+            geom_delay_mode.label()
         );
         println!(
             "[info] Delay model time-offset equivalent: {:+.6} s -> geom-rate {:+.6} sample",
             model_time_offset_s,
-            model_time_offset_s * gr0 * fs
+            model_time_offset_s * geom_rate_at_start_sps * fs
         );
     }
     let delay_cfg = DelayEvalConfig {
@@ -3019,22 +3646,33 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         fs,
         time_offset_s: total_skip_sec,
         geom_delay_table_1s,
+        geom_poly_order,
         coarse_delay_s,
         delay_user_samples,
         extra_delay_rate_sps,
         clock1_delay_s,
         clock1_rate_sps,
+        clock1_accel_sps2,
+        clock1_jerk_sps3,
+        clock1_snap_sps4,
         clock2_delay_s,
         clock2_rate_sps,
+        clock2_accel_sps2,
+        clock2_jerk_sps3,
+        clock2_snap_sps4,
         d_seek,
         residual_on_ant2,
         fx_start_cumulative_seek,
         net_d1_base,
         total_rate1_base,
         total_accel1_base,
+        total_jerk1_base,
+        total_snap1_base,
         net_d2_base,
         total_rate2_base,
         total_accel2_base,
+        total_jerk2_base,
+        total_snap2_base,
         lo1_hz,
         lo2_hz,
         fx_integer_delay: fx_integer_delay_enabled(),
@@ -3055,6 +3693,140 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let cor_label = sanitize_file_token(&cor_label_raw);
     let ant1_name_file = sanitize_file_token(a1_name);
     let ant2_name_file = sanitize_file_token(a2_name);
+
+    let dump_delay_model = std::env::var("YI_DUMP_DELAY_MODEL")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+        })
+        .unwrap_or(false);
+    if dump_delay_model {
+        std::fs::create_dir_all(&o_dir)?;
+        let dump_path = o_dir.join(format!(
+            "delay_model_{}_{}_{}.tsv",
+            ant1_name_file, ant2_name_file, c_tag
+        ));
+        let mut w = BufWriter::new(File::create(&dump_path)?);
+        writeln!(
+            w,
+            "# t_sec\tfull_rel_sample\tresidual_sample\tmodel_rate_sample_s\tmodel_accel_sample_s2\tmodel_jerk_sample_s3\tmodel_snap_sample_s4\tu_lambda\tv_lambda\tw_lambda\tphase_dra_cycles_per_rad\tphase_ddec_cycles_per_rad\tphase_dbx_cycles_per_m\tphase_dby_cycles_per_m\tphase_dbz_cycles_per_m\ttau1_sample\ttau2_sample\tint1\tint2\tfrac1_sample\tfrac2_sample\tfringe_phase_cycles_xmlfreq\tfringe_phase_deg_wrapped\tcarrier_hz\tcarrier_phase_cycles\tcarrier_phase_deg_wrapped"
+        )?;
+        let dump_secs = processed_sec.ceil().max(1.0) as usize;
+        for sec in 0..=dump_secs {
+            let frame_idx = ((sec as f64) / frame_dt).round() as usize;
+            let frame_idx = frame_idx.min(total_f.saturating_sub(1));
+            let d = compute_frame_delay_entry(frame_idx, &delay_cfg, delay_cfg.d_seek);
+            let model_sec = (d.t_mid_s - total_skip_sec).floor().max(0.0) as usize;
+            let (model_rate, model_accel, model_jerk, model_snap) = if let Some(table) =
+                delay_cfg.geom_delay_table_1s.as_deref()
+            {
+                let idx = model_sec.min(table.len().saturating_sub(1));
+                let g = table[idx];
+                (
+                    (g.rate_sps
+                        + delay_cfg.extra_delay_rate_sps
+                        + (delay_cfg.clock2_rate_sps - delay_cfg.clock1_rate_sps)
+                        + (delay_cfg.clock2_accel_sps2 - delay_cfg.clock1_accel_sps2) * d.t_mid_s
+                        + 0.5
+                            * (delay_cfg.clock2_jerk_sps3 - delay_cfg.clock1_jerk_sps3)
+                            * d.t_mid_s
+                            * d.t_mid_s
+                        + (1.0 / 6.0)
+                            * (delay_cfg.clock2_snap_sps4 - delay_cfg.clock1_snap_sps4)
+                            * d.t_mid_s
+                            * d.t_mid_s
+                            * d.t_mid_s)
+                        * fs,
+                    (g.accel_sps2
+                        + (delay_cfg.clock2_accel_sps2 - delay_cfg.clock1_accel_sps2)
+                        + (delay_cfg.clock2_jerk_sps3 - delay_cfg.clock1_jerk_sps3) * d.t_mid_s
+                        + 0.5
+                            * (delay_cfg.clock2_snap_sps4 - delay_cfg.clock1_snap_sps4)
+                            * d.t_mid_s
+                            * d.t_mid_s)
+                        * fs,
+                    (g.jerk_sps3
+                        + (delay_cfg.clock2_jerk_sps3 - delay_cfg.clock1_jerk_sps3)
+                        + (delay_cfg.clock2_snap_sps4 - delay_cfg.clock1_snap_sps4) * d.t_mid_s)
+                        * fs,
+                    (g.snap_sps4 + (delay_cfg.clock2_snap_sps4 - delay_cfg.clock1_snap_sps4)) * fs,
+                )
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+            let basis = if let Some(v) = gdi.as_ref() {
+                let mjd_t = v.mjd + d.t_mid_s / 86400.0;
+                let mjd_tt_t = mjd_t + tt_utc_s / 86400.0;
+                let (ra_t, dec_t) = match source_vector_mode {
+                    geom::SourceVectorMode::MeanGast => {
+                        geom::precess_j2000_to_mean_of_date(v.ra_raw, v.dec_raw, mjd_tt_t)
+                    }
+                    geom::SourceVectorMode::PnmGast | geom::SourceVectorMode::PnmEra => {
+                        (v.ra_raw, v.dec_raw)
+                    }
+                };
+                geom::baseline_phase_basis(
+                    ant1_ecef,
+                    ant2_ecef,
+                    ra_t,
+                    dec_t,
+                    mjd_t,
+                    earth_orientation,
+                    source_vector_mode,
+                    obs_mhz * 1.0e6,
+                )
+            } else {
+                geom::BaselinePhaseBasis {
+                    u_lambda: 0.0,
+                    v_lambda: 0.0,
+                    w_lambda: 0.0,
+                    phase_dra_cycles_per_rad: 0.0,
+                    phase_ddec_cycles_per_rad: 0.0,
+                    phase_dbx_cycles_per_m: 0.0,
+                    phase_dby_cycles_per_m: 0.0,
+                    phase_dbz_cycles_per_m: 0.0,
+                }
+            };
+            let phase_cycles = -obs_mhz * 1.0e6 * d.full_rel_s;
+            let wrapped = ((phase_cycles.rem_euclid(1.0) + 0.5).rem_euclid(1.0) - 0.5) * 360.0;
+            let carrier_hz = if residual_on_ant2 { lo2_hz } else { lo1_hz };
+            let carrier_phase_cycles = -carrier_hz * d.full_rel_s;
+            let carrier_wrapped =
+                ((carrier_phase_cycles.rem_euclid(1.0) + 0.5).rem_euclid(1.0) - 0.5) * 360.0;
+            writeln!(
+                w,
+                "{:.6}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{:.6}\t{:.6}\t{:.6}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{:.12}\t{}\t{}\t{:.12}\t{:.12}\t{:.12}\t{:.6}\t{:.6}\t{:.12}\t{:.6}",
+                sec as f64,
+                d.full_rel_s * fs,
+                d.residual_s * fs,
+                model_rate,
+                model_accel,
+                model_jerk,
+                model_snap,
+                basis.u_lambda,
+                basis.v_lambda,
+                basis.w_lambda,
+                basis.phase_dra_cycles_per_rad,
+                basis.phase_ddec_cycles_per_rad,
+                basis.phase_dbx_cycles_per_m,
+                basis.phase_dby_cycles_per_m,
+                basis.phase_dbz_cycles_per_m,
+                d.tau1_s * fs,
+                d.tau2_s * fs,
+                d.int1,
+                d.int2,
+                d.frac1 * fs,
+                d.frac2 * fs,
+                phase_cycles,
+                wrapped,
+                carrier_hz,
+                carrier_phase_cycles,
+                carrier_wrapped,
+            )?;
+        }
+        w.flush()?;
+        println!("[info] Delay model dump: {}", dump_path.display());
+    }
 
     if do_xcf {
         let mut ac = vec![Complex::new(0.0_f64, 0.0_f64); fft_len / 2 + 1];
@@ -3427,7 +4199,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             writeln!(
                 w,
                 "# read_align_components_s: geom={:.9e} coarse={:.9e} user={:.9e} clock={:.9e} total={:.9e}",
-                gd0,
+                geom_delay_at_start_s,
                 coarse_delay_s,
                 delay_user_samples / fs,
                 clock_delay_s,
@@ -3436,7 +4208,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             writeln!(
                 w,
                 "# read_align_components_samples: geom={:.6} coarse={:.6} user={:.6} clock={:.6} total={:.6}",
-                gd0 * fs,
+                geom_delay_at_start_s * fs,
                 coarse_delay_s * fs,
                 delay_user_samples,
                 clock_delay_s * fs,
@@ -3502,20 +4274,30 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             None
         };
         let frame_sec = fft_len as f64 / fs;
-        let total_duration_sec = total_f as f64 * frame_sec;
-        // "second sectors" should track actual covered duration without
-        // creating an extra tail sector from tiny floating-point excess.
-        let mut sector_count = total_duration_sec.round().max(1.0) as usize;
-        sector_count = sector_count.min(total_f.max(1));
-        let base = total_f / sector_count;
-        let extra = total_f % sector_count;
-        let mut sec_counts = Vec::with_capacity(sector_count);
-        for si in 0..sector_count {
-            let nf = base + if si < extra { 1 } else { 0 };
-            if nf > 0 {
-                sec_counts.push(nf);
-            }
+        let output_sec = d.output_sec.unwrap_or(1.0);
+        if !output_sec.is_finite() || output_sec <= 0.0 {
+            return Err(format!(
+                "stream/output must be a positive finite integration time [s], got {}",
+                output_sec
+            )
+            .into());
         }
+        let frames_per_sector = (output_sec / frame_sec).round().max(1.0) as usize;
+        let actual_output_sec = frames_per_sector as f64 * frame_sec;
+        let mut sec_counts = Vec::new();
+        let mut remaining = total_f;
+        while remaining > 0 {
+            let nf = remaining.min(frames_per_sector);
+            sec_counts.push(nf);
+            remaining -= nf;
+        }
+        println!(
+            "[info] Output integration: XML stream/output requested {:.9} s, actual {:.9} s, frames/sector {}, sectors {}",
+            output_sec,
+            actual_output_sec,
+            frames_per_sector,
+            sec_counts.len()
+        );
         let dp1 = Arc::new(build_decode_plan(bit1, sh1.as_ref(), levels1.as_ref())?);
         let dp2 = Arc::new(build_decode_plan(bit2, sh2.as_ref(), levels2.as_ref())?);
         let mut emitted = 0;
@@ -3940,23 +4722,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                  out_f: Option<&mut [u8]>|
                  -> Option<(Vec<f64>, Vec<f64>, Vec<Complex<f64>>, Vec<f64>)> {
                     let d = frame_delays[i];
-                    let first_sample_odd1 =
-                        ((sector_sample_start1 as u128 + i as u128 * fft_len as u128) & 1) != 0;
-                    let first_sample_odd2 =
-                        ((sector_sample_start2 as u128 + i as u128 * fft_len as u128) & 1) != 0;
                     let (mut f1, mut f2, mut s1, mut s2) = (
                         vec![0.0_f32; fft_len],
                         vec![0.0_f32; fft_len],
                         vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1],
                         vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1],
                     );
-                    if decode_block_into_with_plan(
-                        &raw1[i * bpf1..(i + 1) * bpf1],
+                    let mut dw1 = DecodeWindowScratch::new();
+                    let mut dw2 = DecodeWindowScratch::new();
+                    if decode_shifted_frame_from_chunk(
+                        raw1,
+                        sector_sample_start1,
+                        i,
                         fft_len,
+                        bit1,
+                        samples_per_word1,
                         &dp1,
-                        &mut f1,
                         lsb1,
-                        first_sample_odd1,
+                        d.int1,
+                        &mut f1,
+                        &mut dw1,
                     )
                     .is_err()
                     {
@@ -3966,13 +4751,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         sector_failures.fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
-                    if decode_block_into_with_plan(
-                        &raw2[i * bpf2..(i + 1) * bpf2],
+                    if decode_shifted_frame_from_chunk(
+                        raw2,
+                        sector_sample_start2,
+                        i,
                         fft_len,
+                        bit2,
+                        samples_per_word2,
                         &dp2,
-                        &mut f2,
                         lsb2,
-                        first_sample_odd2,
+                        d.int2,
+                        &mut f2,
+                        &mut dw2,
                     )
                     .is_err()
                     {
@@ -4566,17 +5356,19 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     sec_failed
                 );
             }
+            let sector_start_offset_s = emitted as f64 * frame_sec;
+            let sector_integ_s = nf as f64 * frame_sec;
             emitted += nf;
             if is_phased_mode {
                 print!(
-                    "\r[info] Synthesised second {}/{} ({:.2}%)",
+                    "\r[info] Synthesised sector {}/{} ({:.2}%)",
                     si + 1,
                     sec_counts.len(),
                     (emitted as f64 / total_f as f64) * 100.0
                 );
             } else {
                 print!(
-                    "\r[info] Processed second {}/{} ({:.2}%)",
+                    "\r[info] Processed sector {}/{} ({:.2}%)",
                     si + 1,
                     sec_counts.len(),
                     (emitted as f64 / total_f as f64) * 100.0
@@ -4605,11 +5397,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     .take(fft_len / 2)
                     .map(|&v| Complex::new((v * inv_ph) as f32, 0.0))
                     .collect();
-                w.write_sector(
-                    c_unix + si as i64,
-                    (nf as f64 * fft_len as f64 / fs) as f32,
-                    &s_ph,
-                )?;
+                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_ph)?;
             }
             if let Some(w) = cw_11.as_mut() {
                 let s_11: Vec<Complex<f32>> = batch_11
@@ -4617,11 +5405,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     .take(fft_len / 2)
                     .map(|&v| Complex::new((v * inv_11) as f32, 0.0))
                     .collect();
-                w.write_sector(
-                    c_unix + si as i64,
-                    (nf as f64 * fft_len as f64 / fs) as f32,
-                    &s_11,
-                )?;
+                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_11)?;
             }
             if let Some(w) = cw_12.as_mut() {
                 let s_12: Vec<Complex<f32>> = batch_12
@@ -4629,11 +5413,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     .take(fft_len / 2)
                     .map(|v| Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32))
                     .collect();
-                w.write_sector(
-                    c_unix + si as i64,
-                    (nf as f64 * fft_len as f64 / fs) as f32,
-                    &s_12,
-                )?;
+                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_12)?;
             }
             if let Some(w) = cw_22.as_mut() {
                 let s_22: Vec<Complex<f32>> = batch_22
@@ -4641,11 +5421,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     .take(fft_len / 2)
                     .map(|&v| Complex::new((v * inv_22) as f32, 0.0))
                     .collect();
-                w.write_sector(
-                    c_unix + si as i64,
-                    (nf as f64 * fft_len as f64 / fs) as f32,
-                    &s_22,
-                )?;
+                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_22)?;
             }
         }
         drop(rx_sec);

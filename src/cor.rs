@@ -228,12 +228,39 @@ impl CorWriter {
         effective_integ_time_s: f32,
         spectrum: &[Complex<f32>],
     ) -> Result<(), DynError> {
-        self.write_sector_with_model(timestamp_unix_sec, effective_integ_time_s, spectrum, None)
+        self.write_sector_at(timestamp_unix_sec, 0.0, effective_integ_time_s, spectrum)
+    }
+
+    pub fn write_sector_at(
+        &mut self,
+        timestamp_unix_sec: i64,
+        start_offset_s: f64,
+        effective_integ_time_s: f32,
+        spectrum: &[Complex<f32>],
+    ) -> Result<(), DynError> {
+        self.write_sector_with_model_at(
+            timestamp_unix_sec,
+            start_offset_s,
+            effective_integ_time_s,
+            spectrum,
+            None,
+        )
     }
 
     pub fn write_sector_with_model(
         &mut self,
         timestamp_unix_sec: i64,
+        effective_integ_time_s: f32,
+        spectrum: &[Complex<f32>],
+        model: Option<CorSectorModel>,
+    ) -> Result<(), DynError> {
+        self.write_sector_with_model_at(timestamp_unix_sec, 0.0, effective_integ_time_s, spectrum, model)
+    }
+
+    pub fn write_sector_with_model_at(
+        &mut self,
+        timestamp_unix_sec: i64,
+        start_offset_s: f64,
         effective_integ_time_s: f32,
         spectrum: &[Complex<f32>],
         model: Option<CorSectorModel>,
@@ -246,20 +273,21 @@ impl CorWriter {
             )
             .into());
         }
-        let ts_i32 = i32::try_from(timestamp_unix_sec)
-            .map_err(|_| "timestamp out of i32 range for .cor sector header")?;
 
         let mut sector_header = [0u8; SECTOR_HEADER_SIZE];
         // Keep signed start time at offset 0 for compatibility with frinZ readers.
-        write_i32_le(&mut sector_header, ST_TIME_OFFSET, ts_i32);
-        let (_st_sec, st_nsec) = split_sec_nsec(timestamp_unix_sec, 0.0)?;
+        let (st_sec, st_nsec) = split_sec_nsec(timestamp_unix_sec, start_offset_s)?;
+        let st_i32 = i32::try_from(st_sec)
+            .map_err(|_| "sector start sec out of i32 range for .cor sector header")?;
+        write_i32_le(&mut sector_header, ST_TIME_OFFSET, st_i32);
+        write_u32_le(&mut sector_header, ST_NSEC_OFFSET, st_nsec);
+
         let integ_sec = if effective_integ_time_s.is_finite() && effective_integ_time_s > 0.0 {
             effective_integ_time_s as f64
         } else {
             1.0
         };
-        let (et_sec, et_nsec) = split_sec_nsec(timestamp_unix_sec, integ_sec)?;
-        write_u32_le(&mut sector_header, ST_NSEC_OFFSET, st_nsec);
+        let (et_sec, et_nsec) = split_sec_nsec(timestamp_unix_sec, start_offset_s + integ_sec)?;
         write_u32_le(&mut sector_header, ET_TIME_OFFSET, et_sec);
         write_u32_le(&mut sector_header, ET_NSEC_OFFSET, et_nsec);
         if let Some(model) = model {

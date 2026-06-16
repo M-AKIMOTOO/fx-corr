@@ -28,6 +28,7 @@ pub struct IFileData {
     pub source: Option<String>,
     pub stream_label: Option<String>,
     pub fft: Option<usize>,
+    pub output_sec: Option<f64>,
     pub sampling_hz: Option<f64>,
     pub ant1_bit: Option<usize>,
     pub ant2_bit: Option<usize>,
@@ -38,10 +39,19 @@ pub struct IFileData {
     pub obsfreq_mhz: Option<f64>,
     pub clock_delay_s: Option<f64>,
     pub clock_rate_sps: Option<f64>,
+    pub clock_accel_sps2: Option<f64>,
+    pub clock_jerk_sps3: Option<f64>,
+    pub clock_snap_sps4: Option<f64>,
     pub ant1_clock_delay_s: Option<f64>,
     pub ant2_clock_delay_s: Option<f64>,
     pub ant1_clock_rate_sps: Option<f64>,
     pub ant2_clock_rate_sps: Option<f64>,
+    pub ant1_clock_accel_sps2: Option<f64>,
+    pub ant2_clock_accel_sps2: Option<f64>,
+    pub ant1_clock_jerk_sps3: Option<f64>,
+    pub ant2_clock_jerk_sps3: Option<f64>,
+    pub ant1_clock_snap_sps4: Option<f64>,
+    pub ant2_clock_snap_sps4: Option<f64>,
     pub ant1_clock_epoch: Option<String>,
     pub ant2_clock_epoch: Option<String>,
     pub ant1_sideband: Option<String>,
@@ -69,6 +79,7 @@ pub struct IFileData {
     pub tt_utc_s: Option<f64>,
     pub xp_arcsec: Option<f64>,
     pub yp_arcsec: Option<f64>,
+    pub eop_file: Option<PathBuf>,
 }
 
 fn parse_optional_f64(
@@ -83,13 +94,24 @@ fn parse_optional_f64(
     Ok(None)
 }
 
-fn parse_clock_pair(clock_raw: &str) -> Result<(Option<f64>, Option<f64>), DynError> {
+fn parse_clock_pair(
+    clock_raw: &str,
+) -> Result<
+    (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    ),
+    DynError,
+> {
     let parts: Vec<&str> = clock_raw
         .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .filter(|s| !s.is_empty())
         .collect();
     if parts.is_empty() {
-        return Ok((None, None));
+        return Ok((None, None, None, None, None));
     }
     let delay = Some(parts[0].parse::<f64>()?);
     let rate = if parts.len() >= 2 {
@@ -97,7 +119,22 @@ fn parse_clock_pair(clock_raw: &str) -> Result<(Option<f64>, Option<f64>), DynEr
     } else {
         None
     };
-    Ok((delay, rate))
+    let accel = if parts.len() >= 3 {
+        Some(parts[2].parse::<f64>()?)
+    } else {
+        None
+    };
+    let jerk = if parts.len() >= 4 {
+        Some(parts[3].parse::<f64>()?)
+    } else {
+        None
+    };
+    let snap = if parts.len() >= 5 {
+        Some(parts[4].parse::<f64>()?)
+    } else {
+        None
+    };
+    Ok((delay, rate, accel, jerk, snap))
 }
 
 fn parse_xyz_triplet(raw: &str) -> Result<[f64; 3], DynError> {
@@ -157,6 +194,17 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
     }
     let mut clock_delay_s = parse_optional_f64(&params, &["clockdelay", "clockoffset"])?;
     let mut clock_rate_sps = parse_optional_f64(&params, &["clockrate", "clockdrift"])?;
+    let mut clock_accel_sps2 = parse_optional_f64(
+        &params,
+        &[
+            "clockaccel",
+            "clockacel",
+            "clockacceleration",
+            "clockaccelsps2",
+        ],
+    )?;
+    let mut clock_jerk_sps3 = parse_optional_f64(&params, &["clockjerk", "clockjerksps3"])?;
+    let mut clock_snap_sps4 = parse_optional_f64(&params, &["clocksnap", "clocksnapsps4"])?;
     let ant1_clock_delay_s = parse_optional_f64(
         &params,
         &["ant1clockdelay", "clock1delay", "station1clockdelay"],
@@ -172,6 +220,78 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
     let ant2_clock_rate_sps = parse_optional_f64(
         &params,
         &["ant2clockrate", "clock2rate", "station2clockrate"],
+    )?;
+    let ant1_clock_accel_sps2 = parse_optional_f64(
+        &params,
+        &[
+            "ant1clockaccel",
+            "ant1clockacel",
+            "clock1accel",
+            "clock1acel",
+            "station1clockaccel",
+            "station1clockacel",
+            "ant1clockacceleration",
+            "clock1acceleration",
+            "station1clockacceleration",
+        ],
+    )?;
+    let ant2_clock_accel_sps2 = parse_optional_f64(
+        &params,
+        &[
+            "ant2clockaccel",
+            "ant2clockacel",
+            "clock2accel",
+            "clock2acel",
+            "station2clockaccel",
+            "station2clockacel",
+            "ant2clockacceleration",
+            "clock2acceleration",
+            "station2clockacceleration",
+        ],
+    )?;
+    let ant1_clock_jerk_sps3 = parse_optional_f64(
+        &params,
+        &[
+            "ant1clockjerk",
+            "clock1jerk",
+            "station1clockjerk",
+            "ant1clockjerksps3",
+            "clock1jerksps3",
+            "station1clockjerksps3",
+        ],
+    )?;
+    let ant2_clock_jerk_sps3 = parse_optional_f64(
+        &params,
+        &[
+            "ant2clockjerk",
+            "clock2jerk",
+            "station2clockjerk",
+            "ant2clockjerksps3",
+            "clock2jerksps3",
+            "station2clockjerksps3",
+        ],
+    )?;
+    let ant1_clock_snap_sps4 = parse_optional_f64(
+        &params,
+        &[
+            "ant1clocksnap",
+            "clock1snap",
+            "station1clocksnap",
+            "ant1clocksnapsps4",
+            "clock1snapsps4",
+            "station1clocksnapsps4",
+        ],
+    )?;
+    let ant2_clock_snap_sps4 = parse_optional_f64(
+        &params,
+        &[
+            "ant2clocksnap",
+            "clock2snap",
+            "station2clocksnap",
+            "ant2clocksnapsps4",
+            "clock2snapsps4",
+            "station2clocksnapsps4",
+        ],
     )?;
     let clock_epoch = params.get("clockepoch").cloned();
     let ant1_clock_epoch = params
@@ -202,12 +322,21 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         &["ant2z", "station2z", "z2"],
     )?;
     if let Some(clock_raw) = params.get("clock") {
-        let (d, r) = parse_clock_pair(clock_raw)?;
+        let (d, r, a, j, sn) = parse_clock_pair(clock_raw)?;
         if clock_delay_s.is_none() {
             clock_delay_s = d;
         }
         if clock_rate_sps.is_none() {
             clock_rate_sps = r;
+        }
+        if clock_accel_sps2.is_none() {
+            clock_accel_sps2 = a;
+        }
+        if clock_jerk_sps3.is_none() {
+            clock_jerk_sps3 = j;
+        }
+        if clock_snap_sps4.is_none() {
+            clock_snap_sps4 = sn;
         }
     }
     let ra = params
@@ -239,6 +368,7 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
             .or_else(|| params.get("label"))
             .cloned(),
         fft: params.get("fft").map(|v| v.parse()).transpose()?,
+        output_sec: parse_optional_f64(&params, &["output", "out", "inttime", "integration"])?,
         sampling_hz: params
             .get("samplinghz")
             .or_else(|| params.get("fs"))
@@ -253,10 +383,19 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         obsfreq_mhz,
         clock_delay_s,
         clock_rate_sps,
+        clock_accel_sps2,
+        clock_jerk_sps3,
+        clock_snap_sps4,
         ant1_clock_delay_s,
         ant2_clock_delay_s,
         ant1_clock_rate_sps,
         ant2_clock_rate_sps,
+        ant1_clock_accel_sps2,
+        ant2_clock_accel_sps2,
+        ant1_clock_jerk_sps3,
+        ant2_clock_jerk_sps3,
+        ant1_clock_snap_sps4,
+        ant2_clock_snap_sps4,
         ant1_clock_epoch,
         ant2_clock_epoch,
         ant1_sideband: params.get("sideband").cloned(),
@@ -330,6 +469,10 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         tt_utc_s: parse_optional_f64(&params, &["ttutc", "tt_utc", "tt-utc"])?,
         xp_arcsec: parse_optional_f64(&params, &["xp", "xpolar", "xp_arcsec"])?,
         yp_arcsec: parse_optional_f64(&params, &["yp", "ypolar", "yp_arcsec"])?,
+        eop_file: params
+            .get("eopfile")
+            .or_else(|| params.get("eop_file"))
+            .map(PathBuf::from),
     })
 }
 

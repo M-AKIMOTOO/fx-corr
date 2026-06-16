@@ -41,3 +41,8 @@ patch_*.py
 # Rust build
 target/
 xtask/
+
+# local service/cache files
+filebrowser.db
+__pycache__/
+*.py[cod]
