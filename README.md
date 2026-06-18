@@ -1894,6 +1894,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.1` | Updated `yi-phasedarray` beamforming to use the same post-FFT XML-grid alignment as `yi-corr` before phased summing, so phased raw and phased `.cor` products follow the validated delay/grid tracking path. |
 | `3.1.0` | Added XML `<stream><inband>N</inband></stream>` output splitting for pulsar and sub-band correlation workflows. `N` must be a power of two; split `.cor` files use `.chNbwBW.cor` names and carry sub-band observing frequency / effective bandwidth metadata. |
 | `3.0.2` | Reinterpreted the HITACH32 grid-origin correction as a physical frequency offset (`-976.5625 Hz`) rather than a fixed `-1` bin shift. This gives `-1` bin at `FFT=1048576` but `0` bins at `FFT=8192`, preserving low-resolution continuum processing while fixing high-resolution maser and VLBI delay-search modes. Validated with G9.62 maser and NRAO530 continuum; canceling the correction at `FFT=1048576` reduced the NRAO530 SNR from about 980 to about 19. |
 | `3.0.1` | Added validated station/backend frequency-grid-origin correction for HITACH32 (`-1` bin), ACF peak debug logging of station/env/total grid offsets, and documented the G9.62 maser validation. The same investigation showed that the YAMAGU32--YAMAGU34 factor-of-two amplitude loss was caused by a missing YAMAGU34 clock delay, not by ACF/XCF normalization. |

@@ -4868,25 +4868,44 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         false,
                     );
 
-                    let mut phased_pow = vec![0.0; fft_len / 2 + 1];
-                    let mut p11 = vec![0.0; fft_len / 2 + 1];
-                    let mut p12 = vec![Complex::new(0.0_f64, 0.0_f64); fft_len / 2 + 1];
-                    let mut p22 = vec![0.0; fft_len / 2 + 1];
+                    let half = fft_len / 2 + 1;
+                    let mut g1 = vec![Complex::new(0.0_f32, 0.0_f32); half];
+                    let mut g2 = vec![Complex::new(0.0_f32, 0.0_f32); half];
+                    shift_real_fft_to_xml_grid_with_extra_offset(
+                        &s1,
+                        &mut g1,
+                        fft_len,
+                        rotation_bins1,
+                        station_grid_origin_offset_bins(a1_name, fs, fft_len),
+                    );
+                    shift_real_fft_to_xml_grid_with_extra_offset(
+                        &s2,
+                        &mut g2,
+                        fft_len,
+                        rotation_bins2,
+                        station_grid_origin_offset_bins(a2_name, fs, fft_len)
+                            + ant2_grid_extra_offset(),
+                    );
 
-                    let mut s1_aligned = vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1];
-                    let mut s2_aligned = vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1];
+                    let mut phased_pow = vec![0.0; half];
+                    let mut p11 = vec![0.0; half];
+                    let mut p12 = vec![Complex::new(0.0_f64, 0.0_f64); half];
+                    let mut p22 = vec![0.0; half];
+
+                    let mut s1_aligned = vec![Complex::new(0.0_f32, 0.0_f32); half];
+                    let mut s2_aligned = vec![Complex::new(0.0_f32, 0.0_f32); half];
                     match out_grid {
                         OutputGrid::Ant1 => {
                             if need_xcf_products || need_acf_products || need_phased_products {
                                 for k in 0..(ba.a1e - ba.a1s) {
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
-                                    s2_aligned[i1] = s2[i2] * fr_lo2;
+                                    s2_aligned[i1] = g2[i2] * fr_lo2;
                                 }
                             }
                             let s1c: Vec<Complex<f32>> =
                                 if need_xcf_products || need_acf_products || need_phased_products {
-                                    s1.iter().map(|z| *z * fr_lo1).collect::<Vec<_>>()
+                                    g1.iter().map(|z| *z * fr_lo1).collect::<Vec<_>>()
                                 } else {
                                     Vec::new()
                                 };
@@ -4953,12 +4972,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 for k in 0..(ba.a1e - ba.a1s) {
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
-                                    s1_aligned[i2] = s1[i1] * fr_lo1;
+                                    s1_aligned[i2] = g1[i1] * fr_lo1;
                                 }
                             }
                             let s2c: Vec<Complex<f32>> =
                                 if need_xcf_products || need_acf_products || need_phased_products {
-                                    s2.iter().map(|z| *z * fr_lo2).collect::<Vec<_>>()
+                                    g2.iter().map(|z| *z * fr_lo2).collect::<Vec<_>>()
                                 } else {
                                     Vec::new()
                                 };
