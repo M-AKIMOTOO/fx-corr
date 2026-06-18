@@ -215,6 +215,12 @@ For process 2+ logs:
 - `YAMAGU66_<TAG>_phased_spectrum_amplitude.png`
 - `YAMAGU66_<TAG>_phased_autocorrelation.png`
 
+### In-band `.cor` splitting
+
+XML `<stream><inband>N</inband></stream>` splits the already-correlated positive-frequency band into `N` `.cor` files. `N` must be a power of two. For a 512 MHz band and `<inband>4</inband>`, bins are written as `[0:128)`, `[128:256)`, `[256:384)`, and `[384:512)`.
+
+Split files add `.chNbwBW` before `.cor`, for example `<ANT1>_<ANT2>_<TAG>_<LABEL>.ch1bw512.cor`. Each split `.cor` header uses the sub-band low frequency as observing frequency and the effective sampling speed corresponding to the sub-band bandwidth. No additional delay correction or bandwidth synthesis is applied.
+
 Where:
 
 - `TAG`: `YYYYDDDhhmmss` from process epoch (+ effective skip)

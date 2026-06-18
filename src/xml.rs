@@ -471,6 +471,9 @@ pub fn parse_xml_schedule_for_process(
     let output_hz = child_text(stream, "output")
         .map(parse_f64_text)
         .transpose()?;
+    let inband = child_text(stream, "inband")
+        .map(|v| v.parse::<usize>())
+        .transpose()?;
 
     let default_sideband = "USB";
     let special_by_key: HashMap<String, Node<'_, '_>> = stream
@@ -637,6 +640,7 @@ pub fn parse_xml_schedule_for_process(
         stream_label,
         fft,
         output_sec: output_hz,
+        inband,
         sampling_hz,
         ant1_bit,
         ant2_bit,
@@ -761,6 +765,7 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
     <frequency>0</frequency>
     <fft>16384</fft>
     <output>1.0</output>
+    <inband>1</inband>
     <special key="A"><rotation>0</rotation></special>
     <special key="B"><rotation>0</rotation></special>
   </stream>

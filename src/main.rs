@@ -1680,6 +1680,7 @@ fn print_schedule_summary(
             ),
             ("stream fft".to_string(), fmt_opt(d.fft)),
             ("stream output [s]".to_string(), fmt_opt_f64(d.output_sec)),
+            ("stream inband".to_string(), fmt_opt(d.inband)),
             (
                 "stream output rate".to_string(),
                 d.output_sec
@@ -4311,123 +4312,161 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let dp2 = Arc::new(build_decode_plan(bit2, sh2.as_ref(), levels2.as_ref())?);
         let mut emitted = 0;
         let cor_h_freq_hz = obs_mhz * 1e6;
-        let mut cw_ph = if write_phased_cor {
-            Some(CorWriter::create(
-                &o_dir.join(format!("YAMAGU66_YAMAGU66_{}_{}.cor", c_tag, cor_label)),
-                &CorHeaderConfig {
-                    sampling_speed_hz: fs.round() as i32,
-                    observing_frequency_hz: cor_h_freq_hz,
-                    fft_point: fft_len as i32,
-                    number_of_sector_hint: sec_counts.len() as i32,
-                    clock_reference_unix_sec: c_unix,
-                    source_name: source_name.clone(),
-                    source_ra_rad: gdi.as_ref().map(|v| v.ra_header).unwrap_or(0.0),
-                    source_dec_rad: gdi.as_ref().map(|v| v.dec_header).unwrap_or(0.0),
-                },
-                CorStation {
-                    name: "YAMAGU66",
-                    code: b'M',
-                    ecef_m: ant1_ecef,
-                },
-                CorStation {
-                    name: "YAMAGU66",
-                    code: b'M',
-                    ecef_m: ant1_ecef,
-                },
-            )?)
+        let inband = if_d.as_ref().and_then(|d| d.inband).unwrap_or(1);
+        if inband == 0 || !inband.is_power_of_two() {
+            return Err(format!(
+                "stream/inband must be a positive power of 2, got {}",
+                inband
+            )
+            .into());
+        }
+        let cor_bins_total = fft_len / 2;
+        if cor_bins_total % inband != 0 {
+            return Err(format!(
+                "stream/inband={} does not evenly divide {} positive-frequency bins",
+                inband, cor_bins_total
+            )
+            .into());
+        }
+        let inband_bins = cor_bins_total / inband;
+        let inband_fft_len = fft_len / inband;
+        if inband_fft_len < 2 || inband_fft_len % 2 != 0 {
+            return Err(format!(
+                "stream/inband={} leaves invalid .cor FFT length {}",
+                inband, inband_fft_len
+            )
+            .into());
+        }
+        let inband_fs = fs / inband as f64;
+        let inband_bw_mhz = bw / inband as f64;
+        let bw_tag = if (bw - bw.round()).abs() < 1.0e-6 {
+            format!("{:.0}", bw.round())
         } else {
-            None
+            format!("{:.3}", bw).replace(".", "p")
         };
-        let mut cw_11 = if write_acf_cor {
-            Some(CorWriter::create(
-                &o_dir.join(format!(
-                    "{}_{}_{}_{}.cor",
-                    ant1_name_file, ant1_name_file, c_tag, cor_label
-                )),
-                &CorHeaderConfig {
-                    sampling_speed_hz: fs.round() as i32,
-                    observing_frequency_hz: cor_h_freq_hz,
-                    fft_point: fft_len as i32,
-                    number_of_sector_hint: sec_counts.len() as i32,
-                    clock_reference_unix_sec: c_unix,
-                    source_name: source_name.clone(),
-                    source_ra_rad: gdi.as_ref().map(|v| v.ra_header).unwrap_or(0.0),
-                    source_dec_rad: gdi.as_ref().map(|v| v.dec_header).unwrap_or(0.0),
-                },
-                CorStation {
-                    name: a1_name,
-                    code: a1_code,
-                    ecef_m: ant1_ecef,
-                },
-                CorStation {
-                    name: a1_name,
-                    code: a1_code,
-                    ecef_m: ant1_ecef,
-                },
-            )?)
-        } else {
-            None
+        if inband > 1 {
+            println!(
+                "[info] In-band output: split {} MHz into {} x {:.6} MHz .cor files ({} bins each)",
+                bw_tag, inband, inband_bw_mhz, inband_bins
+            );
+        }
+        let make_cor_path = |left: &str, right: &str, ch: usize| {
+            if inband == 1 {
+                o_dir.join(format!("{}_{}_{}_{}.cor", left, right, c_tag, cor_label))
+            } else {
+                o_dir.join(format!(
+                    "{}_{}_{}_{}.ch{}bw{}.cor",
+                    left,
+                    right,
+                    c_tag,
+                    cor_label,
+                    ch + 1,
+                    bw_tag
+                ))
+            }
         };
-        let mut cw_12 = if write_xcf_cor {
-            Some(CorWriter::create(
-                &o_dir.join(format!(
-                    "{}_{}_{}_{}.cor",
-                    ant1_name_file, ant2_name_file, c_tag, cor_label
-                )),
-                &CorHeaderConfig {
-                    sampling_speed_hz: fs.round() as i32,
-                    observing_frequency_hz: cor_h_freq_hz,
-                    fft_point: fft_len as i32,
-                    number_of_sector_hint: sec_counts.len() as i32,
-                    clock_reference_unix_sec: c_unix,
-                    source_name: source_name.clone(),
-                    source_ra_rad: gdi.as_ref().map(|v| v.ra_header).unwrap_or(0.0),
-                    source_dec_rad: gdi.as_ref().map(|v| v.dec_header).unwrap_or(0.0),
-                },
-                CorStation {
-                    name: a1_name,
-                    code: a1_code,
-                    ecef_m: ant1_ecef,
-                },
-                CorStation {
-                    name: a2_name,
-                    code: a2_code,
-                    ecef_m: ant2_ecef,
-                },
-            )?)
-        } else {
-            None
+        let make_cor_header = |ch: usize| CorHeaderConfig {
+            sampling_speed_hz: if inband == 1 {
+                fs.round() as i32
+            } else {
+                inband_fs.round() as i32
+            },
+            observing_frequency_hz: if inband == 1 {
+                cor_h_freq_hz
+            } else {
+                (obs_mhz + ch as f64 * inband_bw_mhz) * 1.0e6
+            },
+            fft_point: if inband == 1 {
+                fft_len as i32
+            } else {
+                inband_fft_len as i32
+            },
+            number_of_sector_hint: sec_counts.len() as i32,
+            clock_reference_unix_sec: c_unix,
+            source_name: source_name.clone(),
+            source_ra_rad: gdi.as_ref().map(|v| v.ra_header).unwrap_or(0.0),
+            source_dec_rad: gdi.as_ref().map(|v| v.dec_header).unwrap_or(0.0),
         };
-        let mut cw_22 = if write_acf_cor {
-            Some(CorWriter::create(
-                &o_dir.join(format!(
-                    "{}_{}_{}_{}.cor",
-                    ant2_name_file, ant2_name_file, c_tag, cor_label
-                )),
-                &CorHeaderConfig {
-                    sampling_speed_hz: fs.round() as i32,
-                    observing_frequency_hz: cor_h_freq_hz,
-                    fft_point: fft_len as i32,
-                    number_of_sector_hint: sec_counts.len() as i32,
-                    clock_reference_unix_sec: c_unix,
-                    source_name: source_name.clone(),
-                    source_ra_rad: gdi.as_ref().map(|v| v.ra_header).unwrap_or(0.0),
-                    source_dec_rad: gdi.as_ref().map(|v| v.dec_header).unwrap_or(0.0),
-                },
-                CorStation {
-                    name: a2_name,
-                    code: a2_code,
-                    ecef_m: ant2_ecef,
-                },
-                CorStation {
-                    name: a2_name,
-                    code: a2_code,
-                    ecef_m: ant2_ecef,
-                },
-            )?)
-        } else {
-            None
+        let create_cor_writers = |enabled: bool,
+                                  left_file: &str,
+                                  right_file: &str,
+                                  st1: CorStation<'_>,
+                                  st2: CorStation<'_>|
+         -> Result<Vec<CorWriter>, DynError> {
+            if !enabled {
+                return Ok(Vec::new());
+            }
+            let mut writers = Vec::with_capacity(inband);
+            for ch in 0..inband {
+                writers.push(CorWriter::create(
+                    &make_cor_path(left_file, right_file, ch),
+                    &make_cor_header(ch),
+                    st1,
+                    st2,
+                )?);
+            }
+            Ok(writers)
         };
+        let mut cw_ph = create_cor_writers(
+            write_phased_cor,
+            "YAMAGU66",
+            "YAMAGU66",
+            CorStation {
+                name: "YAMAGU66",
+                code: b'M',
+                ecef_m: ant1_ecef,
+            },
+            CorStation {
+                name: "YAMAGU66",
+                code: b'M',
+                ecef_m: ant1_ecef,
+            },
+        )?;
+        let mut cw_11 = create_cor_writers(
+            write_acf_cor,
+            &ant1_name_file,
+            &ant1_name_file,
+            CorStation {
+                name: a1_name,
+                code: a1_code,
+                ecef_m: ant1_ecef,
+            },
+            CorStation {
+                name: a1_name,
+                code: a1_code,
+                ecef_m: ant1_ecef,
+            },
+        )?;
+        let mut cw_12 = create_cor_writers(
+            write_xcf_cor,
+            &ant1_name_file,
+            &ant2_name_file,
+            CorStation {
+                name: a1_name,
+                code: a1_code,
+                ecef_m: ant1_ecef,
+            },
+            CorStation {
+                name: a2_name,
+                code: a2_code,
+                ecef_m: ant2_ecef,
+            },
+        )?;
+        let mut cw_22 = create_cor_writers(
+            write_acf_cor,
+            &ant2_name_file,
+            &ant2_name_file,
+            CorStation {
+                name: a2_name,
+                code: a2_code,
+                ecef_m: ant2_ecef,
+            },
+            CorStation {
+                name: a2_name,
+                code: a2_code,
+                ecef_m: ant2_ecef,
+            },
+        )?;
 
         let prefetch_depth = io_pipeline_depth.max(2);
         println!(
@@ -5406,34 +5445,38 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 / (COR_ONE_SIDED_POWER_FACTOR * (level_power1 * level_power2).sqrt() * norm_base);
             let phased_power_ref = (w1 * w1 * level_power1 + w2 * w2 * level_power2).max(1e-12);
             let inv_ph = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * norm_base);
-            if let Some(w) = cw_ph.as_mut() {
-                let s_ph: Vec<Complex<f32>> = batch_ph
+            for (ch, w) in cw_ph.iter_mut().enumerate() {
+                let start = ch * inband_bins;
+                let end = start + inband_bins;
+                let s_ph: Vec<Complex<f32>> = batch_ph[start..end]
                     .iter()
-                    .take(fft_len / 2)
                     .map(|&v| Complex::new((v * inv_ph) as f32, 0.0))
                     .collect();
                 w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_ph)?;
             }
-            if let Some(w) = cw_11.as_mut() {
-                let s_11: Vec<Complex<f32>> = batch_11
+            for (ch, w) in cw_11.iter_mut().enumerate() {
+                let start = ch * inband_bins;
+                let end = start + inband_bins;
+                let s_11: Vec<Complex<f32>> = batch_11[start..end]
                     .iter()
-                    .take(fft_len / 2)
                     .map(|&v| Complex::new((v * inv_11) as f32, 0.0))
                     .collect();
                 w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_11)?;
             }
-            if let Some(w) = cw_12.as_mut() {
-                let s_12: Vec<Complex<f32>> = batch_12
+            for (ch, w) in cw_12.iter_mut().enumerate() {
+                let start = ch * inband_bins;
+                let end = start + inband_bins;
+                let s_12: Vec<Complex<f32>> = batch_12[start..end]
                     .iter()
-                    .take(fft_len / 2)
                     .map(|v| Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32))
                     .collect();
                 w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_12)?;
             }
-            if let Some(w) = cw_22.as_mut() {
-                let s_22: Vec<Complex<f32>> = batch_22
+            for (ch, w) in cw_22.iter_mut().enumerate() {
+                let start = ch * inband_bins;
+                let end = start + inband_bins;
+                let s_22: Vec<Complex<f32>> = batch_22[start..end]
                     .iter()
-                    .take(fft_len / 2)
                     .map(|&v| Complex::new((v * inv_22) as f32, 0.0))
                     .collect();
                 w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_22)?;
@@ -5463,16 +5506,16 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         if let Some(w) = wr.as_mut() {
             w.flush()?;
         }
-        if let Some(w) = cw_ph.take() {
+        for w in cw_ph {
             w.finalize()?;
         }
-        if let Some(w) = cw_11.take() {
+        for w in cw_11 {
             w.finalize()?;
         }
-        if let Some(w) = cw_12.take() {
+        for w in cw_12 {
             w.finalize()?;
         }
-        if let Some(w) = cw_22.take() {
+        for w in cw_22 {
             w.finalize()?;
         }
         if let Some(mut dw) = dbg_writer {

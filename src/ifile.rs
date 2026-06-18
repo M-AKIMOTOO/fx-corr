@@ -29,6 +29,7 @@ pub struct IFileData {
     pub stream_label: Option<String>,
     pub fft: Option<usize>,
     pub output_sec: Option<f64>,
+    pub inband: Option<usize>,
     pub sampling_hz: Option<f64>,
     pub ant1_bit: Option<usize>,
     pub ant2_bit: Option<usize>,
@@ -357,6 +358,11 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
     let process_length_sec = parse_optional_f64(&params, &["length", "processlength"])?;
     let output_hz =
         parse_optional_f64(&params, &["output", "outputhz", "outratehz", "coroutputhz"])?;
+    let inband = params
+        .get("inband")
+        .or_else(|| params.get("in_band"))
+        .map(|v| v.parse::<usize>())
+        .transpose()?;
     Ok(IFileData {
         ra: ra.clone(),
         dec: dec.clone(),
@@ -371,6 +377,7 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
             .cloned(),
         fft: params.get("fft").map(|v| v.parse()).transpose()?,
         output_sec: output_hz,
+        inband,
         sampling_hz: params
             .get("samplinghz")
             .or_else(|| params.get("fs"))
