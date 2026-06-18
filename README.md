@@ -1895,6 +1895,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.3` | Made `yi-phasedarray` apply residual delay/fringe phase on the same XML-grid bins used by `yi-corr`, so phased raw synthesis differs from correlation only at the final beamforming/output step. |
 | `3.1.2` | Added `--resacel <Hz/s>` to apply residual fringe acceleration from fringe fitting to the delay model, useful for long `yi-phasedarray` integrations when residual phase curvature remains. |
 | `3.1.1` | Updated `yi-phasedarray` beamforming to use the same post-FFT XML-grid alignment as `yi-corr` before phased summing, so phased raw and phased `.cor` products follow the validated delay/grid tracking path. |
 | `3.1.0` | Added XML `<stream><inband>N</inband></stream>` output splitting for pulsar and sub-band correlation workflows. `N` must be a power of two; split `.cor` files use `.chNbwBW.cor` names and carry sub-band observing frequency / effective bandwidth metadata. |

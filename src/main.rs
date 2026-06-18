@@ -33,8 +33,8 @@ use cor::{
 };
 use plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE, GREEN, RED};
 use utils::{
-    apply_delay_and_rate_regular_bins, build_decode_plan, decode_block_into_with_plan,
-    quantise_frame, DecodePlan, DynError, FftHelper, FftScratch,
+    build_decode_plan, decode_block_into_with_plan, quantise_frame, DecodePlan, DynError,
+    FftHelper, FftScratch,
 };
 use xcf::finalize_cross_spectrum;
 
@@ -579,6 +579,17 @@ fn xcf_phase_start_and_step(
     let phase_step_angle = step1 - step2;
     let phase_start = Complex::from_polar(1.0_f32, phase_start_angle as f32);
     let phase_step = Complex::from_polar(1.0_f32, phase_step_angle as f32);
+    (phase_start, phase_step)
+}
+
+fn antenna_phase_start_and_step(
+    df_hz: f64,
+    phase_delay_s: f64,
+    start_bin: isize,
+) -> (Complex<f32>, Complex<f32>) {
+    let step_angle = -2.0_f64 * std::f64::consts::PI * df_hz * phase_delay_s;
+    let phase_start = Complex::from_polar(1.0_f32, (step_angle * start_bin as f64) as f32);
+    let phase_step = Complex::from_polar(1.0_f32, step_angle as f32);
     (phase_start, phase_step)
 }
 
@@ -4844,8 +4855,6 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         sector_failures.fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
-                    let frac_delay1 = d.frac1;
-                    let frac_delay2 = d.frac2;
                     // The integer-delay sign convention is opposite to the sample-window
                     // displacement used by the decoded FFT frame.
                     if helper.forward_r2c_process(&mut f1, &mut s1).is_err() {
@@ -4865,27 +4874,6 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     // Keep the same reference as cross-correlation path.
                     let fr_lo1 = d.fr_lo1;
                     let fr_lo2 = d.fr_lo2;
-                    apply_delay_and_rate_regular_bins(
-                        &mut s1,
-                        fft_len,
-                        fs / fft_len as f64,
-                        frac_delay1,
-                        0.0,
-                        0.0,
-                        0.0,
-                        false,
-                    );
-                    apply_delay_and_rate_regular_bins(
-                        &mut s2,
-                        fft_len,
-                        fs / fft_len as f64,
-                        frac_delay2,
-                        0.0,
-                        0.0,
-                        0.0,
-                        false,
-                    );
-
                     let half = fft_len / 2 + 1;
                     let mut g1 = vec![Complex::new(0.0_f32, 0.0_f32); half];
                     let mut g2 = vec![Complex::new(0.0_f32, 0.0_f32); half];
@@ -4915,18 +4903,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     match out_grid {
                         OutputGrid::Ant1 => {
                             if need_xcf_products || need_acf_products || need_phased_products {
+                                let (mut phase1, step1) = antenna_phase_start_and_step(
+                                    df_hz,
+                                    d.frac1,
+                                    ba.a1s as isize - rotation_bins1,
+                                );
+                                let (mut phase2, step2) = antenna_phase_start_and_step(
+                                    df_hz,
+                                    d.frac2,
+                                    ba.a2s as isize - rotation_bins2,
+                                );
                                 for k in 0..(ba.a1e - ba.a1s) {
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
-                                    s2_aligned[i1] = g2[i2] * fr_lo2;
+                                    s1_aligned[i1] = g1[i1] * fr_lo1 * phase1;
+                                    s2_aligned[i1] = g2[i2] * fr_lo2 * phase2;
+                                    phase1 *= step1;
+                                    phase2 *= step2;
                                 }
                             }
-                            let s1c: Vec<Complex<f32>> =
-                                if need_xcf_products || need_acf_products || need_phased_products {
-                                    g1.iter().map(|z| *z * fr_lo1).collect::<Vec<_>>()
-                                } else {
-                                    Vec::new()
-                                };
+                            let s1c = &s1_aligned;
                             if need_phased_products {
                                 let mut cb = vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1];
                                 for k in 0..cb.len() {
@@ -4987,18 +4983,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         }
                         OutputGrid::Ant2 => {
                             if need_xcf_products || need_acf_products || need_phased_products {
+                                let (mut phase1, step1) = antenna_phase_start_and_step(
+                                    df_hz,
+                                    d.frac1,
+                                    ba.a1s as isize - rotation_bins1,
+                                );
+                                let (mut phase2, step2) = antenna_phase_start_and_step(
+                                    df_hz,
+                                    d.frac2,
+                                    ba.a2s as isize - rotation_bins2,
+                                );
                                 for k in 0..(ba.a1e - ba.a1s) {
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
-                                    s1_aligned[i2] = g1[i1] * fr_lo1;
+                                    s1_aligned[i2] = g1[i1] * fr_lo1 * phase1;
+                                    s2_aligned[i2] = g2[i2] * fr_lo2 * phase2;
+                                    phase1 *= step1;
+                                    phase2 *= step2;
                                 }
                             }
-                            let s2c: Vec<Complex<f32>> =
-                                if need_xcf_products || need_acf_products || need_phased_products {
-                                    g2.iter().map(|z| *z * fr_lo2).collect::<Vec<_>>()
-                                } else {
-                                    Vec::new()
-                                };
+                            let s2c = &s2_aligned;
                             if need_phased_products {
                                 let mut cb = vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1];
                                 for k in 0..cb.len() {
