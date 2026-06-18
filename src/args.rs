@@ -227,6 +227,15 @@ pub struct Args {
     )]
     pub resrate: f64,
 
+    #[arg(
+        long,
+        value_name = "HZ/S",
+        default_value_t = 0.0,
+        allow_hyphen_values = true,
+        help = "Additional residual fringe acceleration [Hz/s]"
+    )]
+    pub resacel: f64,
+
     #[arg(long, value_name = "HZ", num_args = 1.., allow_hyphen_values = true, help = "Per-antenna rotation frequency [Hz] (e.g. \"ant1:343000000 ant2:0\")")]
     pub rotation: Vec<String>,
 

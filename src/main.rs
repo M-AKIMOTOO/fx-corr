@@ -687,6 +687,7 @@ struct DelayEvalConfig {
     coarse_delay_s: f64,
     delay_user_samples: f64,
     extra_delay_rate_sps: f64,
+    extra_delay_accel_sps2: f64,
     clock1_delay_s: f64,
     clock1_rate_sps: f64,
     clock1_accel_sps2: f64,
@@ -762,7 +763,8 @@ fn compute_frame_delay_entry(
             let net_d_rel_no_clock_t = gd_t
                 + cfg.coarse_delay_s
                 + cfg.delay_user_samples / cfg.fs
-                + cfg.extra_delay_rate_sps * t_mid;
+                + cfg.extra_delay_rate_sps * t_mid
+                + 0.5 * cfg.extra_delay_accel_sps2 * t_mid * t_mid;
             let t2 = t_mid * t_mid;
             let t3 = t2 * t_mid;
             let t4 = t2 * t2;
@@ -2649,6 +2651,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     let coarse_delay_s = args.coarse.unwrap_or(DEFAULT_COARSE_DELAY_S);
     let delay_user_samples = args.delay + args.resdelay;
     let rate_user_hz = args.rate + args.resrate;
+    let accel_user_hzps = args.resacel;
+    let accel_user_sps2 = accel_user_hzps / (obs_mhz * 1e6);
     let rot1_regular = if_d
         .as_ref()
         .and_then(|d| d.ant1_rotation_hz)
@@ -2902,6 +2906,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         + coarse_delay_s
         + delay_user_samples / fs
         + extra_delay_rate_sps_for_align * read_align_ref_local_s
+        + 0.5 * accel_user_sps2 * read_align_ref_local_s * read_align_ref_local_s
         + (clock2_align_s - clock1_align_s);
     let read_align_delay_samples = read_align_delay_s * fs;
     // Directed read-align branch selection.
@@ -3509,7 +3514,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
     } else {
         0.0
     };
-    let total_accel_base = correction_sign * geom_accel_at_start_sps2 + clock_accel_sps2;
+    let total_accel_base =
+        correction_sign * geom_accel_at_start_sps2 + clock_accel_sps2 + accel_user_sps2;
     let total_jerk_base = clock_jerk_sps3;
     let total_snap_base = clock_snap_sps4;
     let total_accel1_base = if residual_on_ant2 {
@@ -3609,6 +3615,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         Arc::from(table.into_boxed_slice())
     });
     let extra_delay_rate_sps = (rotation_fringe_hz + rate_user_hz) / (obs_mhz * 1e6);
+    let extra_delay_accel_sps2 = accel_user_sps2;
     let geom_poly_order = match std::env::var("YI_GEOM_POLY_ORDER") {
         Ok(v) => {
             let order = v
@@ -3657,6 +3664,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         coarse_delay_s,
         delay_user_samples,
         extra_delay_rate_sps,
+        extra_delay_accel_sps2,
         clock1_delay_s,
         clock1_rate_sps,
         clock1_accel_sps2,
@@ -3732,6 +3740,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 (
                     (g.rate_sps
                         + delay_cfg.extra_delay_rate_sps
+                        + delay_cfg.extra_delay_accel_sps2 * d.t_mid_s
                         + (delay_cfg.clock2_rate_sps - delay_cfg.clock1_rate_sps)
                         + (delay_cfg.clock2_accel_sps2 - delay_cfg.clock1_accel_sps2) * d.t_mid_s
                         + 0.5
@@ -3745,6 +3754,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             * d.t_mid_s)
                         * fs,
                     (g.accel_sps2
+                        + delay_cfg.extra_delay_accel_sps2
                         + (delay_cfg.clock2_accel_sps2 - delay_cfg.clock1_accel_sps2)
                         + (delay_cfg.clock2_jerk_sps3 - delay_cfg.clock1_jerk_sps3) * d.t_mid_s
                         + 0.5
@@ -4229,6 +4239,14 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 clock_rate_hz,
                 rotation_fringe_hz,
                 rate_user_hz
+            )?;
+            writeln!(
+                w,
+                "# delay_accel_terms_hz_s: total={:.9e} geom={:.9e} clock={:.9e} user={:.9e}",
+                (geom_accel_at_start_sps2 + clock_accel_sps2 + accel_user_sps2) * obs_mhz * 1e6,
+                geom_accel_at_start_sps2 * obs_mhz * 1e6,
+                clock_accel_sps2 * obs_mhz * 1e6,
+                accel_user_hzps
             )?;
             writeln!(
                 w,
