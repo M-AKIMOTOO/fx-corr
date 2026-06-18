@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
+use crate::pulsar::PulsarConfig;
 use crate::utils::DynError;
 
 #[allow(dead_code)]
@@ -30,6 +31,7 @@ pub struct IFileData {
     pub fft: Option<usize>,
     pub output_sec: Option<f64>,
     pub inband: Option<usize>,
+    pub pulsar: Option<PulsarConfig>,
     pub sampling_hz: Option<f64>,
     pub ant1_bit: Option<usize>,
     pub ant2_bit: Option<usize>,
@@ -378,6 +380,7 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
         fft: params.get("fft").map(|v| v.parse()).transpose()?,
         output_sec: output_hz,
         inband,
+        pulsar: None,
         sampling_hz: params
             .get("samplinghz")
             .or_else(|| params.get("fs"))

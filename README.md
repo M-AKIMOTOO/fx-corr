@@ -163,6 +163,8 @@ Important nodes:
   - `<ra>`, `<dec>`
 - `<stream>`
   - `<frequency>` (Hz), `<fft>` (optional), `<label>` (optional)
+  - optional `<inband>N</inband>` power-of-two sub-band output split
+  - optional `<pulsar>` pulse-phase folding model
   - `<special key="A"><rotation>...</rotation><sideband>LSB|USB</sideband></special>`
 - `<process>`
   - `<epoch>YYYY/DDD HH:MM:SS</epoch>`
@@ -220,6 +222,36 @@ For process 2+ logs:
 XML `<stream><inband>N</inband></stream>` splits the already-correlated positive-frequency band into `N` `.cor` files. `N` must be a power of two. For a 512 MHz band and `<inband>4</inband>`, bins are written as `[0:128)`, `[128:256)`, `[256:384)`, and `[384:512)`.
 
 Split files add `.chNbwBW` before `.cor`, for example `<ANT1>_<ANT2>_<TAG>_<LABEL>.ch1bw512.cor`. Each split `.cor` header uses the sub-band low frequency as observing frequency and the effective sampling speed corresponding to the sub-band bandwidth. No additional delay correction or bandwidth synthesis is applied.
+
+### Pulsar folding `.cor` output
+
+XML `<stream><pulsar>...</pulsar></stream>` enables pulse-phase folding for `.cor` spectral products. The pulsar model belongs to the stream, while `<process>` continues to define the scan epoch, skip, length, source, and stations. The first implementation uses topocentric phase folding; barycentric correction is reserved for a future mode.
+
+Example:
+
+```xml
+<stream>
+  <label>yi-corr-pulsar</label>
+  <frequency>+6600e+6</frequency>
+  <fft>1024</fft>
+  <output>1</output>
+  <inband>4</inband>
+  <pulsar>
+    <epoch>2025/302 08:15:00</epoch>
+    <period>0.0335028583</period>
+    <pdot>0.0</pdot>
+    <pddot>0.0</pddot>
+    <bins>32</bins>
+    <dm>0.0</dm>
+    <dedisperse>false</dedisperse>
+    <time-correction>topocentric</time-correction>
+  </pulsar>
+</stream>
+```
+
+`<epoch>` is the pulse phase-zero epoch. If omitted, the process epoch is used. `<period>` is seconds, `<pdot>` is s/s, `<pddot>` is s/s^2, and `<bins>` is the number of pulse phase bins. When `<dedisperse>true</dedisperse>` and `<dm>` is non-zero, each frequency bin is assigned to a pulse phase bin after applying the cold-plasma dispersion delay relative to the top of the processed band; ACF and XCF are then accumulated in that corrected pulse bin.
+
+Pulse-bin output adds `.pbinNN` before `.cor`, for example `<ANT1>_<ANT2>_<TAG>_<LABEL>.pbin00.cor`. With `<inband>4</inband>`, names become `<ANT1>_<ANT2>_<TAG>_<LABEL>.ch1bw512.pbin00.cor`.
 
 Where:
 
@@ -1895,6 +1927,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.4` | Added XML `<stream><pulsar>...</pulsar></stream>` pulse-phase folding for `.cor` spectral products. Pulsar handling lives in `pulsar.rs`; optional DM correction assigns each frequency bin to a corrected pulse phase bin before ACF/XCF accumulation, and output files use `.pbinNN.cor` suffixes. |
 | `3.1.3` | Made `yi-phasedarray` apply residual delay/fringe phase on the same XML-grid bins used by `yi-corr`, so phased raw synthesis differs from correlation only at the final beamforming/output step. |
 | `3.1.2` | Added `--resacel <Hz/s>` to apply residual fringe acceleration from fringe fitting to the delay model, useful for long `yi-phasedarray` integrations when residual phase curvature remains. |
 | `3.1.1` | Updated `yi-phasedarray` beamforming to use the same post-FFT XML-grid alignment as `yi-corr` before phased summing, so phased raw and phased `.cor` products follow the validated delay/grid tracking path. |

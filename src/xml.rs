@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use roxmltree::{Document, Node};
 
 use crate::ifile::{IFileData, ProcessEntry};
+use crate::pulsar;
 use crate::utils::DynError;
 
 #[derive(Clone, Debug)]
@@ -474,6 +475,7 @@ pub fn parse_xml_schedule_for_process(
     let inband = child_text(stream, "inband")
         .map(|v| v.parse::<usize>())
         .transpose()?;
+    let pulsar = pulsar::parse_xml_node(stream.children().find(|n| is_tag(*n, "pulsar")))?;
 
     let default_sideband = "USB";
     let special_by_key: HashMap<String, Node<'_, '_>> = stream
@@ -641,6 +643,7 @@ pub fn parse_xml_schedule_for_process(
         fft,
         output_sec: output_hz,
         inband,
+        pulsar,
         sampling_hz,
         ant1_bit,
         ant2_bit,

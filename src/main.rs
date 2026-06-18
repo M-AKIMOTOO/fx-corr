@@ -6,6 +6,7 @@ mod eop;
 mod geom;
 mod ifile;
 mod plot;
+mod pulsar;
 mod utils;
 mod xcf;
 mod xml;
@@ -32,6 +33,7 @@ use cor::{
     epoch_to_yyyydddhhmmss, unix_seconds_to_yyyydddhhmmss, CorHeaderConfig, CorStation, CorWriter,
 };
 use plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE, GREEN, RED};
+use pulsar::{FoldAccum, FoldProduct, PulsarRuntime};
 use utils::{
     build_decode_plan, decode_block_into_with_plan, quantise_frame, DecodePlan, DynError,
     FftHelper, FftScratch,
@@ -4379,18 +4381,53 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 bw_tag, inband, inband_bw_mhz, inband_bins
             );
         }
-        let make_cor_path = |left: &str, right: &str, ch: usize| {
+        let pulsar_runtime = if let Some(cfg) = if_d.as_ref().and_then(|d| d.pulsar.clone()) {
+            if write_raw {
+                return Err("XML <pulsar> folding is only supported for .cor spectral products, not phased raw output".into());
+            }
+            let rt = PulsarRuntime::new(cfg, &ep_i, obs_mhz, df_hz, cor_bins_total)?;
+            println!(
+                "[info] Pulsar folding: name={} bins={} period={:.12e}s pdot={:.6e} pddot={:.6e} dm={:.6e} dedisperse={} time-correction={}",
+                rt.config().name.as_deref().unwrap_or("-"),
+                rt.bins(),
+                rt.config().period_s,
+                rt.config().pdot,
+                rt.config().pddot,
+                rt.config().dm,
+                rt.config().dedisperse,
+                rt.config().time_correction
+            );
+            Some(rt)
+        } else {
+            None
+        };
+        let pulsar_bin_count = pulsar_runtime.as_ref().map(|rt| rt.bins()).unwrap_or(1);
+        let pbin_tag = |pbin: usize| {
+            format!(
+                "pbin{:0width$}",
+                pbin,
+                width = pulsar_bin_count.saturating_sub(1).to_string().len().max(2)
+            )
+        };
+        let make_cor_path = |left: &str, right: &str, ch: usize, pbin: Option<usize>| {
+            let pbin_suffix = pbin
+                .map(|b| format!(".{}", pbin_tag(b)))
+                .unwrap_or_default();
             if inband == 1 {
-                o_dir.join(format!("{}_{}_{}_{}.cor", left, right, c_tag, cor_label))
+                o_dir.join(format!(
+                    "{}_{}_{}_{}{}.cor",
+                    left, right, c_tag, cor_label, pbin_suffix
+                ))
             } else {
                 o_dir.join(format!(
-                    "{}_{}_{}_{}.ch{}bw{}.cor",
+                    "{}_{}_{}_{}.ch{}bw{}{}.cor",
                     left,
                     right,
                     c_tag,
                     cor_label,
                     ch + 1,
-                    bw_tag
+                    bw_tag,
+                    pbin_suffix
                 ))
             }
         };
@@ -4425,14 +4462,25 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             if !enabled {
                 return Ok(Vec::new());
             }
-            let mut writers = Vec::with_capacity(inband);
-            for ch in 0..inband {
-                writers.push(CorWriter::create(
-                    &make_cor_path(left_file, right_file, ch),
-                    &make_cor_header(ch),
-                    st1,
-                    st2,
-                )?);
+            let mut writers = Vec::with_capacity(inband * pulsar_bin_count);
+            for pbin in 0..pulsar_bin_count {
+                for ch in 0..inband {
+                    writers.push(CorWriter::create(
+                        &make_cor_path(
+                            left_file,
+                            right_file,
+                            ch,
+                            if pulsar_bin_count > 1 {
+                                Some(pbin)
+                            } else {
+                                None
+                            },
+                        ),
+                        &make_cor_header(ch),
+                        st1,
+                        st2,
+                    )?);
+                }
             }
             Ok(writers)
         };
@@ -5091,7 +5139,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     }
                     acc1
                 };
-            let (batch_ph, batch_11, batch_12, batch_22) = if write_raw {
+            let (batch_ph, batch_11, batch_12, batch_22, batch_fold) = if write_raw {
                 let mut enc = vec![0u8; nf * bpf_o];
                 let acc = enc
                     .par_chunks_mut(bpf_o)
@@ -5112,13 +5160,14 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 if let Some(w) = wr.as_mut() {
                     w.write_all(&enc)?;
                 }
-                acc
+                (acc.0, acc.1, acc.2, acc.3, None)
             } else {
                 struct ThreadAccum {
                     acc_ph: Vec<f64>,
                     acc_11: Vec<f64>,
                     acc_12: Vec<Complex<f64>>,
                     acc_22: Vec<f64>,
+                    fold: Option<FoldAccum>,
                     f1: Vec<f32>,
                     f2: Vec<f32>,
                     s1: Vec<Complex<f32>>,
@@ -5137,6 +5186,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     acc_11: vec![0.0; half],
                     acc_12: vec![Complex::new(0.0_f64, 0.0_f64); half],
                     acc_22: vec![0.0; half],
+                    fold: pulsar_runtime
+                        .as_ref()
+                        .map(|rt| FoldAccum::new(rt.bins(), half, need_phased_products)),
                     f1: vec![0.0_f32; fft_len],
                     f2: vec![0.0_f32; fft_len],
                     s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
@@ -5255,6 +5307,67 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 );
                             }
                             let overlap_len = ba.a1e - ba.a1s;
+
+                            if let (Some(rt), Some(fold)) = (pulsar_runtime.as_ref(), st.fold.as_mut()) {
+                                let t_since_process_s = d.t_mid_s - total_skip_sec;
+                                match out_grid {
+                                    OutputGrid::Ant1 => {
+                                        let phase_delay1_s = d.frac1;
+                                        let phase_delay2_s = d.frac2;
+                                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                                            df_hz,
+                                            phase_delay1_s,
+                                            phase_delay2_s,
+                                            ba.a1s as isize - rotation_bins1,
+                                            ba.a2s as isize - rotation_bins2,
+                                        );
+                                        for k in 0..overlap_len {
+                                            let i1 = ba.a1s + k;
+                                            let i2 = ba.a2s + k;
+                                            let raw_xcf = g1[i1] * g2[i2].conj();
+                                            let v = raw_xcf * fr_mix * phase_corr;
+                                            fold.add_values(
+                                                rt,
+                                                t_since_process_s,
+                                                i1,
+                                                None,
+                                                g1[i1].norm_sqr() as f64,
+                                                Complex::new(v.re as f64, v.im as f64),
+                                                g2[i2].norm_sqr() as f64,
+                                            );
+                                            phase_corr *= phase_step;
+                                        }
+                                    }
+                                    OutputGrid::Ant2 => {
+                                        let phase_delay1_s = d.frac1;
+                                        let phase_delay2_s = d.frac2;
+                                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                                            df_hz,
+                                            phase_delay1_s,
+                                            phase_delay2_s,
+                                            ba.a1s as isize - rotation_bins1,
+                                            ba.a2s as isize - rotation_bins2,
+                                        );
+                                        for k in 0..overlap_len {
+                                            let i1 = ba.a1s + k;
+                                            let i2 = ba.a2s + k;
+                                            let raw_xcf = g1[i1] * g2[i2].conj();
+                                            let v = raw_xcf * fr_mix * phase_corr;
+                                            fold.add_values(
+                                                rt,
+                                                t_since_process_s,
+                                                i2,
+                                                None,
+                                                g1[i1].norm_sqr() as f64,
+                                                Complex::new(v.re as f64, v.im as f64),
+                                                g2[i2].norm_sqr() as f64,
+                                            );
+                                            phase_corr *= phase_step;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
 
                             match out_grid {
                                 OutputGrid::Ant1 => {
@@ -5420,6 +5533,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             a.acc_12[k] += b.acc_12[k];
                             a.acc_22[k] += b.acc_22[k];
                         }
+                        if let (Some(a_fold), Some(b_fold)) = (a.fold.as_mut(), b.fold) {
+                            a_fold.merge(b_fold);
+                        }
                         a
                     });
 
@@ -5441,6 +5557,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     std::mem::take(&mut out.acc_11),
                     std::mem::take(&mut out.acc_12),
                     std::mem::take(&mut out.acc_22),
+                    out.fold.take(),
                 )
             };
             let sec_failed = sector_failures.load(Ordering::Relaxed);
@@ -5486,41 +5603,120 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 / (COR_ONE_SIDED_POWER_FACTOR * (level_power1 * level_power2).sqrt() * norm_base);
             let phased_power_ref = (w1 * w1 * level_power1 + w2 * w2 * level_power2).max(1e-12);
             let inv_ph = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * norm_base);
-            for (ch, w) in cw_ph.iter_mut().enumerate() {
-                let start = ch * inband_bins;
-                let end = start + inband_bins;
-                let s_ph: Vec<Complex<f32>> = batch_ph[start..end]
-                    .iter()
-                    .map(|&v| Complex::new((v * inv_ph) as f32, 0.0))
-                    .collect();
-                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_ph)?;
-            }
-            for (ch, w) in cw_11.iter_mut().enumerate() {
-                let start = ch * inband_bins;
-                let end = start + inband_bins;
-                let s_11: Vec<Complex<f32>> = batch_11[start..end]
-                    .iter()
-                    .map(|&v| Complex::new((v * inv_11) as f32, 0.0))
-                    .collect();
-                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_11)?;
-            }
-            for (ch, w) in cw_12.iter_mut().enumerate() {
-                let start = ch * inband_bins;
-                let end = start + inband_bins;
-                let s_12: Vec<Complex<f32>> = batch_12[start..end]
-                    .iter()
-                    .map(|v| Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32))
-                    .collect();
-                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_12)?;
-            }
-            for (ch, w) in cw_22.iter_mut().enumerate() {
-                let start = ch * inband_bins;
-                let end = start + inband_bins;
-                let s_22: Vec<Complex<f32>> = batch_22[start..end]
-                    .iter()
-                    .map(|&v| Complex::new((v * inv_22) as f32, 0.0))
-                    .collect();
-                w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_22)?;
+            if let Some(fold) = batch_fold.as_ref() {
+                let norm_11_per_frame =
+                    1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * (fft_len as f64).powi(2));
+                let norm_22_per_frame =
+                    1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power2 * (fft_len as f64).powi(2));
+                let norm_12_per_frame = 1.0
+                    / (COR_ONE_SIDED_POWER_FACTOR
+                        * (level_power1 * level_power2).sqrt()
+                        * (fft_len as f64).powi(2));
+                let norm_ph_per_frame = 1.0
+                    / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * (fft_len as f64).powi(2));
+                for pbin in 0..pulsar_bin_count {
+                    for ch in 0..inband {
+                        let start = ch * inband_bins;
+                        let end = start + inband_bins;
+                        let count_max = fold.count_max(pbin, start, end);
+                        if count_max == 0 {
+                            continue;
+                        }
+                        let effective_s = count_max as f64 * frame_sec;
+                        let idx = pbin * inband + ch;
+                        if let Some(w) = cw_ph.get_mut(idx) {
+                            let s_ph = fold.normalized_real(
+                                FoldProduct::Phased,
+                                pbin,
+                                start,
+                                end,
+                                norm_ph_per_frame,
+                            );
+                            w.write_sector_at(
+                                c_unix,
+                                sector_start_offset_s,
+                                effective_s as f32,
+                                &s_ph,
+                            )?;
+                        }
+                        if let Some(w) = cw_11.get_mut(idx) {
+                            let s_11 = fold.normalized_real(
+                                FoldProduct::P11,
+                                pbin,
+                                start,
+                                end,
+                                norm_11_per_frame,
+                            );
+                            w.write_sector_at(
+                                c_unix,
+                                sector_start_offset_s,
+                                effective_s as f32,
+                                &s_11,
+                            )?;
+                        }
+                        if let Some(w) = cw_12.get_mut(idx) {
+                            let s_12 = fold.normalized_complex(pbin, start, end, norm_12_per_frame);
+                            w.write_sector_at(
+                                c_unix,
+                                sector_start_offset_s,
+                                effective_s as f32,
+                                &s_12,
+                            )?;
+                        }
+                        if let Some(w) = cw_22.get_mut(idx) {
+                            let s_22 = fold.normalized_real(
+                                FoldProduct::P22,
+                                pbin,
+                                start,
+                                end,
+                                norm_22_per_frame,
+                            );
+                            w.write_sector_at(
+                                c_unix,
+                                sector_start_offset_s,
+                                effective_s as f32,
+                                &s_22,
+                            )?;
+                        }
+                    }
+                }
+            } else {
+                for (ch, w) in cw_ph.iter_mut().enumerate() {
+                    let start = ch * inband_bins;
+                    let end = start + inband_bins;
+                    let s_ph: Vec<Complex<f32>> = batch_ph[start..end]
+                        .iter()
+                        .map(|&v| Complex::new((v * inv_ph) as f32, 0.0))
+                        .collect();
+                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_ph)?;
+                }
+                for (ch, w) in cw_11.iter_mut().enumerate() {
+                    let start = ch * inband_bins;
+                    let end = start + inband_bins;
+                    let s_11: Vec<Complex<f32>> = batch_11[start..end]
+                        .iter()
+                        .map(|&v| Complex::new((v * inv_11) as f32, 0.0))
+                        .collect();
+                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_11)?;
+                }
+                for (ch, w) in cw_12.iter_mut().enumerate() {
+                    let start = ch * inband_bins;
+                    let end = start + inband_bins;
+                    let s_12: Vec<Complex<f32>> = batch_12[start..end]
+                        .iter()
+                        .map(|v| Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32))
+                        .collect();
+                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_12)?;
+                }
+                for (ch, w) in cw_22.iter_mut().enumerate() {
+                    let start = ch * inband_bins;
+                    let end = start + inband_bins;
+                    let s_22: Vec<Complex<f32>> = batch_22[start..end]
+                        .iter()
+                        .map(|&v| Complex::new((v * inv_22) as f32, 0.0))
+                        .collect();
+                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_22)?;
+                }
             }
         }
         drop(rx_sec);
