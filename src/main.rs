@@ -244,6 +244,72 @@ fn shift_real_fft_to_xml_grid_with_extra_offset(
 }
 
 #[inline]
+fn real_fft_xml_grid_bin(
+    src: &[Complex<f32>],
+    fft_len: usize,
+    xml_bin: usize,
+    rotation_bins: isize,
+    extra_raw_offset: isize,
+) -> Complex<f32> {
+    let raw_idx = xml_bin as isize - rotation_bins + extra_raw_offset;
+    map_real_fft_bin_to_xml_grid(src, fft_len, raw_idx)
+}
+
+#[inline]
+fn maybe_dump_xcf_debug(
+    args_debug: bool,
+    frame_global: usize,
+    local_frame: usize,
+    sector_idx: usize,
+    output_grid: OutputGrid,
+    bin: usize,
+    raw_xcf: Complex<f32>,
+    fr_mix: Complex<f32>,
+    phase_corr: Complex<f32>,
+    value: Complex<f32>,
+    d: FrameDelayEntry,
+    fs: f64,
+) {
+    if !args_debug || frame_global >= 40 {
+        return;
+    }
+    let dbg_bin = std::env::var("YI_XCFDBG2_BIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(69866);
+    if bin != dbg_bin {
+        return;
+    }
+    let v_fr = raw_xcf * fr_mix;
+    let v_pc = raw_xcf * phase_corr;
+    let grid_label = match output_grid {
+        OutputGrid::Ant1 => "ant1",
+        OutputGrid::Ant2 => "ant2",
+    };
+    eprintln!(
+        "[xcfdbg2] grid={} frame={} sec={} local_frame={} bin={} raw_abs={:.9e} raw_ph={:+.3} fr_ph={:+.3} pc_ph={:+.3} all_ph={:+.3} fr_mix_ph={:+.3} phase_corr_ph={:+.3} int=({},{}) frac_sample=({:+.6},{:+.6}) tau_sample=({:+.6},{:+.6})",
+        grid_label,
+        frame_global,
+        sector_idx,
+        local_frame,
+        bin,
+        raw_xcf.norm(),
+        raw_xcf.arg().to_degrees(),
+        v_fr.arg().to_degrees(),
+        v_pc.arg().to_degrees(),
+        value.arg().to_degrees(),
+        fr_mix.arg().to_degrees(),
+        phase_corr.arg().to_degrees(),
+        d.int1,
+        d.int2,
+        d.frac1 * fs,
+        d.frac2 * fs,
+        d.tau1_s * fs,
+        d.tau2_s * fs,
+    );
+}
+
+#[inline]
 fn fft_peak_dbg_enabled() -> bool {
     matches!(
         std::env::var("YI_FFTPEAKDBG")
@@ -5308,44 +5374,50 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             let fr_lo1 = d.fr_lo1;
                             let fr_lo2 = d.fr_lo2;
                             let fr_mix = fr_lo1 * fr_lo2.conj();
-                            shift_real_fft_to_xml_grid_with_extra_offset(
-                                &st.s1,
-                                &mut st.g1,
-                                fft_len,
-                                rotation_bins1,
-                                station_offset1,
-                            );
-                            shift_real_fft_to_xml_grid_with_extra_offset(
-                                &st.s2,
-                                &mut st.g2,
-                                fft_len,
-                                rotation_bins2,
-                                station_offset2,
-                            );
-
-                            if fft_peak_dbg_enabled() && i < fft_peak_dbg_max_frames() {
-                                print_fft_peak_dbg(
-                                    "raw_to_grid",
-                                    i,
-                                    a1_name,
+                            let need_grid_buffers =
+                                pulsar_runtime.is_some() || fft_peak_dbg_enabled();
+                            if need_grid_buffers {
+                                shift_real_fft_to_xml_grid_with_extra_offset(
                                     &st.s1,
-                                    &st.g1,
+                                    &mut st.g1,
+                                    fft_len,
                                     rotation_bins1,
-                                    0,
+                                    station_offset1,
                                 );
-                                print_fft_peak_dbg(
-                                    "raw_to_grid",
-                                    i,
-                                    a2_name,
+                                shift_real_fft_to_xml_grid_with_extra_offset(
                                     &st.s2,
-                                    &st.g2,
+                                    &mut st.g2,
+                                    fft_len,
                                     rotation_bins2,
                                     station_offset2,
                                 );
+
+                                if fft_peak_dbg_enabled() && i < fft_peak_dbg_max_frames() {
+                                    print_fft_peak_dbg(
+                                        "raw_to_grid",
+                                        i,
+                                        a1_name,
+                                        &st.s1,
+                                        &st.g1,
+                                        rotation_bins1,
+                                        0,
+                                    );
+                                    print_fft_peak_dbg(
+                                        "raw_to_grid",
+                                        i,
+                                        a2_name,
+                                        &st.s2,
+                                        &st.g2,
+                                        rotation_bins2,
+                                        station_offset2,
+                                    );
+                                }
                             }
                             let overlap_len = ba.a1e - ba.a1s;
 
-                            if let (Some(rt), Some(fold)) = (pulsar_runtime.as_ref(), st.fold.as_mut()) {
+                            if let (Some(rt), Some(fold)) =
+                                (pulsar_runtime.as_ref(), st.fold.as_mut())
+                            {
                                 let t_since_process_s = d.t_mid_s - total_skip_sec;
                                 match out_grid {
                                     OutputGrid::Ant1 => {
@@ -5406,152 +5478,145 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 continue;
                             }
 
+                            // Fast path: do not materialize XML-grid spectra for normal
+                            // correlation.  Read the mapped FFT bin once and update ACF/XCF in
+                            // the same pass to reduce memory traffic and extra 1024-bin loops.
                             match out_grid {
                                 OutputGrid::Ant1 => {
-                                    if need_acf_products {
-                                        if acf_overlap_only {
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_11[i1] += st.g1[i1].norm_sqr() as f64;
-                                                st.acc_22[i1] += st.g2[i2].norm_sqr() as f64;
-                                            }
-                                        } else {
-                                            for k in 0..half {
-                                                st.acc_11[k] += st.g1[k].norm_sqr() as f64;
-                                            }
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_22[i1] += st.g2[i2].norm_sqr() as f64;
-                                            }
+                                    if need_acf_products && !acf_overlap_only {
+                                        for k in 0..half {
+                                            let z1 = real_fft_xml_grid_bin(
+                                                &st.s1,
+                                                fft_len,
+                                                k,
+                                                rotation_bins1,
+                                                station_offset1,
+                                            );
+                                            st.acc_11[k] += z1.norm_sqr() as f64;
                                         }
                                     }
+                                    let mut phase_corr = None;
                                     if need_xcf_products {
-                                        let phase_delay1_s = d.frac1;
-                                        let phase_delay2_s = d.frac2;
-                                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                                        let (phase0, step) = xcf_phase_start_and_step(
                                             df_hz,
-                                            phase_delay1_s,
-                                            phase_delay2_s,
+                                            d.frac1,
+                                            d.frac2,
                                             ba.a1s as isize - rotation_bins1,
                                             ba.a2s as isize - rotation_bins2,
                                         );
-                                        for k in 0..overlap_len {
-                                            let i1 = ba.a1s + k;
-                                            let i2 = ba.a2s + k;
-                                            let raw_xcf = st.g1[i1] * st.g2[i2].conj();
-                                            let v = raw_xcf * fr_mix * phase_corr;
-
-                                            // Diagnostic for narrow-band maser XCF coherence.
-                                            // Dump only a few early frames around the maser peak bin.
-                                            if args.debug && (emitted + i) < 40 {
-                                                let dbg_bin = std::env::var("YI_XCFDBG2_BIN")
-                                                    .ok()
-                                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                                                    .unwrap_or(69866);
-                                                if i1 == dbg_bin {
-                                                let v_fr = raw_xcf * fr_mix;
-                                                let v_pc = raw_xcf * phase_corr;
-                                                eprintln!(
-                                                    "[xcfdbg2] grid=ant1 frame={} sec={} local_frame={} bin={} raw_abs={:.9e} raw_ph={:+.3} fr_ph={:+.3} pc_ph={:+.3} all_ph={:+.3} fr_mix_ph={:+.3} phase_corr_ph={:+.3} int=({},{}) frac_sample=({:+.6},{:+.6}) tau_sample=({:+.6},{:+.6})",
-                                                    emitted + i,
-                                                    si,
-                                                    i,
-                                                    i1,
-                                                    raw_xcf.norm(),
-                                                    raw_xcf.arg().to_degrees(),
-                                                    v_fr.arg().to_degrees(),
-                                                    v_pc.arg().to_degrees(),
-                                                    v.arg().to_degrees(),
-                                                    fr_mix.arg().to_degrees(),
-                                                    phase_corr.arg().to_degrees(),
-                                                    d.int1,
-                                                    d.int2,
-                                                    d.frac1 * fs,
-                                                    d.frac2 * fs,
-                                                    d.tau1_s * fs,
-                                                    d.tau2_s * fs,
-                                                );
-                                                }
+                                        phase_corr = Some((phase0, step));
+                                    }
+                                    for k in 0..overlap_len {
+                                        let i1 = ba.a1s + k;
+                                        let i2 = ba.a2s + k;
+                                        let z1 = real_fft_xml_grid_bin(
+                                            &st.s1,
+                                            fft_len,
+                                            i1,
+                                            rotation_bins1,
+                                            station_offset1,
+                                        );
+                                        let z2 = real_fft_xml_grid_bin(
+                                            &st.s2,
+                                            fft_len,
+                                            i2,
+                                            rotation_bins2,
+                                            station_offset2,
+                                        );
+                                        if need_acf_products {
+                                            if acf_overlap_only {
+                                                st.acc_11[i1] += z1.norm_sqr() as f64;
                                             }
-
+                                            st.acc_22[i1] += z2.norm_sqr() as f64;
+                                        }
+                                        if let Some((ref mut pc, step)) = phase_corr {
+                                            let raw_xcf = z1 * z2.conj();
+                                            let v = raw_xcf * fr_mix * *pc;
+                                            maybe_dump_xcf_debug(
+                                                args.debug,
+                                                emitted + i,
+                                                i,
+                                                si,
+                                                OutputGrid::Ant1,
+                                                i1,
+                                                raw_xcf,
+                                                fr_mix,
+                                                *pc,
+                                                v,
+                                                d,
+                                                fs,
+                                            );
                                             st.acc_12[i1] += Complex::new(v.re as f64, v.im as f64);
-                                            phase_corr *= phase_step;
+                                            *pc *= step;
                                         }
                                     }
                                 }
                                 OutputGrid::Ant2 => {
-                                    if need_acf_products {
-                                        if acf_overlap_only {
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_11[i2] += st.g1[i1].norm_sqr() as f64;
-                                                st.acc_22[i2] += st.g2[i2].norm_sqr() as f64;
-                                            }
-                                        } else {
-                                            for k in 0..half {
-                                                st.acc_22[k] += st.g2[k].norm_sqr() as f64;
-                                            }
-                                            for k in 0..overlap_len {
-                                                let i1 = ba.a1s + k;
-                                                let i2 = ba.a2s + k;
-                                                st.acc_11[i2] += st.g1[i1].norm_sqr() as f64;
-                                            }
+                                    if need_acf_products && !acf_overlap_only {
+                                        for k in 0..half {
+                                            let z2 = real_fft_xml_grid_bin(
+                                                &st.s2,
+                                                fft_len,
+                                                k,
+                                                rotation_bins2,
+                                                station_offset2,
+                                            );
+                                            st.acc_22[k] += z2.norm_sqr() as f64;
                                         }
                                     }
+                                    let mut phase_corr = None;
                                     if need_xcf_products {
-                                        let phase_delay1_s = d.frac1;
-                                        let phase_delay2_s = d.frac2;
-                                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
+                                        let (phase0, step) = xcf_phase_start_and_step(
                                             df_hz,
-                                            phase_delay1_s,
-                                            phase_delay2_s,
+                                            d.frac1,
+                                            d.frac2,
                                             ba.a1s as isize - rotation_bins1,
                                             ba.a2s as isize - rotation_bins2,
                                         );
-                                        for k in 0..overlap_len {
-                                            let i1 = ba.a1s + k;
-                                            let i2 = ba.a2s + k;
-                                            let raw_xcf = st.g1[i1] * st.g2[i2].conj();
-                                            let v = raw_xcf * fr_mix * phase_corr;
-
-                                            // Diagnostic for narrow-band maser XCF coherence.
-                                            // Dump only a few early frames around the maser peak bin.
-                                            if args.debug && (emitted + i) < 40 {
-                                                let dbg_bin = std::env::var("YI_XCFDBG2_BIN")
-                                                    .ok()
-                                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                                                    .unwrap_or(69866);
-                                                if i2 == dbg_bin {
-                                                let v_fr = raw_xcf * fr_mix;
-                                                let v_pc = raw_xcf * phase_corr;
-                                                eprintln!(
-                                                    "[xcfdbg2] grid=ant2 frame={} sec={} local_frame={} bin={} raw_abs={:.9e} raw_ph={:+.3} fr_ph={:+.3} pc_ph={:+.3} all_ph={:+.3} fr_mix_ph={:+.3} phase_corr_ph={:+.3} int=({},{}) frac_sample=({:+.6},{:+.6}) tau_sample=({:+.6},{:+.6})",
-                                                    emitted + i,
-                                                    si,
-                                                    i,
-                                                    i2,
-                                                    raw_xcf.norm(),
-                                                    raw_xcf.arg().to_degrees(),
-                                                    v_fr.arg().to_degrees(),
-                                                    v_pc.arg().to_degrees(),
-                                                    v.arg().to_degrees(),
-                                                    fr_mix.arg().to_degrees(),
-                                                    phase_corr.arg().to_degrees(),
-                                                    d.int1,
-                                                    d.int2,
-                                                    d.frac1 * fs,
-                                                    d.frac2 * fs,
-                                                    d.tau1_s * fs,
-                                                    d.tau2_s * fs,
-                                                );
-                                                }
+                                        phase_corr = Some((phase0, step));
+                                    }
+                                    for k in 0..overlap_len {
+                                        let i1 = ba.a1s + k;
+                                        let i2 = ba.a2s + k;
+                                        let z1 = real_fft_xml_grid_bin(
+                                            &st.s1,
+                                            fft_len,
+                                            i1,
+                                            rotation_bins1,
+                                            station_offset1,
+                                        );
+                                        let z2 = real_fft_xml_grid_bin(
+                                            &st.s2,
+                                            fft_len,
+                                            i2,
+                                            rotation_bins2,
+                                            station_offset2,
+                                        );
+                                        if need_acf_products {
+                                            st.acc_11[i2] += z1.norm_sqr() as f64;
+                                            if acf_overlap_only {
+                                                st.acc_22[i2] += z2.norm_sqr() as f64;
                                             }
-
+                                        }
+                                        if let Some((ref mut pc, step)) = phase_corr {
+                                            let raw_xcf = z1 * z2.conj();
+                                            let v = raw_xcf * fr_mix * *pc;
+                                            maybe_dump_xcf_debug(
+                                                args.debug,
+                                                emitted + i,
+                                                i,
+                                                si,
+                                                OutputGrid::Ant2,
+                                                i2,
+                                                raw_xcf,
+                                                fr_mix,
+                                                *pc,
+                                                v,
+                                                d,
+                                                fs,
+                                            );
                                             st.acc_12[i2] += Complex::new(v.re as f64, v.im as f64);
-                                            phase_corr *= phase_step;
+                                            *pc *= step;
                                         }
                                     }
                                 }
