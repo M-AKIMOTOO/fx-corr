@@ -20,10 +20,8 @@ CPU 相関器は単なる試作ではなく、GPU 相関器開発の基準実装
 
 今後の GPU 相関器開発では、CPU 版で確定した処理を段階的に GPU へ移植する。第一段階では raw decode、sideband normalization、integer delay shift、FFT 入力整形を GPU 化する。第二段階では batched FFT と fractional delay phase correction、frequency rotation、XCF/ACF accumulation を GPU 上で実装する。第三段階では multi-baseline/multi-station 処理、streaming I/O、観測 scan の連続処理を GPU pipeline として統合する。CPU 版はこの各段階で比較対象として使い、GPU 化による高速化と科学的再現性の両方を評価する。
 
-This repository builds four binaries from the same codebase:
+This repository builds two operational binaries from the same codebase:
 
-- `yi-acf`: auto-correlation only (A1xA1, A2xA2)
-- `yi-xcf`: cross-correlation only (A1xA2)
 - `yi-corr`: auto + cross correlation (A1xA1, A1xA2, A2xA2)
 - `yi-phasedarray`: phased-array synthesis (`.raw`, phased `.cor`, plots)
 
@@ -59,8 +57,6 @@ These build-time values are used as defaults for automatic `yi-corr` tuning
 
 Binaries are created under `target/release/`:
 
-- `target/release/yi-acf`
-- `target/release/yi-xcf`
 - `target/release/yi-corr`
 - `target/release/yi-phasedarray`
 
@@ -107,18 +103,9 @@ target/release/yi-corr \
   --cor test/
 ```
 
-### 3) Run per mode
+### 3) Run phased-array synthesis
 
 ```bash
-# ACF only
-target/release/yi-acf --sc test.xml --raw raw --cor test/
-
-# XCF only
-target/release/yi-xcf --sc test.xml --raw raw --cor test/
-
-# ACF + XCF
-target/release/yi-corr --sc test.xml --raw raw --cor test/
-
 # Phased-array (writes outputs to current directory)
 target/release/yi-phasedarray --sc test.xml --raw raw
 ```
@@ -194,16 +181,9 @@ For process 2+ logs:
 
 ## Output files
 
-### yi-acf
-
-- `<ANT1>_<ANT1>_<TAG>_<LABEL>.cor`
-- `<ANT2>_<ANT2>_<TAG>_<LABEL>.cor`
-
-### yi-xcf
-
-- `<ANT1>_<ANT2>_<TAG>_<LABEL>.cor`
-
 ### yi-corr
+
+`yi-corr` writes ACF and XCF products together:
 
 - `<ANT1>_<ANT1>_<TAG>_<LABEL>.cor`
 - `<ANT1>_<ANT2>_<TAG>_<LABEL>.cor`
@@ -225,7 +205,7 @@ Split files add `.chNbwBW` before `.cor`, for example `<ANT1>_<ANT2>_<TAG>_<LABE
 
 ### Quick-look fringe plots
 
-`yi-xcf` and `yi-corr` support `--fringe <S>` to write quick-look products every `S` seconds. The implementation accumulates the already fringe-stopped XCF frequency spectrum, writes a spectrum plot/TSV, then performs a lightweight 1D inverse FFT across frequency to write a lag-fringe plot/TSV. This is intended for fast inspection, not a full 2D delay/rate fringe search.
+`yi-corr` supports `--fringe <S>` to write quick-look products every `S` seconds. The implementation accumulates the already fringe-stopped XCF frequency spectrum, writes a spectrum plot/TSV, then performs a lightweight 1D inverse FFT across frequency to write a lag-fringe plot/TSV. This is intended for fast inspection, not a full 2D delay/rate fringe search.
 
 Example:
 
@@ -284,7 +264,7 @@ Core:
 
 - `--sc, --schedule <XML>`
 - `--raw, --raw-directory <DIR>`
-- `--cor, --cor-directory <DIR>` (required for `yi-acf/yi-xcf/yi-corr`)
+- `--cor, --cor-directory <DIR>` (required for `yi-corr`)
 
 Signal/processing:
 
@@ -1939,6 +1919,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.13` | Removed the obsolete `yi-acf` and `yi-xcf` binaries; `yi-corr` is now the single ACF/XCF correlator entry point. |
 | `3.1.12` | Reused normalized `.cor` output buffers for normal `yi-corr` sector writes, avoiding per-sector/per-inband allocation during ACF/XCF/phased product serialization. |
 | `3.1.11` | Reused `PackedSampleReader` instances in the `yi-corr` sector reader and skipped seeks when sector reads are byte-contiguous, reducing raw I/O open/seek overhead. |
 | `3.1.10` | Precomputed real-FFT XML-grid bin maps for normal `yi-corr` accumulation, removing per-bin modulo/Hermitian mapping from the ACF/XCF hot loop while keeping arbitrary FFT lengths. |
@@ -2086,7 +2067,7 @@ time target/release/yi-corr \
 - Large run-to-run wall-time variation
   - Commonly due to storage/cache state, not algorithmic change.
 - Need ACF and XCF together
-  - Use `yi-corr` (not `yi-xcf` only).
+  - Use `yi-corr` as the ACF/XCF correlator entry point.
 
 ## External RAID (3 Gbps) operation tip
 

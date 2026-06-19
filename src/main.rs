@@ -1106,8 +1106,6 @@ impl NormalCorrKernel {
 
 #[derive(Clone, Copy, Debug)]
 enum RunMode {
-    Acf,
-    Xcf,
     PhasedArray,
     Corr,
 }
@@ -1115,8 +1113,6 @@ enum RunMode {
 impl RunMode {
     fn label(self) -> &'static str {
         match self {
-            RunMode::Acf => "yi_acf",
-            RunMode::Xcf => "yi-xcf",
             RunMode::PhasedArray => "yi-phasedarray",
             RunMode::Corr => "yi-corr",
         }
@@ -1134,8 +1130,6 @@ fn detect_run_mode_from_argv0() -> RunMode {
         .unwrap_or_default()
         .to_ascii_lowercase();
     match stem.as_str() {
-        "yi_acf" | "yi-acf" => RunMode::Acf,
-        "yi-xcf" | "yi_xcf" => RunMode::Xcf,
         "yi_phasedarray" | "yi-phasedarray" => RunMode::PhasedArray,
         "yi-corr" | "yi_corr" => RunMode::Corr,
         s if s.starts_with("yi-corr-v") => RunMode::Corr,
@@ -1606,7 +1600,7 @@ fn resolve_output_layout(
         let d = args
             .cor_directory
             .clone()
-            .ok_or("--cor-directory is required for yi-acf/yi-xcf/yi-corr")?;
+            .ok_or("--cor-directory is required for yi-corr")?;
         std::fs::create_dir_all(&d)?;
         d
     };
@@ -2146,15 +2140,15 @@ fn main() -> Result<(), DynError> {
                 return Err("--raw-directory is required for yi-phasedarray".into());
             }
         }
-        RunMode::Acf | RunMode::Xcf | RunMode::Corr => {
+        RunMode::Corr => {
             if args.schedule.is_none() {
-                return Err("--schedule is required for yi-acf/yi-xcf/yi-corr".into());
+                return Err("--schedule is required for yi-corr".into());
             }
             if args.raw_directory.is_none() {
-                return Err("--raw-directory is required for yi-acf/yi-xcf/yi-corr".into());
+                return Err("--raw-directory is required for yi-corr".into());
             }
             if args.cor_directory.is_none() {
-                return Err("--cor-directory is required for yi-acf/yi-xcf/yi-corr".into());
+                return Err("--cor-directory is required for yi-corr".into());
             }
         }
     }
@@ -2257,18 +2251,15 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         if !v.is_finite() || v <= 0.0 {
             return Err("--fringe interval must be a positive finite number of seconds".into());
         }
-        if !matches!(run_mode, RunMode::Xcf | RunMode::Corr) {
-            return Err("--fringe requires yi-xcf or yi-corr because it uses XCF spectra".into());
+        if !matches!(run_mode, RunMode::Corr) {
+            return Err("--fringe requires yi-corr because it uses XCF spectra".into());
         }
     }
     let do_xcf = false;
-    let do_synth = matches!(
-        run_mode,
-        RunMode::Acf | RunMode::Xcf | RunMode::PhasedArray | RunMode::Corr
-    );
+    let do_synth = true;
     let write_raw = matches!(run_mode, RunMode::PhasedArray);
-    let write_acf_cor = matches!(run_mode, RunMode::Acf | RunMode::Corr);
-    let write_xcf_cor = matches!(run_mode, RunMode::Xcf | RunMode::Corr);
+    let write_acf_cor = matches!(run_mode, RunMode::Corr);
+    let write_xcf_cor = matches!(run_mode, RunMode::Corr);
     let write_phased_cor = matches!(run_mode, RunMode::PhasedArray);
     let plot_phased = matches!(run_mode, RunMode::PhasedArray);
     let if_d = if let Some(p) = &args.schedule {
@@ -4918,10 +4909,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let need_xcf_products = write_xcf_cor;
         let fft_peak_debug = fft_peak_dbg_enabled();
         let normal_corr_kernel = NormalCorrKernel::from_output_grid(out_grid);
-        let acf_overlap_only = matches!(run_mode, RunMode::Acf)
-            && need_acf_products
-            && !need_xcf_products
-            && !need_phased_products;
+        let acf_overlap_only = false;
         let mut acc_ph_total = if need_phased_products {
             Some(vec![0.0; fft_len / 2 + 1])
         } else {

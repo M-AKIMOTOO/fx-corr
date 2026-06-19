@@ -17,7 +17,7 @@ pub const DEFAULT_SHUFFLE_IN: [usize; 32] = [
     author,
     version,
     about = "yi toolkit for FX correlation and phased-array processing",
-    long_about = "yi-acf: auto-correlation only\nyi-xcf: cross-correlation only\nyi-corr: auto + cross correlation\nyi-phasedarray: phased-array synthesis and spectrum plots",
+    long_about = "yi-corr: auto + cross correlation\nyi-phasedarray: phased-array synthesis and spectrum plots",
     infer_long_args = true,
     arg_required_else_help = true
 )]
