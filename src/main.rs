@@ -2270,7 +2270,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         .unwrap_or("2000".into());
     let (a1p, a2p, _, _unused_tag) =
         resolve_input_paths(&args, &ep_i, if_d.as_ref().map(|v| &**v))?;
-    let (c_unix_base, _) = epoch_to_yyyydddhhmmss(&ep_i)?;
+    let (c_unix_base, process_epoch_tag) = epoch_to_yyyydddhhmmss(&ep_i)?;
     let ant1_ecef = if_d
         .as_ref()
         .and_then(|d| d.ant1_ecef_m)
@@ -4557,8 +4557,22 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             },
         )?;
 
-        let mut ql_fringe_acc =
-            fringe_interval_s.map(|_| vec![Complex::new(0.0_f64, 0.0_f64); cor_bins_total]);
+        let ql_fringe_dir = fringe_interval_s.map(|_| {
+            let schedule_base = args
+                .schedule
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+                .map(sanitize_file_token)
+                .unwrap_or_else(|| "direct".to_string());
+            o_dir
+                .join("fringe_yicorr_ql")
+                .join(schedule_base)
+                .join(&process_epoch_tag)
+        });
+        let mut ql_fringe_acc = ql_fringe_dir
+            .as_ref()
+            .map(|_| vec![Complex::new(0.0_f64, 0.0_f64); cor_bins_total]);
         let mut ql_fringe_frames = 0usize;
         let mut ql_fringe_start_offset_s = 0.0_f64;
         let mut ql_fringe_index = 0usize;
@@ -5643,7 +5657,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         .collect();
                     let ql_label = format!("{}_ql{:04}", cor_label, ql_fringe_index);
                     fringe::write_ql_fringe_products(
-                        &o_dir,
+                        ql_fringe_dir.as_ref().expect("fringe output directory"),
                         &c_tag,
                         &ql_label,
                         ql_fringe_start_offset_s,

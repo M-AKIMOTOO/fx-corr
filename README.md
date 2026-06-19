@@ -233,7 +233,7 @@ Example:
 yi-corr --sc scan.xml --raw ../raw --cor cor_out --fringe 60
 ```
 
-For each interval, files are written under the correlation output directory with names containing `_fringe_spectrum.tsv`, `_fringe_spectrum_amp.png`, `_fringe_lag.tsv`, and `_fringe_lag_amp.png`.
+For each interval, files are written under `<cor>/fringe_yicorr_ql/<schedule-basename>/<process-epoch>/` with names containing `_fringe_spectrum.tsv`, `_fringe_spectrum_amp.png`, `_fringe_lag.tsv`, and `_fringe_lag_amp.png`.
 
 ### Pulsar folding `.cor` output
 
@@ -1939,6 +1939,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.6` | Grouped `--fringe <seconds>` quick-look outputs under `<cor>/fringe_yicorr_ql/<schedule-basename>/<process-epoch>/` so repeated process windows from one schedule stay together. |
 | `3.1.5` | Changed `--fringe` to `--fringe <seconds>` quick-look output for `yi-xcf`/`yi-corr`: each interval writes integrated XCF spectrum PNG/TSV plus a lightweight 1D frequency-IFFT lag-fringe PNG/TSV. |
 | `3.1.4` | Added XML `<stream><pulsar>...</pulsar></stream>` pulse-phase folding for `.cor` spectral products. Pulsar handling lives in `pulsar.rs`; optional DM correction assigns each frequency bin to a corrected pulse phase bin before ACF/XCF accumulation, and output files use `.pbinNN.cor` suffixes. |
 | `3.1.3` | Made `yi-phasedarray` apply residual delay/fringe phase on the same XML-grid bins used by `yi-corr`, so phased raw synthesis differs from correlation only at the final beamforming/output step. |
