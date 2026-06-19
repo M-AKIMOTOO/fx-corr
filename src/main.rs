@@ -4707,6 +4707,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 ecef_m: ant2_ecef,
             },
         )?;
+        let mut cor_write_buf_ph = vec![Complex::new(0.0_f32, 0.0_f32); inband_bins];
+        let mut cor_write_buf_11 = vec![Complex::new(0.0_f32, 0.0_f32); inband_bins];
+        let mut cor_write_buf_12 = vec![Complex::new(0.0_f32, 0.0_f32); inband_bins];
+        let mut cor_write_buf_22 = vec![Complex::new(0.0_f32, 0.0_f32); inband_bins];
 
         let ql_fringe_dir = fringe_interval_s.map(|_| {
             let schedule_base = args
@@ -5888,38 +5892,54 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 for (ch, w) in cw_ph.iter_mut().enumerate() {
                     let start = ch * inband_bins;
                     let end = start + inband_bins;
-                    let s_ph: Vec<Complex<f32>> = batch_ph[start..end]
-                        .iter()
-                        .map(|&v| Complex::new((v * inv_ph) as f32, 0.0))
-                        .collect();
-                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_ph)?;
+                    for (out, &v) in cor_write_buf_ph.iter_mut().zip(&batch_ph[start..end]) {
+                        *out = Complex::new((v * inv_ph) as f32, 0.0);
+                    }
+                    w.write_sector_at(
+                        c_unix,
+                        sector_start_offset_s,
+                        sector_integ_s as f32,
+                        &cor_write_buf_ph,
+                    )?;
                 }
                 for (ch, w) in cw_11.iter_mut().enumerate() {
                     let start = ch * inband_bins;
                     let end = start + inband_bins;
-                    let s_11: Vec<Complex<f32>> = batch_11[start..end]
-                        .iter()
-                        .map(|&v| Complex::new((v * inv_11) as f32, 0.0))
-                        .collect();
-                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_11)?;
+                    for (out, &v) in cor_write_buf_11.iter_mut().zip(&batch_11[start..end]) {
+                        *out = Complex::new((v * inv_11) as f32, 0.0);
+                    }
+                    w.write_sector_at(
+                        c_unix,
+                        sector_start_offset_s,
+                        sector_integ_s as f32,
+                        &cor_write_buf_11,
+                    )?;
                 }
                 for (ch, w) in cw_12.iter_mut().enumerate() {
                     let start = ch * inband_bins;
                     let end = start + inband_bins;
-                    let s_12: Vec<Complex<f32>> = batch_12[start..end]
-                        .iter()
-                        .map(|v| Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32))
-                        .collect();
-                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_12)?;
+                    for (out, v) in cor_write_buf_12.iter_mut().zip(&batch_12[start..end]) {
+                        *out = Complex::new((v.re * inv_12) as f32, (v.im * inv_12) as f32);
+                    }
+                    w.write_sector_at(
+                        c_unix,
+                        sector_start_offset_s,
+                        sector_integ_s as f32,
+                        &cor_write_buf_12,
+                    )?;
                 }
                 for (ch, w) in cw_22.iter_mut().enumerate() {
                     let start = ch * inband_bins;
                     let end = start + inband_bins;
-                    let s_22: Vec<Complex<f32>> = batch_22[start..end]
-                        .iter()
-                        .map(|&v| Complex::new((v * inv_22) as f32, 0.0))
-                        .collect();
-                    w.write_sector_at(c_unix, sector_start_offset_s, sector_integ_s as f32, &s_22)?;
+                    for (out, &v) in cor_write_buf_22.iter_mut().zip(&batch_22[start..end]) {
+                        *out = Complex::new((v * inv_22) as f32, 0.0);
+                    }
+                    w.write_sector_at(
+                        c_unix,
+                        sector_start_offset_s,
+                        sector_integ_s as f32,
+                        &cor_write_buf_22,
+                    )?;
                 }
             }
         }

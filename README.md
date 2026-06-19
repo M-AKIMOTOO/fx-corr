@@ -1939,6 +1939,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.12` | Reused normalized `.cor` output buffers for normal `yi-corr` sector writes, avoiding per-sector/per-inband allocation during ACF/XCF/phased product serialization. |
 | `3.1.11` | Reused `PackedSampleReader` instances in the `yi-corr` sector reader and skipped seeks when sector reads are byte-contiguous, reducing raw I/O open/seek overhead. |
 | `3.1.10` | Precomputed real-FFT XML-grid bin maps for normal `yi-corr` accumulation, removing per-bin modulo/Hermitian mapping from the ACF/XCF hot loop while keeping arbitrary FFT lengths. |
 | `3.1.9` | Fixed the normal `yi-corr` accumulation kernel from XML/CLI state before the frame loop and cached FFT debug mode outside the hot path. |
