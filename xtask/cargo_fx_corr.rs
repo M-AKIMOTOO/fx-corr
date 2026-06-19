@@ -89,7 +89,7 @@ fn install_versioned() -> Result<(), Box<dyn Error>> {
 fn build_yi_corr() -> Result<(), Box<dyn Error>> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
-        .args(["build", "--release", "--offline", "--bin", "yi-corr"])
+        .args(["build", "--release", "--bin", "yi-corr"])
         .status()?;
 
     if !status.success() {
