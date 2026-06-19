@@ -4936,12 +4936,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let synth_stats_start = Instant::now();
         let mut synth_read_bytes_total: u64 = 0;
         let mut synth_queue_hwm = 0usize;
+        let mut timing_delay_s = 0.0_f64;
+        let mut timing_recv_wait_s = 0.0_f64;
+        let mut timing_compute_s = 0.0_f64;
+        let mut timing_output_s = 0.0_f64;
         for (si, &nf) in sec_counts.iter().enumerate() {
             let sector_d_seek = sector_d_seeks[si];
             let (sector_sample_start1, sector_sample_start2) = sector_read_starts[si];
+            let timing_delay_start = Instant::now();
             let frame_delays: Vec<FrameDelayEntry> = (0..nf)
                 .map(|i| compute_frame_delay_entry(emitted + i, &delay_cfg, sector_d_seek))
                 .collect();
+            timing_delay_s += timing_delay_start.elapsed().as_secs_f64();
             if args.debug && need_xcf_products {
                 print_delay_debug_samples(
                     &format!("delay sector {}", si + 1),
@@ -5010,6 +5016,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     )?;
                 }
             }
+            let timing_recv_start = Instant::now();
             let (raw1_vec, raw2_vec) = match rx_sec.recv() {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
@@ -5021,6 +5028,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     )
                 }
             };
+            timing_recv_wait_s += timing_recv_start.elapsed().as_secs_f64();
             synth_consumed_chunks.fetch_add(1, Ordering::Relaxed);
             let raw1: &[u8] = &raw1_vec;
             let raw2: &[u8] = &raw2_vec;
@@ -5328,6 +5336,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     }
                     acc1
                 };
+            let timing_compute_start = Instant::now();
             let (batch_ph, batch_11, batch_12, batch_22, batch_fold) = if write_raw {
                 let mut enc = vec![0u8; nf * bpf_o];
                 let acc = enc
@@ -5720,6 +5729,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     out.fold.take(),
                 )
             };
+            timing_compute_s += timing_compute_start.elapsed().as_secs_f64();
+            let timing_output_start = Instant::now();
             let sec_failed = sector_failures.load(Ordering::Relaxed);
             if sec_failed > 0 {
                 println!(
@@ -5930,6 +5941,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     )?;
                 }
             }
+            timing_output_s += timing_output_start.elapsed().as_secs_f64();
         }
         drop(rx_sec);
         if reader_handle.join().is_err() {
@@ -5950,6 +5962,27 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 prefetch_depth,
                 synth_queue_hwm,
                 prefetch_depth
+            );
+            let timed = timing_delay_s + timing_recv_wait_s + timing_compute_s + timing_output_s;
+            let pct = |v: f64| {
+                if timed > 0.0 {
+                    100.0 * v / timed
+                } else {
+                    0.0
+                }
+            };
+            println!(
+                "[info] Synth timing summary: delay={:.3}s ({:.1}%) recv-wait={:.3}s ({:.1}%) compute={:.3}s ({:.1}%) output={:.3}s ({:.1}%) accounted={:.3}s elapsed={:.3}s",
+                timing_delay_s,
+                pct(timing_delay_s),
+                timing_recv_wait_s,
+                pct(timing_recv_wait_s),
+                timing_compute_s,
+                pct(timing_compute_s),
+                timing_output_s,
+                pct(timing_output_s),
+                timed,
+                elapsed
             );
         }
         if let Some(w) = wr.as_mut() {
