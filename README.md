@@ -1939,6 +1939,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.7` | Reduced hot-loop allocation in `yi-corr` by reusing XML-grid FFT scratch buffers per worker and shifting bit-offset input reads in-place. |
 | `3.1.6` | Grouped `--fringe <seconds>` quick-look outputs under `<cor>/fringe_yicorr_ql/<schedule-basename>/<process-epoch>/` so repeated process windows from one schedule stay together. |
 | `3.1.5` | Changed `--fringe` to `--fringe <seconds>` quick-look output for `yi-xcf`/`yi-corr`: each interval writes integrated XCF spectrum PNG/TSV plus a lightweight 1D frequency-IFFT lag-fringe PNG/TSV. |
 | `3.1.4` | Added XML `<stream><pulsar>...</pulsar></stream>` pulse-phase folding for `.cor` spectral products. Pulsar handling lives in `pulsar.rs`; optional DM correction assigns each frequency bin to a corrected pulse phase bin before ACF/XCF accumulation, and output files use `.pbinNN.cor` suffixes. |

@@ -1382,13 +1382,13 @@ impl PackedSampleReader {
             let _ = read_with_padding(&mut self.reader, out)?;
             return Ok(());
         }
-        let mut next = vec![0u8; out.len()];
-        let _ = read_with_padding(&mut self.reader, &mut next)?;
+        let _ = read_with_padding(&mut self.reader, out)?;
         let shift = self.bit_offset;
         let mut prev = self.prev_byte.unwrap_or(0);
-        for (dst, &n) in out.iter_mut().zip(next.iter()) {
-            *dst = (prev >> shift) | (n << (8 - shift));
-            prev = n;
+        for dst in out.iter_mut() {
+            let next = *dst;
+            *dst = (prev >> shift) | (next << (8 - shift));
+            prev = next;
         }
         self.prev_byte = Some(prev);
         Ok(())
@@ -5204,6 +5204,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     f2: Vec<f32>,
                     s1: Vec<Complex<f32>>,
                     s2: Vec<Complex<f32>>,
+                    g1: Vec<Complex<f32>>,
+                    g2: Vec<Complex<f32>>,
                     fft_scratch: FftScratch,
                     dw1: DecodeWindowScratch,
                     dw2: DecodeWindowScratch,
@@ -5225,6 +5227,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     f2: vec![0.0_f32; fft_len],
                     s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
                     s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
+                    g1: vec![Complex::new(0.0_f32, 0.0_f32); half + 1],
+                    g2: vec![Complex::new(0.0_f32, 0.0_f32); half + 1],
                     fft_scratch: helper.make_scratch(),
                     dw1: DecodeWindowScratch::new(),
                     dw2: DecodeWindowScratch::new(),
@@ -5233,6 +5237,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
                 let chunk_abs_start1 = sector_sample_start1;
                 let chunk_abs_start2 = sector_sample_start2;
+                let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
+                let station_offset2 = station_grid_origin_offset_bins(a2_name, fs, fft_len)
+                    + ant2_grid_extra_offset();
                 let mut out = chunk_starts
                     .into_par_iter()
                     .map(|start| {
@@ -5301,22 +5308,20 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             let fr_lo1 = d.fr_lo1;
                             let fr_lo2 = d.fr_lo2;
                             let fr_mix = fr_lo1 * fr_lo2.conj();
-                            let mut g1 = vec![Complex::new(0.0_f32, 0.0_f32); half + 1];
-                            let mut g2 = vec![Complex::new(0.0_f32, 0.0_f32); half + 1];
                             shift_real_fft_to_xml_grid_with_extra_offset(
-                            &st.s1,
-                            &mut g1,
-                            fft_len,
-                            rotation_bins1,
-                            station_grid_origin_offset_bins(a1_name, fs, fft_len),
-                        );
+                                &st.s1,
+                                &mut st.g1,
+                                fft_len,
+                                rotation_bins1,
+                                station_offset1,
+                            );
                             shift_real_fft_to_xml_grid_with_extra_offset(
-                            &st.s2,
-                            &mut g2,
-                            fft_len,
-                            rotation_bins2,
-                            station_grid_origin_offset_bins(a2_name, fs, fft_len) + ant2_grid_extra_offset(),
-                        );
+                                &st.s2,
+                                &mut st.g2,
+                                fft_len,
+                                rotation_bins2,
+                                station_offset2,
+                            );
 
                             if fft_peak_dbg_enabled() && i < fft_peak_dbg_max_frames() {
                                 print_fft_peak_dbg(
@@ -5324,7 +5329,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                     i,
                                     a1_name,
                                     &st.s1,
-                                    &g1,
+                                    &st.g1,
                                     rotation_bins1,
                                     0,
                                 );
@@ -5333,9 +5338,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                     i,
                                     a2_name,
                                     &st.s2,
-                                    &g2,
+                                    &st.g2,
                                     rotation_bins2,
-                                    station_grid_origin_offset_bins(a2_name, fs, fft_len) + ant2_grid_extra_offset(),
+                                    station_offset2,
                                 );
                             }
                             let overlap_len = ba.a1e - ba.a1s;
@@ -5356,16 +5361,16 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         for k in 0..overlap_len {
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
-                                            let raw_xcf = g1[i1] * g2[i2].conj();
+                                            let raw_xcf = st.g1[i1] * st.g2[i2].conj();
                                             let v = raw_xcf * fr_mix * phase_corr;
                                             fold.add_values(
                                                 rt,
                                                 t_since_process_s,
                                                 i1,
                                                 None,
-                                                g1[i1].norm_sqr() as f64,
+                                                st.g1[i1].norm_sqr() as f64,
                                                 Complex::new(v.re as f64, v.im as f64),
-                                                g2[i2].norm_sqr() as f64,
+                                                st.g2[i2].norm_sqr() as f64,
                                             );
                                             phase_corr *= phase_step;
                                         }
@@ -5383,16 +5388,16 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         for k in 0..overlap_len {
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
-                                            let raw_xcf = g1[i1] * g2[i2].conj();
+                                            let raw_xcf = st.g1[i1] * st.g2[i2].conj();
                                             let v = raw_xcf * fr_mix * phase_corr;
                                             fold.add_values(
                                                 rt,
                                                 t_since_process_s,
                                                 i2,
                                                 None,
-                                                g1[i1].norm_sqr() as f64,
+                                                st.g1[i1].norm_sqr() as f64,
                                                 Complex::new(v.re as f64, v.im as f64),
-                                                g2[i2].norm_sqr() as f64,
+                                                st.g2[i2].norm_sqr() as f64,
                                             );
                                             phase_corr *= phase_step;
                                         }
@@ -5408,17 +5413,17 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                             for k in 0..overlap_len {
                                                 let i1 = ba.a1s + k;
                                                 let i2 = ba.a2s + k;
-                                                st.acc_11[i1] += g1[i1].norm_sqr() as f64;
-                                                st.acc_22[i1] += g2[i2].norm_sqr() as f64;
+                                                st.acc_11[i1] += st.g1[i1].norm_sqr() as f64;
+                                                st.acc_22[i1] += st.g2[i2].norm_sqr() as f64;
                                             }
                                         } else {
                                             for k in 0..half {
-                                                st.acc_11[k] += g1[k].norm_sqr() as f64;
+                                                st.acc_11[k] += st.g1[k].norm_sqr() as f64;
                                             }
                                             for k in 0..overlap_len {
                                                 let i1 = ba.a1s + k;
                                                 let i2 = ba.a2s + k;
-                                                st.acc_22[i1] += g2[i2].norm_sqr() as f64;
+                                                st.acc_22[i1] += st.g2[i2].norm_sqr() as f64;
                                             }
                                         }
                                     }
@@ -5435,7 +5440,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         for k in 0..overlap_len {
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
-                                            let raw_xcf = g1[i1] * g2[i2].conj();
+                                            let raw_xcf = st.g1[i1] * st.g2[i2].conj();
                                             let v = raw_xcf * fr_mix * phase_corr;
 
                                             // Diagnostic for narrow-band maser XCF coherence.
@@ -5482,17 +5487,17 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                             for k in 0..overlap_len {
                                                 let i1 = ba.a1s + k;
                                                 let i2 = ba.a2s + k;
-                                                st.acc_11[i2] += g1[i1].norm_sqr() as f64;
-                                                st.acc_22[i2] += g2[i2].norm_sqr() as f64;
+                                                st.acc_11[i2] += st.g1[i1].norm_sqr() as f64;
+                                                st.acc_22[i2] += st.g2[i2].norm_sqr() as f64;
                                             }
                                         } else {
                                             for k in 0..half {
-                                                st.acc_22[k] += g2[k].norm_sqr() as f64;
+                                                st.acc_22[k] += st.g2[k].norm_sqr() as f64;
                                             }
                                             for k in 0..overlap_len {
                                                 let i1 = ba.a1s + k;
                                                 let i2 = ba.a2s + k;
-                                                st.acc_11[i2] += g1[i1].norm_sqr() as f64;
+                                                st.acc_11[i2] += st.g1[i1].norm_sqr() as f64;
                                             }
                                         }
                                     }
@@ -5509,7 +5514,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         for k in 0..overlap_len {
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
-                                            let raw_xcf = g1[i1] * g2[i2].conj();
+                                            let raw_xcf = st.g1[i1] * st.g2[i2].conj();
                                             let v = raw_xcf * fr_mix * phase_corr;
 
                                             // Diagnostic for narrow-band maser XCF coherence.
