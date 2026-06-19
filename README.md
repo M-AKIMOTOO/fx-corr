@@ -1919,6 +1919,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.16` | Fused the normal `yi-corr` overlap ACF/XCF accumulation loop so the common full-overlap path reads each FFT bin once during correlation accumulation. |
 | `3.1.15` | Added sampled compute breakdown timing for normal `yi-corr` workers, reporting decode, real-FFT, and accumulation fractions without timing every frame. |
 | `3.1.14` | Added a normal `yi-corr` synth timing summary for delay-table generation, input receive wait, compute/reduce, and output/write phases so the next bottleneck can be measured directly. |
 | `3.1.13` | Removed the obsolete `yi-acf` and `yi-xcf` binaries; `yi-corr` is now the single ACF/XCF correlator entry point. |

@@ -5624,12 +5624,6 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             // the same pass to reduce memory traffic and extra 1024-bin loops.
                             match normal_corr_kernel {
                                 NormalCorrKernel::Ant1Grid => {
-                                    if need_acf_products && !acf_overlap_only {
-                                        for k in 0..half {
-                                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, k);
-                                            st.acc_11[k] += z1.norm_sqr() as f64;
-                                        }
-                                    }
                                     let mut phase_corr = None;
                                     if need_xcf_products {
                                         let (phase0, step) = xcf_phase_start_and_step(
@@ -5647,9 +5641,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
                                         let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
                                         if need_acf_products {
-                                            if acf_overlap_only {
-                                                st.acc_11[i1] += z1.norm_sqr() as f64;
-                                            }
+                                            st.acc_11[i1] += z1.norm_sqr() as f64;
                                             st.acc_22[i1] += z2.norm_sqr() as f64;
                                         }
                                         if let Some((ref mut pc, step)) = phase_corr {
@@ -5673,14 +5665,18 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                             *pc *= step;
                                         }
                                     }
-                                }
-                                NormalCorrKernel::Ant2Grid => {
                                     if need_acf_products && !acf_overlap_only {
-                                        for k in 0..half {
-                                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, k);
-                                            st.acc_22[k] += z2.norm_sqr() as f64;
+                                        for k in 0..ba.a1s {
+                                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, k);
+                                            st.acc_11[k] += z1.norm_sqr() as f64;
+                                        }
+                                        for k in ba.a1e..half {
+                                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, k);
+                                            st.acc_11[k] += z1.norm_sqr() as f64;
                                         }
                                     }
+                                }
+                                NormalCorrKernel::Ant2Grid => {
                                     let mut phase_corr = None;
                                     if need_xcf_products {
                                         let (phase0, step) = xcf_phase_start_and_step(
@@ -5699,9 +5695,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
                                         if need_acf_products {
                                             st.acc_11[i2] += z1.norm_sqr() as f64;
-                                            if acf_overlap_only {
-                                                st.acc_22[i2] += z2.norm_sqr() as f64;
-                                            }
+                                            st.acc_22[i2] += z2.norm_sqr() as f64;
                                         }
                                         if let Some((ref mut pc, step)) = phase_corr {
                                             let raw_xcf = z1 * z2.conj();
@@ -5722,6 +5716,16 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                             );
                                             st.acc_12[i2] += Complex::new(v.re as f64, v.im as f64);
                                             *pc *= step;
+                                        }
+                                    }
+                                    if need_acf_products && !acf_overlap_only {
+                                        for k in 0..ba.a1s {
+                                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, k);
+                                            st.acc_22[k] += z2.norm_sqr() as f64;
+                                        }
+                                        for k in ba.a1e..half {
+                                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, k);
+                                            st.acc_22[k] += z2.norm_sqr() as f64;
                                         }
                                     }
                                 }

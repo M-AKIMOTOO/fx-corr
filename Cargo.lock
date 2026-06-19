@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "fx-corr"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "astro",
  "clap",
