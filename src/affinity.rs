@@ -225,3 +225,16 @@ impl AffinityRuntime {
         self.info.as_deref()
     }
 }
+
+pub fn reader_core_from_env() -> Result<Option<core_affinity::CoreId>, DynError> {
+    let Some(raw) = env::var_os("YI_READER_CORE") else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy();
+    let requested = parse_affinity_spec(&raw)?;
+    Ok(map_requested_to_core_ids(&requested).and_then(|v| v.first().copied()))
+}
+
+pub fn set_current_thread_core(core: core_affinity::CoreId) -> bool {
+    core_affinity::set_for_current(core)
+}

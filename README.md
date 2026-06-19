@@ -1919,6 +1919,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.17` | Added optional `YI_READER_CORE` pinning for yi-corr input reader threads so one CPU can be reserved for RAID/input transfer control experiments. |
 | `3.1.16` | Fused the normal `yi-corr` overlap ACF/XCF accumulation loop so the common full-overlap path reads each FFT bin once during correlation accumulation. |
 | `3.1.15` | Added sampled compute breakdown timing for normal `yi-corr` workers, reporting decode, real-FFT, and accumulation fractions without timing every frame. |
 | `3.1.14` | Added a normal `yi-corr` synth timing summary for delay-table generation, input receive wait, compute/reduce, and output/write phases so the next bottleneck can be measured directly. |
@@ -2049,6 +2050,14 @@ Examples:
 ```
 
 When multiple lines exist, one slot is claimed via lock file so concurrent runs can use different core sets.
+
+The input reader thread can also be pinned independently for I/O experiments:
+
+```bash
+YI_READER_CORE=0 yi-corr --sc schedule.xml --raw raw --cor cor --cpu 13
+```
+
+`YI_READER_CORE` accepts the same core-number syntax, but only the first available core is used. Keep the chosen reader core out of the worker affinity set, or reduce `--cpu` accordingly, if you want to reserve it exclusively for input transfer.
 
 ## Example full command (2-station corr)
 

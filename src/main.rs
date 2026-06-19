@@ -2177,6 +2177,13 @@ fn main() -> Result<(), DynError> {
     if let Some(msg) = affinity_runtime.info() {
         println!("[info] {msg}");
     }
+    let reader_core = affinity::reader_core_from_env()?;
+    if let Some(core) = reader_core {
+        println!(
+            "[info] I/O reader thread affinity enabled via YI_READER_CORE: core={}",
+            core.id
+        );
+    }
     let mut tp_builder = rayon::ThreadPoolBuilder::new().num_threads(cpu_threads);
     if let Some(core_ids) = affinity_runtime.worker_cores() {
         tp_builder = tp_builder.start_handler(move |thread_idx| {
@@ -2228,7 +2235,7 @@ fn main() -> Result<(), DynError> {
                 run_args.process_index = Some(idx);
                 run_args.compact_logs = idx > 0;
                 let process_started = std::time::Instant::now();
-                let run_result = run_once(run_args, run_mode, cpu_threads);
+                let run_result = run_once(run_args, run_mode, cpu_threads, reader_core);
                 let elapsed_sec = process_started.elapsed().as_secs_f64();
                 match run_result {
                     Ok(()) => {
@@ -2253,10 +2260,15 @@ fn main() -> Result<(), DynError> {
             return Ok(());
         }
     }
-    run_once(args, run_mode, cpu_threads)
+    run_once(args, run_mode, cpu_threads, reader_core)
 }
 
-fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(), DynError> {
+fn run_once(
+    args: args::Args,
+    run_mode: RunMode,
+    cpu_threads: usize,
+    reader_core: Option<core_affinity::CoreId>,
+) -> Result<(), DynError> {
     let fringe_interval_s = args.fringe;
     if let Some(v) = fringe_interval_s {
         if !v.is_finite() || v <= 0.0 {
@@ -4032,6 +4044,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let xcf_produced_chunks_rd = Arc::clone(&xcf_produced_chunks);
         let xcf_produced_bytes_rd = Arc::clone(&xcf_produced_bytes);
         thread::spawn(move || {
+            if let Some(core) = reader_core {
+                let _ = affinity::set_current_thread_core(core);
+            }
             let mut rd1 = match PackedSampleReader::open(&r1_p, s1_b, s1_bit) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4850,6 +4865,9 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let synth_produced_chunks_rd = Arc::clone(&synth_produced_chunks);
         let synth_produced_bytes_rd = Arc::clone(&synth_produced_bytes);
         let reader_handle = thread::spawn(move || {
+            if let Some(core) = reader_core {
+                let _ = affinity::set_current_thread_core(core);
+            }
             let mut pr1 = match PackedSampleReader::open(&a1_read, 0, 0) {
                 Ok(v) => v,
                 Err(e) => {
