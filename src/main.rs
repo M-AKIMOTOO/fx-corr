@@ -3,6 +3,7 @@ mod affinity;
 mod args;
 mod cor;
 mod eop;
+mod fringe;
 mod geom;
 mod ifile;
 mod plot;
@@ -2100,11 +2101,16 @@ fn main() -> Result<(), DynError> {
 }
 
 fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(), DynError> {
-    let fringe_enabled = matches!(run_mode, RunMode::PhasedArray) && args.fringe;
-    if args.fringe && !matches!(run_mode, RunMode::PhasedArray) {
-        println!("[info] --fringe is ignored for this mode");
+    let fringe_interval_s = args.fringe;
+    if let Some(v) = fringe_interval_s {
+        if !v.is_finite() || v <= 0.0 {
+            return Err("--fringe interval must be a positive finite number of seconds".into());
+        }
+        if !matches!(run_mode, RunMode::Xcf | RunMode::Corr) {
+            return Err("--fringe requires yi-xcf or yi-corr because it uses XCF spectra".into());
+        }
     }
-    let do_xcf = fringe_enabled;
+    let do_xcf = false;
     let do_synth = matches!(
         run_mode,
         RunMode::Acf | RunMode::Xcf | RunMode::PhasedArray | RunMode::Corr
@@ -4385,6 +4391,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
             if write_raw {
                 return Err("XML <pulsar> folding is only supported for .cor spectral products, not phased raw output".into());
             }
+            if fringe_interval_s.is_some() {
+                return Err(
+                    "--fringe QL output is not yet supported together with XML <pulsar> folding"
+                        .into(),
+                );
+            }
             let rt = PulsarRuntime::new(cfg, &ep_i, obs_mhz, df_hz, cor_bins_total)?;
             println!(
                 "[info] Pulsar folding: name={} bins={} period={:.12e}s pdot={:.6e} pddot={:.6e} dm={:.6e} dedisperse={} time-correction={}",
@@ -4544,6 +4556,12 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 ecef_m: ant2_ecef,
             },
         )?;
+
+        let mut ql_fringe_acc =
+            fringe_interval_s.map(|_| vec![Complex::new(0.0_f64, 0.0_f64); cor_bins_total]);
+        let mut ql_fringe_frames = 0usize;
+        let mut ql_fringe_start_offset_s = 0.0_f64;
+        let mut ql_fringe_index = 0usize;
 
         let prefetch_depth = io_pipeline_depth.max(2);
         println!(
@@ -5603,6 +5621,42 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 / (COR_ONE_SIDED_POWER_FACTOR * (level_power1 * level_power2).sqrt() * norm_base);
             let phased_power_ref = (w1 * w1 * level_power1 + w2 * w2 * level_power2).max(1e-12);
             let inv_ph = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * norm_base);
+            if let (Some(interval_s), Some(acc)) = (fringe_interval_s, ql_fringe_acc.as_mut()) {
+                if ql_fringe_frames == 0 {
+                    ql_fringe_start_offset_s = sector_start_offset_s;
+                }
+                for k in 0..cor_bins_total {
+                    acc[k] += batch_12[k];
+                }
+                ql_fringe_frames += nf;
+                let ql_integ_s = ql_fringe_frames as f64 * frame_sec;
+                let is_last_sector = si + 1 == sec_counts.len();
+                if ql_integ_s + 0.5 * frame_sec >= interval_s || is_last_sector {
+                    let ql_norm = 1.0
+                        / (COR_ONE_SIDED_POWER_FACTOR
+                            * (level_power1 * level_power2).sqrt()
+                            * (fft_len as f64).powi(2)
+                            * ql_fringe_frames.max(1) as f64);
+                    let ql_spec: Vec<Complex<f64>> = acc
+                        .iter()
+                        .map(|v| Complex::new(v.re * ql_norm, v.im * ql_norm))
+                        .collect();
+                    let ql_label = format!("{}_ql{:04}", cor_label, ql_fringe_index);
+                    fringe::write_ql_fringe_products(
+                        &o_dir,
+                        &c_tag,
+                        &ql_label,
+                        ql_fringe_start_offset_s,
+                        ql_integ_s,
+                        &ql_spec,
+                        obs_mhz,
+                        df_hz,
+                    )?;
+                    acc.fill(Complex::new(0.0_f64, 0.0_f64));
+                    ql_fringe_frames = 0;
+                    ql_fringe_index += 1;
+                }
+            }
             if let Some(fold) = batch_fold.as_ref() {
                 let norm_11_per_frame =
                     1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * (fft_len as f64).powi(2));

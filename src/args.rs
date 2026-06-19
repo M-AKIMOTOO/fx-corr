@@ -266,8 +266,12 @@ pub struct Args {
     #[arg(long, value_name = "JY", num_args = 1.., help = "SEFD [Jy]")]
     pub sefd: Vec<String>,
 
-    #[arg(long, help = "Enable fringe search in yi-phasedarray mode only")]
-    pub fringe: bool,
+    #[arg(
+        long,
+        value_name = "S",
+        help = "Write quick-look XCF spectrum and 1D lag-fringe plots every S seconds"
+    )]
+    pub fringe: Option<f64>,
 
     // Other
     #[arg(

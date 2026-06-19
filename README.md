@@ -223,6 +223,18 @@ XML `<stream><inband>N</inband></stream>` splits the already-correlated positive
 
 Split files add `.chNbwBW` before `.cor`, for example `<ANT1>_<ANT2>_<TAG>_<LABEL>.ch1bw512.cor`. Each split `.cor` header uses the sub-band low frequency as observing frequency and the effective sampling speed corresponding to the sub-band bandwidth. No additional delay correction or bandwidth synthesis is applied.
 
+### Quick-look fringe plots
+
+`yi-xcf` and `yi-corr` support `--fringe <S>` to write quick-look products every `S` seconds. The implementation accumulates the already fringe-stopped XCF frequency spectrum, writes a spectrum plot/TSV, then performs a lightweight 1D inverse FFT across frequency to write a lag-fringe plot/TSV. This is intended for fast inspection, not a full 2D delay/rate fringe search.
+
+Example:
+
+```bash
+yi-corr --sc scan.xml --raw ../raw --cor cor_out --fringe 60
+```
+
+For each interval, files are written under the correlation output directory with names containing `_fringe_spectrum.tsv`, `_fringe_spectrum_amp.png`, `_fringe_lag.tsv`, and `_fringe_lag_amp.png`.
+
 ### Pulsar folding `.cor` output
 
 XML `<stream><pulsar>...</pulsar></stream>` enables pulse-phase folding for `.cor` spectral products. The pulsar model belongs to the stream, while `<process>` continues to define the scan epoch, skip, length, source, and stations. The first implementation uses topocentric phase folding; barycentric correction is reserved for a future mode.
@@ -1927,6 +1939,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.5` | Changed `--fringe` to `--fringe <seconds>` quick-look output for `yi-xcf`/`yi-corr`: each interval writes integrated XCF spectrum PNG/TSV plus a lightweight 1D frequency-IFFT lag-fringe PNG/TSV. |
 | `3.1.4` | Added XML `<stream><pulsar>...</pulsar></stream>` pulse-phase folding for `.cor` spectral products. Pulsar handling lives in `pulsar.rs`; optional DM correction assigns each frequency bin to a corrected pulse phase bin before ACF/XCF accumulation, and output files use `.pbinNN.cor` suffixes. |
 | `3.1.3` | Made `yi-phasedarray` apply residual delay/fringe phase on the same XML-grid bins used by `yi-corr`, so phased raw synthesis differs from correlation only at the final beamforming/output step. |
 | `3.1.2` | Added `--resacel <Hz/s>` to apply residual fringe acceleration from fringe fitting to the delay model, useful for long `yi-phasedarray` integrations when residual phase curvature remains. |
