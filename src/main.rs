@@ -1475,6 +1475,7 @@ struct PackedSampleReader {
     reader: BufReader<File>,
     bit_offset: u8,
     prev_byte: Option<u8>,
+    next_start_byte: Option<u64>,
 }
 
 impl PackedSampleReader {
@@ -1497,12 +1498,36 @@ impl PackedSampleReader {
             reader,
             bit_offset,
             prev_byte,
+            next_start_byte: Some(start_byte),
         })
+    }
+
+    fn seek_to(&mut self, start_byte: u64, bit_offset: u8) -> Result<(), DynError> {
+        if bit_offset >= 8 {
+            return Err("bit_offset must be in 0..8".into());
+        }
+        if self.next_start_byte == Some(start_byte) && self.bit_offset == bit_offset {
+            return Ok(());
+        }
+        self.reader.seek(SeekFrom::Start(start_byte))?;
+        self.bit_offset = bit_offset;
+        self.prev_byte = if bit_offset == 0 {
+            None
+        } else {
+            let mut b = [0u8; 1];
+            let _ = read_with_padding(&mut self.reader, &mut b)?;
+            Some(b[0])
+        };
+        self.next_start_byte = Some(start_byte);
+        Ok(())
     }
 
     fn read_packed_with_padding(&mut self, out: &mut [u8]) -> Result<(), DynError> {
         if self.bit_offset == 0 {
             let _ = read_with_padding(&mut self.reader, out)?;
+            if let Some(next) = self.next_start_byte.as_mut() {
+                *next += out.len() as u64;
+            }
             return Ok(());
         }
         let _ = read_with_padding(&mut self.reader, out)?;
@@ -1514,6 +1539,9 @@ impl PackedSampleReader {
             prev = next;
         }
         self.prev_byte = Some(prev);
+        if let Some(next) = self.next_start_byte.as_mut() {
+            *next += out.len() as u64;
+        }
         Ok(())
     }
 }
@@ -4816,6 +4844,26 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let synth_produced_chunks_rd = Arc::clone(&synth_produced_chunks);
         let synth_produced_bytes_rd = Arc::clone(&synth_produced_bytes);
         let reader_handle = thread::spawn(move || {
+            let mut pr1 = match PackedSampleReader::open(&a1_read, 0, 0) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx_sec.send(Err(format!(
+                        "failed to open {} for sector reader: {e}",
+                        a1_read.display()
+                    )));
+                    return;
+                }
+            };
+            let mut pr2 = match PackedSampleReader::open(&a2_read, 0, 0) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx_sec.send(Err(format!(
+                        "failed to open {} for sector reader: {e}",
+                        a2_read.display()
+                    )));
+                    return;
+                }
+            };
             for (sector_idx, _nf) in sec_counts_for_read.into_iter().enumerate() {
                 let (read_n1, read_n2) = sector_read_sample_counts_rd[sector_idx];
                 let mut b1 = vec![0u8; ((read_n1 as usize * bit1) + 7) / 8];
@@ -4823,30 +4871,22 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 let (sector_s1, sector_s2) = sector_read_starts_rd[sector_idx];
                 let bits1 = sector_s1 * bit1 as u64;
                 let bits2 = sector_s2 * bit2 as u64;
-                let mut pr1 = match PackedSampleReader::open(&a1_read, bits1 / 8, (bits1 % 8) as u8)
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed to open/seek {} at sample {}: {e}",
-                            a1_read.display(),
-                            sector_s1
-                        )));
-                        return;
-                    }
-                };
-                let mut pr2 = match PackedSampleReader::open(&a2_read, bits2 / 8, (bits2 % 8) as u8)
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed to open/seek {} at sample {}: {e}",
-                            a2_read.display(),
-                            sector_s2
-                        )));
-                        return;
-                    }
-                };
+                if let Err(e) = pr1.seek_to(bits1 / 8, (bits1 % 8) as u8) {
+                    let _ = tx_sec.send(Err(format!(
+                        "failed to seek {} at sample {}: {e}",
+                        a1_read.display(),
+                        sector_s1
+                    )));
+                    return;
+                }
+                if let Err(e) = pr2.seek_to(bits2 / 8, (bits2 % 8) as u8) {
+                    let _ = tx_sec.send(Err(format!(
+                        "failed to seek {} at sample {}: {e}",
+                        a2_read.display(),
+                        sector_s2
+                    )));
+                    return;
+                }
                 if let Err(e) = pr1.read_packed_with_padding(&mut b1) {
                     let _ = tx_sec.send(Err(format!(
                         "failed reading ant1 input at sample {}: {e}",
