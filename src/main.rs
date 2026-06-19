@@ -12,7 +12,7 @@ mod utils;
 mod xcf;
 mod xml;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -1154,6 +1154,26 @@ fn build_logical_cpus() -> Option<usize> {
         .filter(|&v| v > 0)
 }
 
+fn runtime_physical_cores() -> Option<usize> {
+    let available = core_affinity::get_core_ids()?;
+    let mut physical = HashSet::<(usize, usize)>::new();
+    for cpu in available {
+        let topology = PathBuf::from(format!("/sys/devices/system/cpu/cpu{}/topology", cpu.id));
+        let package = read_to_string(topology.join("physical_package_id"))
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()?;
+        let core = read_to_string(topology.join("core_id"))
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()?;
+        physical.insert((package, core));
+    }
+    (!physical.is_empty()).then_some(physical.len())
+}
+
 fn build_l3_cache_bytes() -> Option<u64> {
     option_env!("YI_BUILD_L3_CACHE_BYTES")
         .and_then(|v| v.parse::<u64>().ok())
@@ -2163,16 +2183,29 @@ fn main() -> Result<(), DynError> {
             }
         }
     }
-    let cpu_auto = build_logical_cpus()
-        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
-        .unwrap_or(2)
-        .saturating_sub(2)
-        .max(1);
+    let physical_cores = runtime_physical_cores();
+    let cpu_auto = physical_cores
+        .map(|n| n.saturating_sub(1).max(1))
+        .unwrap_or_else(|| {
+            build_logical_cpus()
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(2)
+                .saturating_sub(2)
+                .max(1)
+        });
     let cpu_threads = match args.cpu {
         Some(0) => return Err("--cpu must be >= 1".into()),
         Some(v) => v,
         None => cpu_auto,
     };
+    if args.cpu.is_none() {
+        if let Some(physical) = physical_cores {
+            println!(
+                "[info] CPU auto-tuning: physical-cores={} reader-reserve=1 compute-threads={}",
+                physical, cpu_threads
+            );
+        }
+    }
     let affinity_runtime = affinity::AffinityRuntime::from_default_file()?;
     if let Some(msg) = affinity_runtime.info() {
         println!("[info] {msg}");
