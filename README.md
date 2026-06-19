@@ -1939,6 +1939,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.1.10` | Precomputed real-FFT XML-grid bin maps for normal `yi-corr` accumulation, removing per-bin modulo/Hermitian mapping from the ACF/XCF hot loop while keeping arbitrary FFT lengths. |
 | `3.1.9` | Fixed the normal `yi-corr` accumulation kernel from XML/CLI state before the frame loop and cached FFT debug mode outside the hot path. |
 | `3.1.8` | Fused normal `yi-corr` FFT-bin accumulation so ACF/XCF update directly from mapped FFT bins without materializing XML-grid spectra unless pulsar folding or FFT debug needs them. |
 | `3.1.7` | Reduced hot-loop allocation in `yi-corr` by reusing XML-grid FFT scratch buffers per worker and shifting bit-offset input reads in-place. |

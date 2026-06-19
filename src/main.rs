@@ -190,6 +190,54 @@ fn map_real_fft_bin_to_xml_grid(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RealFftGridMap {
+    src_idx: usize,
+    conjugate: bool,
+}
+
+fn build_real_fft_xml_grid_map(
+    fft_len: usize,
+    rotation_bins: isize,
+    extra_raw_offset: isize,
+    bins: usize,
+) -> Vec<RealFftGridMap> {
+    let n = fft_len as isize;
+    let half = (fft_len / 2) as isize;
+    (0..bins)
+        .map(|xml_bin| {
+            let raw_idx = xml_bin as isize - rotation_bins + extra_raw_offset;
+            let idx = raw_idx.rem_euclid(n);
+            if idx <= half {
+                RealFftGridMap {
+                    src_idx: idx as usize,
+                    conjugate: false,
+                }
+            } else {
+                RealFftGridMap {
+                    src_idx: (n - idx) as usize,
+                    conjugate: true,
+                }
+            }
+        })
+        .collect()
+}
+
+#[inline]
+fn mapped_real_fft_bin(
+    src: &[Complex<f32>],
+    map: &[RealFftGridMap],
+    xml_bin: usize,
+) -> Complex<f32> {
+    let m = map[xml_bin];
+    let z = src[m.src_idx];
+    if m.conjugate {
+        z.conj()
+    } else {
+        z
+    }
+}
+
 #[inline]
 fn station_grid_origin_offset_hz(name: &str) -> f64 {
     // Empirical backend/grid-origin convention correction in physical
@@ -242,19 +290,6 @@ fn shift_real_fft_to_xml_grid_with_extra_offset(
         *out = map_real_fft_bin_to_xml_grid(src, fft_len, raw_idx);
     }
 }
-
-#[inline]
-fn real_fft_xml_grid_bin(
-    src: &[Complex<f32>],
-    fft_len: usize,
-    xml_bin: usize,
-    rotation_bins: isize,
-    extra_raw_offset: isize,
-) -> Complex<f32> {
-    let raw_idx = xml_bin as isize - rotation_bins + extra_raw_offset;
-    map_real_fft_bin_to_xml_grid(src, fft_len, raw_idx)
-}
-
 #[inline]
 fn maybe_dump_xcf_debug(
     args_debug: bool,
@@ -5330,6 +5365,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
                 let station_offset2 = station_grid_origin_offset_bins(a2_name, fs, fft_len)
                     + ant2_grid_extra_offset();
+                let grid_map1 =
+                    build_real_fft_xml_grid_map(fft_len, rotation_bins1, station_offset1, half);
+                let grid_map2 =
+                    build_real_fft_xml_grid_map(fft_len, rotation_bins2, station_offset2, half);
                 let mut out = chunk_starts
                     .into_par_iter()
                     .map(|start| {
@@ -5508,13 +5547,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 NormalCorrKernel::Ant1Grid => {
                                     if need_acf_products && !acf_overlap_only {
                                         for k in 0..half {
-                                            let z1 = real_fft_xml_grid_bin(
-                                                &st.s1,
-                                                fft_len,
-                                                k,
-                                                rotation_bins1,
-                                                station_offset1,
-                                            );
+                                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, k);
                                             st.acc_11[k] += z1.norm_sqr() as f64;
                                         }
                                     }
@@ -5532,20 +5565,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                     for k in 0..overlap_len {
                                         let i1 = ba.a1s + k;
                                         let i2 = ba.a2s + k;
-                                        let z1 = real_fft_xml_grid_bin(
-                                            &st.s1,
-                                            fft_len,
-                                            i1,
-                                            rotation_bins1,
-                                            station_offset1,
-                                        );
-                                        let z2 = real_fft_xml_grid_bin(
-                                            &st.s2,
-                                            fft_len,
-                                            i2,
-                                            rotation_bins2,
-                                            station_offset2,
-                                        );
+                                        let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
+                                        let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
                                         if need_acf_products {
                                             if acf_overlap_only {
                                                 st.acc_11[i1] += z1.norm_sqr() as f64;
@@ -5577,13 +5598,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 NormalCorrKernel::Ant2Grid => {
                                     if need_acf_products && !acf_overlap_only {
                                         for k in 0..half {
-                                            let z2 = real_fft_xml_grid_bin(
-                                                &st.s2,
-                                                fft_len,
-                                                k,
-                                                rotation_bins2,
-                                                station_offset2,
-                                            );
+                                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, k);
                                             st.acc_22[k] += z2.norm_sqr() as f64;
                                         }
                                     }
@@ -5601,20 +5616,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                     for k in 0..overlap_len {
                                         let i1 = ba.a1s + k;
                                         let i2 = ba.a2s + k;
-                                        let z1 = real_fft_xml_grid_bin(
-                                            &st.s1,
-                                            fft_len,
-                                            i1,
-                                            rotation_bins1,
-                                            station_offset1,
-                                        );
-                                        let z2 = real_fft_xml_grid_bin(
-                                            &st.s2,
-                                            fft_len,
-                                            i2,
-                                            rotation_bins2,
-                                            station_offset2,
-                                        );
+                                        let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
+                                        let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
                                         if need_acf_products {
                                             st.acc_11[i2] += z1.norm_sqr() as f64;
                                             if acf_overlap_only {
