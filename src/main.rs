@@ -1047,6 +1047,28 @@ enum OutputGrid {
     Ant2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NormalCorrKernel {
+    Ant1Grid,
+    Ant2Grid,
+}
+
+impl NormalCorrKernel {
+    fn from_output_grid(out_grid: OutputGrid) -> Self {
+        match out_grid {
+            OutputGrid::Ant1 => Self::Ant1Grid,
+            OutputGrid::Ant2 => Self::Ant2Grid,
+        }
+    }
+
+    fn output_grid(self) -> OutputGrid {
+        match self {
+            Self::Ant1Grid => OutputGrid::Ant1,
+            Self::Ant2Grid => OutputGrid::Ant2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RunMode {
     Acf,
@@ -4815,6 +4837,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let need_phased_products = write_raw || write_phased_cor || plot_phased;
         let need_acf_products = write_acf_cor;
         let need_xcf_products = write_xcf_cor;
+        let fft_peak_debug = fft_peak_dbg_enabled();
+        let normal_corr_kernel = NormalCorrKernel::from_output_grid(out_grid);
         let acf_overlap_only = matches!(run_mode, RunMode::Acf)
             && need_acf_products
             && !need_xcf_products
@@ -5374,8 +5398,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             let fr_lo1 = d.fr_lo1;
                             let fr_lo2 = d.fr_lo2;
                             let fr_mix = fr_lo1 * fr_lo2.conj();
-                            let need_grid_buffers =
-                                pulsar_runtime.is_some() || fft_peak_dbg_enabled();
+                            let need_grid_buffers = pulsar_runtime.is_some() || fft_peak_debug;
                             if need_grid_buffers {
                                 shift_real_fft_to_xml_grid_with_extra_offset(
                                     &st.s1,
@@ -5392,7 +5415,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                     station_offset2,
                                 );
 
-                                if fft_peak_dbg_enabled() && i < fft_peak_dbg_max_frames() {
+                                if fft_peak_debug && i < fft_peak_dbg_max_frames() {
                                     print_fft_peak_dbg(
                                         "raw_to_grid",
                                         i,
@@ -5481,8 +5504,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                             // Fast path: do not materialize XML-grid spectra for normal
                             // correlation.  Read the mapped FFT bin once and update ACF/XCF in
                             // the same pass to reduce memory traffic and extra 1024-bin loops.
-                            match out_grid {
-                                OutputGrid::Ant1 => {
+                            match normal_corr_kernel {
+                                NormalCorrKernel::Ant1Grid => {
                                     if need_acf_products && !acf_overlap_only {
                                         for k in 0..half {
                                             let z1 = real_fft_xml_grid_bin(
@@ -5537,7 +5560,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                                 emitted + i,
                                                 i,
                                                 si,
-                                                OutputGrid::Ant1,
+                                                normal_corr_kernel.output_grid(),
                                                 i1,
                                                 raw_xcf,
                                                 fr_mix,
@@ -5551,7 +5574,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                         }
                                     }
                                 }
-                                OutputGrid::Ant2 => {
+                                NormalCorrKernel::Ant2Grid => {
                                     if need_acf_products && !acf_overlap_only {
                                         for k in 0..half {
                                             let z2 = real_fft_xml_grid_bin(
@@ -5606,7 +5629,7 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                                 emitted + i,
                                                 i,
                                                 si,
-                                                OutputGrid::Ant2,
+                                                normal_corr_kernel.output_grid(),
                                                 i2,
                                                 raw_xcf,
                                                 fr_mix,
