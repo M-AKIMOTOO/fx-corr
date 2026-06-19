@@ -170,6 +170,17 @@ fn display_whole_seconds(duration_s: f64) -> i64 {
     }
 }
 
+fn synth_timing_sample_stride() -> usize {
+    static STRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        std::env::var("YI_TIMING_SAMPLE_STRIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(4096)
+    })
+}
+
 #[inline]
 fn map_real_fft_bin_to_xml_grid(
     src: &[Complex<f32>],
@@ -4940,6 +4951,11 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
         let mut timing_recv_wait_s = 0.0_f64;
         let mut timing_compute_s = 0.0_f64;
         let mut timing_output_s = 0.0_f64;
+        let timing_sample_stride = synth_timing_sample_stride();
+        let mut timing_sample_decode_s = 0.0_f64;
+        let mut timing_sample_fft_s = 0.0_f64;
+        let mut timing_sample_accum_s = 0.0_f64;
+        let mut timing_sample_frames = 0usize;
         for (si, &nf) in sec_counts.iter().enumerate() {
             let sector_d_seek = sector_d_seeks[si];
             let (sector_sample_start1, sector_sample_start2) = sector_read_starts[si];
@@ -5375,6 +5391,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     fft_scratch: FftScratch,
                     dw1: DecodeWindowScratch,
                     dw2: DecodeWindowScratch,
+                    timing_decode_s: f64,
+                    timing_fft_s: f64,
+                    timing_accum_s: f64,
+                    timing_samples: usize,
                 }
                 let half = fft_len / 2 + 1;
                 let init = || ThreadAccum {
@@ -5398,6 +5418,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                     fft_scratch: helper.make_scratch(),
                     dw1: DecodeWindowScratch::new(),
                     dw2: DecodeWindowScratch::new(),
+                    timing_decode_s: 0.0,
+                    timing_fft_s: 0.0,
+                    timing_accum_s: 0.0,
+                    timing_samples: 0,
                 };
                 let frames_per_job = (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(128, 2048);
                 let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
@@ -5417,6 +5441,8 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         let end = (start + frames_per_job).min(nf);
                         for i in start..end {
                             let d = frame_delays[i];
+                            let timing_frame_sampled = i % timing_sample_stride == 0;
+                            let timing_decode_start = timing_frame_sampled.then(Instant::now);
                             if decode_shifted_frame_from_chunk(
                                 raw1,
                                 chunk_abs_start1,
@@ -5453,6 +5479,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 sector_failures.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
+                            if let Some(t) = timing_decode_start {
+                                st.timing_decode_s += t.elapsed().as_secs_f64();
+                            }
+                            let timing_fft_start = timing_frame_sampled.then(Instant::now);
                             if helper
                                 .forward_r2c_process_with_scratch(
                                     &mut st.f1,
@@ -5475,6 +5505,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                 sector_failures.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
+                            if let Some(t) = timing_fft_start {
+                                st.timing_fft_s += t.elapsed().as_secs_f64();
+                            }
+                            let timing_accum_start = timing_frame_sampled.then(Instant::now);
                             let fr_lo1 = d.fr_lo1;
                             let fr_lo2 = d.fr_lo2;
                             let fr_mix = fr_lo1 * fr_lo2.conj();
@@ -5577,6 +5611,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                             phase_corr *= phase_step;
                                         }
                                     }
+                                }
+                                if let Some(t) = timing_accum_start {
+                                    st.timing_accum_s += t.elapsed().as_secs_f64();
+                                    st.timing_samples += 1;
                                 }
                                 continue;
                             }
@@ -5688,6 +5726,10 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                                     }
                                 }
                             }
+                            if let Some(t) = timing_accum_start {
+                                st.timing_accum_s += t.elapsed().as_secs_f64();
+                                st.timing_samples += 1;
+                            }
                         }
                         st
                     })
@@ -5705,8 +5747,17 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                         if let (Some(a_fold), Some(b_fold)) = (a.fold.as_mut(), b.fold) {
                             a_fold.merge(b_fold);
                         }
+                        a.timing_decode_s += b.timing_decode_s;
+                        a.timing_fft_s += b.timing_fft_s;
+                        a.timing_accum_s += b.timing_accum_s;
+                        a.timing_samples += b.timing_samples;
                         a
                     });
+
+                timing_sample_decode_s += out.timing_decode_s;
+                timing_sample_fft_s += out.timing_fft_s;
+                timing_sample_accum_s += out.timing_accum_s;
+                timing_sample_frames += out.timing_samples;
 
                 if acf_peak_dbg_enabled() {
                     print_acf_peak_dbg(si, a1_name, &out.acc_11, rotation_bins1, 0, fs, fft_len);
@@ -5984,6 +6035,22 @@ fn run_once(args: args::Args, run_mode: RunMode, cpu_threads: usize) -> Result<(
                 timed,
                 elapsed
             );
+            let sample_timed = timing_sample_decode_s + timing_sample_fft_s + timing_sample_accum_s;
+            if timing_sample_frames > 0 && sample_timed > 0.0 {
+                let sample_pct = |v: f64| 100.0 * v / sample_timed;
+                println!(
+                    "[info] Compute sampled breakdown: frames={} stride={} decode={:.6}s ({:.1}%) fft={:.6}s ({:.1}%) accum={:.6}s ({:.1}%) sampled_total={:.6}s",
+                    timing_sample_frames,
+                    timing_sample_stride,
+                    timing_sample_decode_s,
+                    sample_pct(timing_sample_decode_s),
+                    timing_sample_fft_s,
+                    sample_pct(timing_sample_fft_s),
+                    timing_sample_accum_s,
+                    sample_pct(timing_sample_accum_s),
+                    sample_timed
+                );
+            }
         }
         if let Some(w) = wr.as_mut() {
             w.flush()?;
