@@ -249,6 +249,133 @@ fn mapped_real_fft_bin(
     }
 }
 
+/// Return the first source bin when an XML-grid range maps to one forward,
+/// non-conjugated, contiguous FFT range. This common case lets the accumulation
+/// hot loop read spectra directly instead of loading and branching on two map
+/// entries for every frequency bin of every frame.
+fn contiguous_real_fft_src_start(
+    map: &[RealFftGridMap],
+    xml_start: usize,
+    len: usize,
+) -> Option<usize> {
+    let xml_end = xml_start.checked_add(len)?;
+    let range = map.get(xml_start..xml_end)?;
+    let first = range.first()?;
+    if first.conjugate {
+        return None;
+    }
+    let src_start = first.src_idx;
+    if range
+        .iter()
+        .enumerate()
+        .all(|(offset, entry)| !entry.conjugate && entry.src_idx == src_start + offset)
+    {
+        Some(src_start)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn accumulate_direct_acf_xcf(
+    spectrum1: &[Complex<f32>],
+    spectrum2: &[Complex<f32>],
+    acc11: &mut [f64],
+    acc12: &mut [Complex<f64>],
+    acc22: &mut [f64],
+    fr_mix: Complex<f32>,
+    mut phase_corr: Complex<f32>,
+    phase_step: Complex<f32>,
+) {
+    debug_assert_eq!(spectrum1.len(), spectrum2.len());
+    debug_assert_eq!(spectrum1.len(), acc11.len());
+    debug_assert_eq!(spectrum1.len(), acc12.len());
+    debug_assert_eq!(spectrum1.len(), acc22.len());
+    for k in 0..spectrum1.len() {
+        let z1 = spectrum1[k];
+        let z2 = spectrum2[k];
+        acc11[k] += z1.norm_sqr() as f64;
+        acc22[k] += z2.norm_sqr() as f64;
+        let raw_xcf = z1 * z2.conj();
+        let value = raw_xcf * fr_mix * phase_corr;
+        acc12[k] += Complex::new(value.re as f64, value.im as f64);
+        phase_corr *= phase_step;
+    }
+}
+
+#[cfg(test)]
+mod correlation_hot_path_tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_grid_map_detects_direct_and_wrapped_ranges() {
+        let direct = build_real_fft_xml_grid_map(16, 0, 2, 9);
+        assert_eq!(contiguous_real_fft_src_start(&direct, 1, 5), Some(3));
+
+        let wrapped = build_real_fft_xml_grid_map(16, 1, 0, 9);
+        assert_eq!(contiguous_real_fft_src_start(&wrapped, 0, 5), None);
+        assert_eq!(contiguous_real_fft_src_start(&wrapped, 1, 5), Some(0));
+    }
+
+    #[test]
+    fn direct_accumulator_is_bit_identical_to_mapped_loop() {
+        let spectrum1 = vec![
+            Complex::new(1.0, -0.5),
+            Complex::new(-2.0, 0.25),
+            Complex::new(0.75, 1.5),
+            Complex::new(-0.125, -3.0),
+        ];
+        let spectrum2 = vec![
+            Complex::new(-0.25, 2.0),
+            Complex::new(1.5, -1.0),
+            Complex::new(-0.5, -0.75),
+            Complex::new(2.25, 0.125),
+        ];
+        let map = (0..spectrum1.len())
+            .map(|src_idx| RealFftGridMap {
+                src_idx,
+                conjugate: false,
+            })
+            .collect::<Vec<_>>();
+        let fr_mix = Complex::from_polar(1.0_f32, 0.37);
+        let phase0 = Complex::from_polar(1.0_f32, -0.21);
+        let phase_step = Complex::from_polar(1.0_f32, 0.013);
+
+        let mut direct11 = vec![0.0; spectrum1.len()];
+        let mut direct12 = vec![Complex::new(0.0, 0.0); spectrum1.len()];
+        let mut direct22 = vec![0.0; spectrum1.len()];
+        accumulate_direct_acf_xcf(
+            &spectrum1,
+            &spectrum2,
+            &mut direct11,
+            &mut direct12,
+            &mut direct22,
+            fr_mix,
+            phase0,
+            phase_step,
+        );
+
+        let mut mapped11 = vec![0.0; spectrum1.len()];
+        let mut mapped12 = vec![Complex::new(0.0, 0.0); spectrum1.len()];
+        let mut mapped22 = vec![0.0; spectrum1.len()];
+        let mut phase_corr = phase0;
+        for k in 0..spectrum1.len() {
+            let z1 = mapped_real_fft_bin(&spectrum1, &map, k);
+            let z2 = mapped_real_fft_bin(&spectrum2, &map, k);
+            mapped11[k] += z1.norm_sqr() as f64;
+            mapped22[k] += z2.norm_sqr() as f64;
+            let raw_xcf = z1 * z2.conj();
+            let value = raw_xcf * fr_mix * phase_corr;
+            mapped12[k] += Complex::new(value.re as f64, value.im as f64);
+            phase_corr *= phase_step;
+        }
+
+        assert_eq!(direct11, mapped11);
+        assert_eq!(direct12, mapped12);
+        assert_eq!(direct22, mapped22);
+    }
+}
+
 #[inline]
 fn station_grid_origin_offset_hz(name: &str) -> f64 {
     // Empirical backend/grid-origin convention correction in physical
@@ -4971,6 +5098,35 @@ fn run_once(
         let need_xcf_products = write_xcf_cor;
         let fft_peak_debug = fft_peak_dbg_enabled();
         let normal_corr_kernel = NormalCorrKernel::from_output_grid(out_grid);
+        let need_grid_buffers = pulsar_runtime.is_some() || fft_peak_debug;
+        let overlap_len = ba.a1e - ba.a1s;
+        // Frequency-grid maps are constant for the whole process.  Building
+        // them inside every output sector is especially expensive for very
+        // large FFTs, where a map pair can occupy many MiB.
+        let normal_grid_maps = if write_raw {
+            None
+        } else {
+            let half = fft_len / 2 + 1;
+            let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
+            let station_offset2 =
+                station_grid_origin_offset_bins(a2_name, fs, fft_len) + ant2_grid_extra_offset();
+            let grid_map1 =
+                build_real_fft_xml_grid_map(fft_len, rotation_bins1, station_offset1, half);
+            let grid_map2 =
+                build_real_fft_xml_grid_map(fft_len, rotation_bins2, station_offset2, half);
+            let direct_src1 = contiguous_real_fft_src_start(&grid_map1, ba.a1s, overlap_len);
+            let direct_src2 = contiguous_real_fft_src_start(&grid_map2, ba.a2s, overlap_len);
+            Some((grid_map1, grid_map2, direct_src1, direct_src2))
+        };
+        if let Some((_, _, direct_src1, direct_src2)) = normal_grid_maps.as_ref() {
+            match (direct_src1, direct_src2) {
+                (Some(src1), Some(src2)) => println!(
+                    "[info] Correlation grid path: direct contiguous FFT bins (src starts {}, {})",
+                    src1, src2
+                ),
+                _ => println!("[info] Correlation grid path: general mapped/Hermitian FFT bins"),
+            }
+        }
         let acf_overlap_only = false;
         let mut acc_ph_total = if need_phased_products {
             Some(vec![0.0; fft_len / 2 + 1])
@@ -5464,8 +5620,16 @@ fn run_once(
                     f2: vec![0.0_f32; fft_len],
                     s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
                     s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
-                    g1: vec![Complex::new(0.0_f32, 0.0_f32); half + 1],
-                    g2: vec![Complex::new(0.0_f32, 0.0_f32); half + 1],
+                    g1: if need_grid_buffers {
+                        vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
+                    } else {
+                        Vec::new()
+                    },
+                    g2: if need_grid_buffers {
+                        vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
+                    } else {
+                        Vec::new()
+                    },
                     fft_scratch: helper.make_scratch(),
                     dw1: DecodeWindowScratch::new(),
                     dw2: DecodeWindowScratch::new(),
@@ -5478,13 +5642,14 @@ fn run_once(
                 let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
                 let chunk_abs_start1 = sector_sample_start1;
                 let chunk_abs_start2 = sector_sample_start2;
+                let (grid_map1, grid_map2, direct_src1, direct_src2) = normal_grid_maps
+                    .as_ref()
+                    .expect("normal correlation grid maps");
+                let direct_src1 = *direct_src1;
+                let direct_src2 = *direct_src2;
                 let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
                 let station_offset2 = station_grid_origin_offset_bins(a2_name, fs, fft_len)
                     + ant2_grid_extra_offset();
-                let grid_map1 =
-                    build_real_fft_xml_grid_map(fft_len, rotation_bins1, station_offset1, half);
-                let grid_map2 =
-                    build_real_fft_xml_grid_map(fft_len, rotation_bins2, station_offset2, half);
                 let mut out = chunk_starts
                     .into_par_iter()
                     .map(|start| {
@@ -5563,7 +5728,6 @@ fn run_once(
                             let fr_lo1 = d.fr_lo1;
                             let fr_lo2 = d.fr_lo2;
                             let fr_mix = fr_lo1 * fr_lo2.conj();
-                            let need_grid_buffers = pulsar_runtime.is_some() || fft_peak_debug;
                             if need_grid_buffers {
                                 shift_real_fft_to_xml_grid_with_extra_offset(
                                     &st.s1,
@@ -5601,8 +5765,6 @@ fn run_once(
                                     );
                                 }
                             }
-                            let overlap_len = ba.a1e - ba.a1s;
-
                             if let (Some(rt), Some(fold)) =
                                 (pulsar_runtime.as_ref(), st.fold.as_mut())
                             {
@@ -5673,112 +5835,112 @@ fn run_once(
                             // Fast path: do not materialize XML-grid spectra for normal
                             // correlation.  Read the mapped FFT bin once and update ACF/XCF in
                             // the same pass to reduce memory traffic and extra 1024-bin loops.
-                            match normal_corr_kernel {
-                                NormalCorrKernel::Ant1Grid => {
-                                    let mut phase_corr = None;
-                                    if need_xcf_products {
-                                        let (phase0, step) = xcf_phase_start_and_step(
-                                            df_hz,
-                                            d.frac1,
-                                            d.frac2,
-                                            ba.a1s as isize - rotation_bins1,
-                                            ba.a2s as isize - rotation_bins2,
+                            let output_start = match normal_corr_kernel {
+                                NormalCorrKernel::Ant1Grid => ba.a1s,
+                                NormalCorrKernel::Ant2Grid => ba.a2s,
+                            };
+                            let direct_accumulated = if need_acf_products
+                                && need_xcf_products
+                                && !args.debug
+                            {
+                                if let (Some(src1), Some(src2)) = (direct_src1, direct_src2) {
+                                    let (phase0, phase_step) = xcf_phase_start_and_step(
+                                        df_hz,
+                                        d.frac1,
+                                        d.frac2,
+                                        ba.a1s as isize - rotation_bins1,
+                                        ba.a2s as isize - rotation_bins2,
+                                    );
+                                    match normal_corr_kernel {
+                                        NormalCorrKernel::Ant1Grid => accumulate_direct_acf_xcf(
+                                            &st.s1[src1..src1 + overlap_len],
+                                            &st.s2[src2..src2 + overlap_len],
+                                            &mut st.acc_11[ba.a1s..ba.a1s + overlap_len],
+                                            &mut st.acc_12[ba.a1s..ba.a1s + overlap_len],
+                                            &mut st.acc_22[ba.a1s..ba.a1s + overlap_len],
+                                            fr_mix,
+                                            phase0,
+                                            phase_step,
+                                        ),
+                                        NormalCorrKernel::Ant2Grid => accumulate_direct_acf_xcf(
+                                            &st.s1[src1..src1 + overlap_len],
+                                            &st.s2[src2..src2 + overlap_len],
+                                            &mut st.acc_11[ba.a2s..ba.a2s + overlap_len],
+                                            &mut st.acc_12[ba.a2s..ba.a2s + overlap_len],
+                                            &mut st.acc_22[ba.a2s..ba.a2s + overlap_len],
+                                            fr_mix,
+                                            phase0,
+                                            phase_step,
+                                        ),
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if !direct_accumulated {
+                                let mut phase_corr = None;
+                                if need_xcf_products {
+                                    let (phase0, step) = xcf_phase_start_and_step(
+                                        df_hz,
+                                        d.frac1,
+                                        d.frac2,
+                                        ba.a1s as isize - rotation_bins1,
+                                        ba.a2s as isize - rotation_bins2,
+                                    );
+                                    phase_corr = Some((phase0, step));
+                                }
+                                for k in 0..overlap_len {
+                                    let i1 = ba.a1s + k;
+                                    let i2 = ba.a2s + k;
+                                    let output_bin = output_start + k;
+                                    let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
+                                    let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
+                                    if need_acf_products {
+                                        st.acc_11[output_bin] += z1.norm_sqr() as f64;
+                                        st.acc_22[output_bin] += z2.norm_sqr() as f64;
+                                    }
+                                    if let Some((ref mut pc, step)) = phase_corr {
+                                        let raw_xcf = z1 * z2.conj();
+                                        let v = raw_xcf * fr_mix * *pc;
+                                        maybe_dump_xcf_debug(
+                                            args.debug,
+                                            emitted + i,
+                                            i,
+                                            si,
+                                            normal_corr_kernel.output_grid(),
+                                            output_bin,
+                                            raw_xcf,
+                                            fr_mix,
+                                            *pc,
+                                            v,
+                                            d,
+                                            fs,
                                         );
-                                        phase_corr = Some((phase0, step));
-                                    }
-                                    for k in 0..overlap_len {
-                                        let i1 = ba.a1s + k;
-                                        let i2 = ba.a2s + k;
-                                        let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
-                                        let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
-                                        if need_acf_products {
-                                            st.acc_11[i1] += z1.norm_sqr() as f64;
-                                            st.acc_22[i1] += z2.norm_sqr() as f64;
-                                        }
-                                        if let Some((ref mut pc, step)) = phase_corr {
-                                            let raw_xcf = z1 * z2.conj();
-                                            let v = raw_xcf * fr_mix * *pc;
-                                            maybe_dump_xcf_debug(
-                                                args.debug,
-                                                emitted + i,
-                                                i,
-                                                si,
-                                                normal_corr_kernel.output_grid(),
-                                                i1,
-                                                raw_xcf,
-                                                fr_mix,
-                                                *pc,
-                                                v,
-                                                d,
-                                                fs,
-                                            );
-                                            st.acc_12[i1] += Complex::new(v.re as f64, v.im as f64);
-                                            *pc *= step;
-                                        }
-                                    }
-                                    if need_acf_products && !acf_overlap_only {
-                                        for k in 0..ba.a1s {
-                                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, k);
-                                            st.acc_11[k] += z1.norm_sqr() as f64;
-                                        }
-                                        for k in ba.a1e..half {
-                                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, k);
-                                            st.acc_11[k] += z1.norm_sqr() as f64;
-                                        }
+                                        st.acc_12[output_bin] +=
+                                            Complex::new(v.re as f64, v.im as f64);
+                                        *pc *= step;
                                     }
                                 }
-                                NormalCorrKernel::Ant2Grid => {
-                                    let mut phase_corr = None;
-                                    if need_xcf_products {
-                                        let (phase0, step) = xcf_phase_start_and_step(
-                                            df_hz,
-                                            d.frac1,
-                                            d.frac2,
-                                            ba.a1s as isize - rotation_bins1,
-                                            ba.a2s as isize - rotation_bins2,
-                                        );
-                                        phase_corr = Some((phase0, step));
+                            }
+                            if need_acf_products && !acf_overlap_only {
+                                let (spectrum, map, accumulator) = match normal_corr_kernel {
+                                    NormalCorrKernel::Ant1Grid => {
+                                        (&st.s1, &grid_map1, &mut st.acc_11)
                                     }
-                                    for k in 0..overlap_len {
-                                        let i1 = ba.a1s + k;
-                                        let i2 = ba.a2s + k;
-                                        let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
-                                        let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
-                                        if need_acf_products {
-                                            st.acc_11[i2] += z1.norm_sqr() as f64;
-                                            st.acc_22[i2] += z2.norm_sqr() as f64;
-                                        }
-                                        if let Some((ref mut pc, step)) = phase_corr {
-                                            let raw_xcf = z1 * z2.conj();
-                                            let v = raw_xcf * fr_mix * *pc;
-                                            maybe_dump_xcf_debug(
-                                                args.debug,
-                                                emitted + i,
-                                                i,
-                                                si,
-                                                normal_corr_kernel.output_grid(),
-                                                i2,
-                                                raw_xcf,
-                                                fr_mix,
-                                                *pc,
-                                                v,
-                                                d,
-                                                fs,
-                                            );
-                                            st.acc_12[i2] += Complex::new(v.re as f64, v.im as f64);
-                                            *pc *= step;
-                                        }
+                                    NormalCorrKernel::Ant2Grid => {
+                                        (&st.s2, &grid_map2, &mut st.acc_22)
                                     }
-                                    if need_acf_products && !acf_overlap_only {
-                                        for k in 0..ba.a1s {
-                                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, k);
-                                            st.acc_22[k] += z2.norm_sqr() as f64;
-                                        }
-                                        for k in ba.a1e..half {
-                                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, k);
-                                            st.acc_22[k] += z2.norm_sqr() as f64;
-                                        }
-                                    }
+                                };
+                                for k in 0..ba.a1s {
+                                    let z = mapped_real_fft_bin(spectrum, map, k);
+                                    accumulator[k] += z.norm_sqr() as f64;
+                                }
+                                for k in ba.a1e..half {
+                                    let z = mapped_real_fft_bin(spectrum, map, k);
+                                    accumulator[k] += z.norm_sqr() as f64;
                                 }
                             }
                             if let Some(t) = timing_accum_start {
