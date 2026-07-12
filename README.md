@@ -285,6 +285,12 @@ Signal/processing:
 - `--skip <s>`
 - `--length <s>`
 
+Model diagnostics:
+
+- `--model-diagnostics` (one correlation run plus model-only comparisons)
+- `--model-sweep` (five unattended full-correlation runs)
+- `--stdout` (save runtime stdout under `./stdout/`)
+
 ### Delay Compensation Model
 
 `yi-corr` applies delay correction in two parts for each FFT frame:
@@ -1561,6 +1567,145 @@ XML/header coordinates: J2000 catalog RA/Dec
 Delay-model coordinates: precessed-to-date RA/Dec
 ```
 
+### Geometric-model diagnostics and unattended sweep
+
+`--model-diagnostics` diagnoses a curved residual delay or fringe phase without
+changing the correlation numerics. It performs the requested correlation once;
+the raw reads and FFT are therefore not repeated for each model variant. For a
+schedule-driven run, use for example:
+
+```bash
+target/release/yi-corr \
+  --sc observation.xml \
+  --raw raw \
+  --cor cor \
+  --model-diagnostics \
+  --stdout
+```
+
+The normal stdout contains detailed `geom-diag` records and up to five exact
+frame-midpoint checkpoints: start, one quarter, midpoint, three quarters, and
+end. The checkpoints report:
+
+`scan_elapsed_s=0` is always the first data time of the selected process
+window. A frame midpoint is only the instant at which the continuously varying
+delay is evaluated; it is not a replacement phase origin. The TSV therefore
+records data time and model-evaluation time separately when a nonzero
+`model_time_offset` is in use.
+
+- UTC/MJD, process skip, model-time offset, FFT-frame midpoint, sampling rate,
+  XML reference frequency, and actual fringe-stop carrier frequency;
+- J2000 source coordinates, active source-vector/delay modes, EOP values,
+  station ECEF coordinates, and the directed `ant2 - ant1` baseline;
+- raw and process-epoch clock delay/rate/accel/jerk/snap coefficients;
+- geometric, relative-clock, coarse/user, rotation-residual, and total
+  delay/rate/accel/jerk/snap terms in SI and sample-based units;
+- the continuous exact model versus the value actually applied by integer and
+  fractional delay tracking;
+- station azimuth/elevation, `csc(elevation)` with an explicit validity flag, and baseline `u/v/w`; and
+- every source-vector/delay-mode alternative relative to the active model,
+  including phase differences with the constant, linear, and quadratic terms
+  successively removed.
+
+The same run writes a per-second
+`model_diagnostics_<ANT1>_<ANT2>_<EPOCH>.tsv` under the correlation output
+directory. It contains the active composite model and 16 model variants: all
+three source-vector paths crossed with all five geometric-delay paths, plus the
+active model with DUT1/xp/yp forced to zero. `pnm-era-engineering` is included
+only as a transform/sign control; it is not the standard CIO-plus-ERA model.
+`--model-diagnostics` also enables the existing
+`delay_model_<ANT1>_<ANT2>_<EPOCH>.tsv` dump. Collect both TSV files and the
+`--stdout` log when comparing against `frinZ`; no additional correlation is
+needed for this model-only comparison.
+
+To keep the high derivatives stable against MJD `f64` rounding, diagnostic
+rate/acceleration/jerk/snap use seven-point central stencils with respective
+steps of 30/60/120/300 seconds. This changes only the reported diagnostic
+derivative estimates. The production per-frame delay correction and the
+resulting `.cor` numerics are unchanged.
+
+The reported phase is the phase correction applied by `yi-corr`, not the
+residual phase subsequently measured by `frinZ`. For baseline delay
+`tau = arrival_time_ant2 - arrival_time_ant1`, the convention is:
+
+```text
+correction phase [cycles] = -frequency_hz * tau_s
+fringe rate        [Hz]    = -frequency_hz * d(tau)/dt
+phase acceleration [Hz/s]  = -frequency_hz * d2(tau)/dt2
+phase jerk         [Hz/s2] = -frequency_hz * d3(tau)/dt3
+```
+
+For the printed degree polynomial
+`phase(dt) = c0 + c1*dt + c2*dt^2 + c3*dt^3 + c4*dt^4`, the coefficients are
+`c1=-360*f*tau1`, `c2=-180*f*tau2`, `c3=-60*f*tau3`, and
+`c4=-15*f*tau4`. Thus the cubic coefficient contains the required `1/6`
+factor and must not be compared directly with the third derivative. The
+`delta_phase_after_linear` column exposes quadratic and higher differences;
+`delta_phase_after_quadratic` isolates cubic and higher differences.
+
+`--model-sweep` is the unattended full-correlation counterpart:
+
+```bash
+target/release/yi-corr \
+  --sc observation.xml \
+  --raw raw \
+  --cor cor \
+  --model-sweep
+```
+
+For a long run that must survive logout, redirect the parent console as well:
+
+```bash
+nohup target/release/yi-corr \
+  --sc observation.xml \
+  --raw raw \
+  --cor cor \
+  --model-sweep \
+  > model_sweep.nohup.log 2>&1 &
+```
+
+Add `--usb` only when both antenna files are on USB-attached storage and
+concurrent reads improve that enclosure. It does not change the signal-sideband
+or correlation model.
+
+It sequentially runs these five cases, each with `--model-diagnostics` and its
+own stdout/stderr log:
+
+| Directory | Source/delay/EOP case |
+|---|---|
+| `01_active` | Caller/XML/environment model unchanged |
+| `02_mean_anchored_eop_zero` | `mean-gast` + `anchored`, DUT1=xp=yp=0 |
+| `03_pnm_anchored_eop_zero` | `pnm-gast` + `anchored`, DUT1=xp=yp=0 |
+| `04_pnm_vlbi_minus_eop_zero` | `pnm-gast` + first-order IERS-sign `vlbi-minus`, DUT1=xp=yp=0 |
+| `05_pnm_vlbi_minus_active_eop` | `pnm-gast` + first-order IERS-sign `vlbi-minus`, caller/XML EOP |
+
+Outputs are placed below `<cor-directory>/model_sweep/`; progress and exit
+status are recorded in `model_sweep_status.tsv`. A failed case is recorded and
+the remaining cases continue, but the parent command returns an error after the
+sweep if any case failed. Unlike `--model-diagnostics`, this mode intentionally
+repeats raw reading, FFT, and correlation five times. Five two-hour cases can
+therefore require approximately ten hours.
+
+Each case captures both stdout and stderr in
+`model_sweep_stdout_stderr.log`. A validated `.model_sweep_ok` marker lets an
+interrupted command resume without recomputing completed cases. The signature
+covers the working directory, executable, forwarded arguments, `YI_*`
+environment/file settings, schedule XML, EOP data, and selected/raw input file
+state; it is checked before and after every case. Each `.cor` header, exact size,
+sector count, and artifact fingerprint must still match its marker. A Unix
+`flock` inherited by the active child prevents overlapping sweeps even if the
+parent is terminated.
+
+These diagnostics do not add propagation or station-deformation corrections.
+In particular, `yi-corr` currently does **not** model troposphere, ionosphere,
+solid-Earth tide, ocean loading, pole tide, station velocity, antenna axis
+offset, or gravitational delay. A changing differential tropospheric slant
+path at low elevation can produce a smooth nonlinear residual delay and an
+apparently quadratic or cubic fringe phase. The printed elevation and
+`csc(elevation)` values are provided to test that possibility; a model sweep
+must not be interpreted as proving that a remaining jerk is a clock polynomial
+or a correlator time-origin error.
+
 #### `.cor` clock fields are metadata
 
 The `.cor` file header carries station clock delay/rate from XML `<clock>` for
@@ -1686,12 +1831,15 @@ Performance:
 
 - `--cpu <N>`
 - `--chunk-frames <N>`
+- `--usb` (read the two antenna files concurrently on USB-attached storage; unrelated to USB signal sideband)
 - `--pipeline-depth <N>`
 
 Diagnostics:
 
 - `--stdout` (yi-corr only; write runtime stdout log to `./stdout/stdout_<yyyydddhhmmss>.log`)
 - `--debug` (writes full-frame debug log to `<schedule_dir>/debug_yi-corr/debug_<epoch>.log`)
+- `--model-diagnostics` (one correlation plus per-second 16-variant model comparison)
+- `--model-sweep` (five sequential full-correlation model cases)
 - `--mkxml`
 
 Advanced hidden:
@@ -1919,6 +2067,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.2.0` | Optimized normal `yi-corr` ACF/XCF processing with direct contiguous FFT-bin accumulation for eligible grid mappings, added `--usb` concurrent per-antenna input readers for USB-attached storage, and added non-mutating `--model-diagnostics` plus the five-case `--model-sweep`; signal sideband, delay, fringe, and time models are unchanged from `3.1.x`. |
 | `3.1.17` | Added optional `YI_READER_CORE` pinning for yi-corr input reader threads so one CPU can be reserved for RAID/input transfer control experiments. |
 | `3.1.16` | Fused the normal `yi-corr` overlap ACF/XCF accumulation loop so the common full-overlap path reads each FFT bin once during correlation accumulation. |
 | `3.1.15` | Added sampled compute breakdown timing for normal `yi-corr` workers, reporting decode, real-FFT, and accumulation fractions without timing every frame. |
@@ -2020,8 +2169,15 @@ Practical validation notes:
 4. Storage matters:
    - NVMe > SATA SSD > HDD/RAID
    - first run may be slower due to cold page cache
+   - for two input files on USB-attached storage, `--usb` reads the antenna streams concurrently while preserving sector boundaries, bit offsets, and EOF zero padding
 5. Very large `.raw` (10s of GB to TB) is supported as streaming I/O; full-RAM loading is not required.
 6. Process-window prefetch reads only the required scan window, not the whole file.
+
+`--usb` changes only input scheduling. It does not select the receiver USB
+(Upper SideBand) signal mode and does not change decoded samples or `.cor`
+numerics. It does not split output integration sectors. An explicit
+`--pipeline-depth` is respected as the I/O prefetch setting; USB mode reserves
+one ready-queue slot for the sector pairer.
 
 ## Scan window and end-time handling
 
@@ -2106,6 +2262,7 @@ Notes:
 
 - This keeps correlation throughput near `max(stage I/O, yi-corr compute)`.
 - With two 2-bit streams at 1024 Msps, required input is about 4.096 Gbps; a 3 Gbps link cannot achieve true real-time without reducing data rate.
+- When correlating both raw files directly from USB-attached RAID, add `--usb` to run one input reader per antenna. This can improve utilization when the enclosure and host support concurrent reads, but it cannot exceed the physical link bandwidth.
 
 ## Phase Check (No Fixed Offset)
 

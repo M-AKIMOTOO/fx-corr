@@ -6,6 +6,9 @@ mod eop;
 mod fringe;
 mod geom;
 mod ifile;
+mod model_diag;
+mod model_diag_output;
+mod model_sweep;
 mod plot;
 mod pulsar;
 mod utils;
@@ -859,77 +862,6 @@ struct GeomDelaySample {
     snap_sps4: f64,
 }
 
-fn solve_5x5(mut a: [[f64; 5]; 5], mut b: [f64; 5]) -> Option<[f64; 5]> {
-    for col in 0..5 {
-        let mut pivot = col;
-        let mut pivot_abs = a[col][col].abs();
-        for row in (col + 1)..5 {
-            let v = a[row][col].abs();
-            if v > pivot_abs {
-                pivot = row;
-                pivot_abs = v;
-            }
-        }
-        if pivot_abs < 1.0e-24 {
-            return None;
-        }
-        if pivot != col {
-            a.swap(col, pivot);
-            b.swap(col, pivot);
-        }
-        let inv = 1.0 / a[col][col];
-        for j in col..5 {
-            a[col][j] *= inv;
-        }
-        b[col] *= inv;
-        for row in 0..5 {
-            if row == col {
-                continue;
-            }
-            let f = a[row][col];
-            if f == 0.0 {
-                continue;
-            }
-            for j in col..5 {
-                a[row][j] -= f * a[col][j];
-            }
-            b[row] -= f * b[col];
-        }
-    }
-    Some(b)
-}
-
-fn local_quartic_derivatives(
-    delay_grid: &[f64],
-    center_idx: usize,
-    radius: usize,
-) -> (f64, f64, f64, f64) {
-    let center = delay_grid[center_idx];
-    let start = center_idx.saturating_sub(radius);
-    let end = (center_idx + radius).min(delay_grid.len().saturating_sub(1));
-    let mut normal = [[0.0_f64; 5]; 5];
-    let mut rhs = [0.0_f64; 5];
-    for idx in start..=end {
-        let x = idx as f64 - center_idx as f64;
-        let y = delay_grid[idx] - center;
-        let mut p = [1.0_f64; 9];
-        for k in 1..p.len() {
-            p[k] = p[k - 1] * x;
-        }
-        for r in 0..5 {
-            rhs[r] += p[r] * y;
-            for c in 0..5 {
-                normal[r][c] += p[r + c];
-            }
-        }
-    }
-    if let Some(c) = solve_5x5(normal, rhs) {
-        (c[1], 2.0 * c[2], 6.0 * c[3], 24.0 * c[4])
-    } else {
-        (0.0, 0.0, 0.0, 0.0)
-    }
-}
-
 struct DelayEvalConfig {
     frame_dt: f64,
     model_time_offset_s: f64,
@@ -1698,6 +1630,111 @@ impl PackedSampleReader {
     }
 }
 
+type PairedSectorRead = Result<(usize, Vec<u8>, Vec<u8>), String>;
+type StationSectorRead = Result<(usize, Vec<u8>), String>;
+
+struct SynthReaderPipeline {
+    receiver: Option<mpsc::Receiver<PairedSectorRead>>,
+    handles: Vec<(&'static str, thread::JoinHandle<()>)>,
+}
+
+impl SynthReaderPipeline {
+    fn new(
+        receiver: mpsc::Receiver<PairedSectorRead>,
+        handles: Vec<(&'static str, thread::JoinHandle<()>)>,
+    ) -> Self {
+        Self {
+            receiver: Some(receiver),
+            handles,
+        }
+    }
+
+    fn recv(&self) -> Result<PairedSectorRead, mpsc::RecvError> {
+        self.receiver
+            .as_ref()
+            .expect("synth reader receiver is available")
+            .recv()
+    }
+
+    fn finish(mut self) -> Result<(), DynError> {
+        self.receiver.take();
+        let mut panicked = Vec::new();
+        for (name, handle) in self.handles.drain(..) {
+            if handle.join().is_err() {
+                panicked.push(name);
+            }
+        }
+        if panicked.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("synth reader thread(s) panicked: {}", panicked.join(", ")).into())
+        }
+    }
+}
+
+impl Drop for SynthReaderPipeline {
+    fn drop(&mut self) {
+        // Dropping the ready receiver first releases a producer blocked on a
+        // bounded send.  In USB mode that also lets the pairer drop both
+        // rendezvous receivers before the station-reader joins below.
+        self.receiver.take();
+        for (_, handle) in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_usb_station_reader(
+    path: PathBuf,
+    station_label: &'static str,
+    bit_depth: usize,
+    sector_reads: Vec<(u64, u64)>,
+    reader_core: Option<core_affinity::CoreId>,
+    sender: mpsc::SyncSender<StationSectorRead>,
+) {
+    if let Some(core) = reader_core {
+        let _ = affinity::set_current_thread_core(core);
+    }
+    let mut reader = match PackedSampleReader::open(&path, 0, 0) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = sender.send(Err(format!(
+                "failed to open {} for USB {} sector reader: {e}",
+                path.display(),
+                station_label
+            )));
+            return;
+        }
+    };
+    for (sector_idx, (start_sample, sample_count)) in sector_reads.into_iter().enumerate() {
+        let mut buf = vec![0u8; ((sample_count as usize * bit_depth) + 7) / 8];
+        let start_bits = start_sample * bit_depth as u64;
+        if let Err(e) = reader.seek_to(start_bits / 8, (start_bits % 8) as u8) {
+            let _ = sender.send(Err(format!(
+                "failed to seek {} USB {} input at sample {} (sector {}): {e}",
+                path.display(),
+                station_label,
+                start_sample,
+                sector_idx + 1
+            )));
+            return;
+        }
+        if let Err(e) = reader.read_packed_with_padding(&mut buf) {
+            let _ = sender.send(Err(format!(
+                "failed reading {} USB {} input at sample {} (sector {}): {e}",
+                path.display(),
+                station_label,
+                start_sample,
+                sector_idx + 1
+            )));
+            return;
+        }
+        if sender.send(Ok((sector_idx, buf))).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn advise_sequential_readahead(file: &File) {
     use std::os::fd::AsRawFd;
@@ -2288,7 +2325,6 @@ fn main() -> Result<(), DynError> {
         return Ok(());
     }
     let run_mode = detect_run_mode_from_argv0();
-    init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
     match run_mode {
         RunMode::PhasedArray => {
             if args.schedule.is_none() {
@@ -2310,6 +2346,14 @@ fn main() -> Result<(), DynError> {
             }
         }
     }
+    if args.model_sweep {
+        model_sweep::ensure_not_recursive_model_sweep(true)?;
+        if !matches!(run_mode, RunMode::Corr) {
+            return Err("--model-sweep is supported only by yi-corr".into());
+        }
+        return model_sweep::run_unattended_model_sweep(&args);
+    }
+    init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
     let physical_cores = runtime_physical_cores();
     let cpu_auto = physical_cores
         .map(|n| n.saturating_sub(1).max(1))
@@ -3946,7 +3990,7 @@ fn run_once(
         for i in 0..n_points {
             let center_idx = i + guard as usize;
             let (rate_sps, accel_sps2, jerk_sps3, snap_sps4) =
-                local_quartic_derivatives(&delay_grid, center_idx, fit_radius);
+                model_diag::local_quartic_derivatives(&delay_grid, center_idx, fit_radius);
             table.push(GeomDelaySample {
                 delay_s: sample(i, 0),
                 rate_sps,
@@ -4053,12 +4097,298 @@ fn run_once(
     let ant1_name_file = sanitize_file_token(a1_name);
     let ant2_name_file = sanitize_file_token(a2_name);
 
-    let dump_delay_model = std::env::var("YI_DUMP_DELAY_MODEL")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
-        })
-        .unwrap_or(false);
+    if args.model_diagnostics {
+        if let Some(source) = gdi.as_ref() {
+            let diagnostic_path = o_dir.join(format!(
+                "model_diagnostics_{}_{}_{}.tsv",
+                ant1_name_file, ant2_name_file, c_tag
+            ));
+            let carrier_hz = if residual_on_ant2 { lo2_hz } else { lo1_hz };
+            let geometry = model_diag::GeometryContext {
+                ant1_ecef_m: ant1_ecef,
+                ant2_ecef_m: ant2_ecef,
+                ra_j2000_rad: source.ra_raw,
+                dec_j2000_rad: source.dec_raw,
+                reference_mjd_utc: source.mjd,
+            };
+            let clock_coefficients = model_diag::DelayDerivatives {
+                delay_s: clock_delay_s,
+                rate_sps: clock_rate_sps,
+                accel_sps2: clock_accel_sps2,
+                jerk_sps3: clock_jerk_sps3,
+                snap_sps4: clock_snap_sps4,
+            };
+            let other_coefficients = model_diag::DelayDerivatives {
+                delay_s: coarse_delay_s + delay_user_samples / fs,
+                rate_sps: extra_delay_rate_sps,
+                accel_sps2: extra_delay_accel_sps2,
+                jerk_sps3: 0.0,
+                snap_sps4: 0.0,
+            };
+            let residual_target = if residual_on_ant2 { a2_name } else { a1_name };
+            let diagnostic_input = model_diag_output::DiagnosticInput {
+                ant1_name: a1_name.to_string(),
+                ant2_name: a2_name.to_string(),
+                epoch: ep_i.clone(),
+                geometry,
+                active_source_mode: source_vector_mode,
+                active_delay_mode: geom_delay_mode,
+                active_eop: earth_orientation,
+                start_elapsed_process_s: total_skip_sec + model_time_offset_s,
+                total_skip_s: total_skip_sec,
+                model_time_offset_s,
+                duration_s: processed_sec,
+                frame_dt_s: frame_dt,
+                total_frames: total_f,
+                fs_hz: fs,
+                obs_hz: obs_mhz * 1.0e6,
+                carrier_hz,
+                clock_epoch_coefficients: clock_coefficients,
+                other_epoch_coefficients: other_coefficients,
+                read_align_reference_s: read_align_ref_local_s,
+                d_seek_s: d_seek,
+                residual_target: residual_target.to_string(),
+            };
+            let baseline = [
+                ant2_ecef[0] - ant1_ecef[0],
+                ant2_ecef[1] - ant1_ecef[1],
+                ant2_ecef[2] - ant1_ecef[2],
+            ];
+            let baseline_length_m =
+                (baseline[0] * baseline[0] + baseline[1] * baseline[1] + baseline[2] * baseline[2])
+                    .sqrt();
+            println!(
+                "[geom-diag:begin] one_run=true raw_fft_runs=1 full_model_variants=16 per_second_tsv={} duration_s={:.9}",
+                diagnostic_path.display(),
+                processed_sec
+            );
+            println!(
+                "[geom-diag:context] epoch={} reference_mjd_utc={:.12} total_skip_s={:+.17e} model_time_offset_s={:+.17e} frame_dt_s={:.17e} frames={} fs_hz={:.9} obs_hz={:.9} carrier_hz={:.9}",
+                ep_i,
+                source.mjd,
+                total_skip_sec,
+                model_time_offset_s,
+                frame_dt,
+                total_f,
+                fs,
+                obs_mhz * 1.0e6,
+                carrier_hz
+            );
+            println!(
+                "[geom-diag:source] ra_j2000_rad={:+.17e} dec_j2000_rad={:+.17e} ra_j2000_deg={:+.12} dec_j2000_deg={:+.12} source_mode={} delay_mode={} poly_order={}",
+                source.ra_raw,
+                source.dec_raw,
+                source.ra_raw.to_degrees(),
+                source.dec_raw.to_degrees(),
+                source_vector_mode.label(),
+                geom_delay_mode.label(),
+                geom_poly_order
+            );
+            println!(
+                "[geom-diag:baseline] ant1={} xyz_m={:+.9},{:+.9},{:+.9} ant2={} xyz_m={:+.9},{:+.9},{:+.9} baseline_2minus1_m={:+.9},{:+.9},{:+.9} length_m={:.9}",
+                a1_name,
+                ant1_ecef[0], ant1_ecef[1], ant1_ecef[2],
+                a2_name,
+                ant2_ecef[0], ant2_ecef[1], ant2_ecef[2],
+                baseline[0], baseline[1], baseline[2], baseline_length_m
+            );
+            println!(
+                "[geom-diag:eop] dut1_s={:+.17e} tt_minus_utc_s={:+.17e} xp_arcsec={:+.17e} yp_arcsec={:+.17e}",
+                dut1_s, tt_utc_s, xp_arcsec, yp_arcsec
+            );
+            println!(
+                "[geom-diag:clock-raw] ant1_epoch={} delay_s={:+.17e} rate_sps={:+.17e} accel_sps2={:+.17e} jerk_sps3={:+.17e} snap_sps4={:+.17e} ant2_epoch={} delay_s={:+.17e} rate_sps={:+.17e} accel_sps2={:+.17e} jerk_sps3={:+.17e} snap_sps4={:+.17e}",
+                clock1_epoch.as_deref().unwrap_or("process"),
+                clock1_delay_base_s,
+                clock1_rate_raw_sps,
+                clock1_accel_raw_sps2,
+                clock1_jerk_raw_sps3,
+                clock1_snap_raw_sps4,
+                clock2_epoch.as_deref().unwrap_or("process"),
+                clock2_delay_base_s,
+                clock2_rate_raw_sps,
+                clock2_accel_raw_sps2,
+                clock2_jerk_raw_sps3,
+                clock2_snap_raw_sps4
+            );
+            println!(
+                "[geom-diag:clock-effective] epoch_mode={} ant1_delay_s={:+.17e} ant1_rate_sps={:+.17e} ant1_accel_sps2={:+.17e} ant1_jerk_sps3={:+.17e} ant1_snap_sps4={:+.17e} ant2_delay_s={:+.17e} ant2_rate_sps={:+.17e} ant2_accel_sps2={:+.17e} ant2_jerk_sps3={:+.17e} ant2_snap_sps4={:+.17e}",
+                clock_epoch_mode,
+                clock1_delay_s,
+                clock1_rate_sps,
+                clock1_accel_sps2,
+                clock1_jerk_sps3,
+                clock1_snap_sps4,
+                clock2_delay_s,
+                clock2_rate_sps,
+                clock2_accel_sps2,
+                clock2_jerk_sps3,
+                clock2_snap_sps4
+            );
+            println!(
+                "[geom-diag:nongeom] coarse_delay_s={:+.17e} user_delay_sample={:+.17e} rotation_residual_hz={:+.17e} user_rate_hz={:+.17e} extra_delay_rate_sps={:+.17e} user_accel_hz_s={:+.17e} extra_delay_accel_sps2={:+.17e} read_align_ref_s={:+.17e} d_seek_s={:+.17e} residual_target={}",
+                coarse_delay_s,
+                delay_user_samples,
+                rotation_fringe_hz,
+                rate_user_hz,
+                extra_delay_rate_sps,
+                accel_user_hzps,
+                extra_delay_accel_sps2,
+                read_align_ref_local_s,
+                d_seek,
+                residual_target
+            );
+            println!(
+                "[geom-diag:phase-convention] correction_cycles=-frequency_hz*delay_s rate_hz=-f*tau1 accel_hz_s=-f*tau2 jerk_hz_s2=-f*tau3 polynomial_deg=c0+c1*dt+c2*dt2+c3*dt3+c4*dt4"
+            );
+            println!(
+                "[geom-diag:not-modeled] troposphere ionosphere solid-earth-tide ocean-loading pole-tide station-velocity axis-offset gravitational-delay"
+            );
+            println!(
+                "[geom-diag:warning] pnm-era-engineering is a sign-control path, not standard CIO-plus-ERA"
+            );
+            let report =
+                model_diag_output::generate_model_diagnostics(&diagnostic_input, &diagnostic_path)?;
+            println!(
+                "[geom-diag:time-origin] scan_elapsed_s=0_is_first_data_timestamp frame_midpoint_is_model_evaluation_only data_and_model_times_are_reported_separately"
+            );
+            println!(
+                "[geom-diag:derivative-stencil] {}",
+                model_diag::diagnostic_derivative_stencil_label()
+            );
+            println!(
+                "[geom-diag:file] path={} rows={} variants={} correlation_numerics_changed=false",
+                report.path.display(),
+                report.rows,
+                report.variants
+            );
+            for checkpoint in &report.checkpoints {
+                let total_phase_obs = checkpoint.total.phase_derivatives(obs_mhz * 1.0e6);
+                let total_phase_carrier = checkpoint.total.phase_derivatives(carrier_hz);
+                let phase_coeff = checkpoint.total.phase_polynomial_deg(obs_mhz * 1.0e6);
+                let applied =
+                    compute_frame_delay_entry(checkpoint.frame_idx, &delay_cfg, delay_cfg.d_seek);
+                let applied_minus_exact_s = applied.full_rel_s - checkpoint.total.delay_s;
+                println!(
+                    "[geom-diag:checkpoint] point={} frame_idx={} scan_elapsed_s={:.9} data_elapsed_process_s={:.9} data_mjd_utc={:.12} model_elapsed_process_s={:.9} model_mjd_utc={:.12} geom_sample={:+.17e} geom_rate_sample_s={:+.17e} geom_accel_sample_s2={:+.17e} geom_jerk_sample_s3={:+.17e} geom_snap_sample_s4={:+.17e}",
+                    checkpoint.label,
+                    checkpoint.frame_idx,
+                    checkpoint.scan_elapsed_s,
+                    checkpoint.data_elapsed_process_s,
+                    checkpoint.data_mjd_utc,
+                    checkpoint.model_elapsed_process_s,
+                    checkpoint.model_mjd_utc,
+                    checkpoint.geom.delay_s * fs,
+                    checkpoint.geom.rate_sps * fs,
+                    checkpoint.geom.accel_sps2 * fs,
+                    checkpoint.geom.jerk_sps3 * fs,
+                    checkpoint.geom.snap_sps4 * fs
+                );
+                println!(
+                    "[geom-diag:components] point={} clock_delay_sample={:+.17e} clock_rate_sample_s={:+.17e} clock_accel_sample_s2={:+.17e} clock_jerk_sample_s3={:+.17e} clock_snap_sample_s4={:+.17e} other_delay_sample={:+.17e} other_rate_sample_s={:+.17e} other_accel_sample_s2={:+.17e}",
+                    checkpoint.label,
+                    checkpoint.clock.delay_s * fs,
+                    checkpoint.clock.rate_sps * fs,
+                    checkpoint.clock.accel_sps2 * fs,
+                    checkpoint.clock.jerk_sps3 * fs,
+                    checkpoint.clock.snap_sps4 * fs,
+                    checkpoint.other.delay_s * fs,
+                    checkpoint.other.rate_sps * fs,
+                    checkpoint.other.accel_sps2 * fs
+                );
+                println!(
+                    "[geom-diag:total] point={} delay_sample={:+.17e} rate_sample_s={:+.17e} accel_sample_s2={:+.17e} jerk_sample_s3={:+.17e} snap_sample_s4={:+.17e} obs_phase_rate_hz={:+.17e} obs_phase_accel_hz_s={:+.17e} obs_phase_jerk_hz_s2={:+.17e} carrier_phase_rate_hz={:+.17e} carrier_phase_accel_hz_s={:+.17e} carrier_phase_jerk_hz_s2={:+.17e} c1_deg_s={:+.17e} c2_deg_s2={:+.17e} c3_deg_s3={:+.17e} c4_deg_s4={:+.17e}",
+                    checkpoint.label,
+                    checkpoint.total.delay_s * fs,
+                    checkpoint.total.rate_sps * fs,
+                    checkpoint.total.accel_sps2 * fs,
+                    checkpoint.total.jerk_sps3 * fs,
+                    checkpoint.total.snap_sps4 * fs,
+                    total_phase_obs.rate_sps,
+                    total_phase_obs.accel_sps2,
+                    total_phase_obs.jerk_sps3,
+                    total_phase_carrier.rate_sps,
+                    total_phase_carrier.accel_sps2,
+                    total_phase_carrier.jerk_sps3,
+                    phase_coeff[1], phase_coeff[2], phase_coeff[3], phase_coeff[4]
+                );
+                println!(
+                    "[geom-diag:applied] point={} full_rel_sample={:+.17e} residual_sample={:+.17e} int1={} int2={} frac1_sample={:+.17e} frac2_sample={:+.17e} applied_minus_exact_sample={:+.17e} applied_minus_exact_phase_deg={:+.17e}",
+                    checkpoint.label,
+                    applied.full_rel_s * fs,
+                    applied.residual_s * fs,
+                    applied.int1,
+                    applied.int2,
+                    applied.frac1 * fs,
+                    applied.frac2 * fs,
+                    applied_minus_exact_s * fs,
+                    -360.0 * obs_mhz * 1.0e6 * applied_minus_exact_s
+                );
+                let csc_delta_valid = checkpoint.ant1_csc_el_valid && checkpoint.ant2_csc_el_valid;
+                let csc_delta = if csc_delta_valid {
+                    checkpoint.ant2_csc_el - checkpoint.ant1_csc_el
+                } else {
+                    0.0
+                };
+                println!(
+                    "[geom-diag:azel] point={} ant1={} az_deg={:.9} el_deg={:.9} csc_el={:+.17e} csc_valid={} ant2={} az_deg={:.9} el_deg={:.9} csc_el={:+.17e} csc_valid={} csc_delta_2minus1={:+.17e} csc_delta_valid={} u_lambda={:+.17e} v_lambda={:+.17e} w_lambda={:+.17e} troposphere_mode=not-modeled",
+                    checkpoint.label,
+                    a1_name,
+                    checkpoint.ant1_az_deg,
+                    checkpoint.ant1_el_deg,
+                    checkpoint.ant1_csc_el,
+                    checkpoint.ant1_csc_el_valid,
+                    a2_name,
+                    checkpoint.ant2_az_deg,
+                    checkpoint.ant2_el_deg,
+                    checkpoint.ant2_csc_el,
+                    checkpoint.ant2_csc_el_valid,
+                    csc_delta,
+                    csc_delta_valid,
+                    checkpoint.u_lambda,
+                    checkpoint.v_lambda,
+                    checkpoint.w_lambda
+                );
+                for variant in &checkpoint.variants {
+                    let geom_phase = variant.geom.phase_derivatives(obs_mhz * 1.0e6);
+                    let delta_phase = variant.delta.phase_derivatives(obs_mhz * 1.0e6);
+                    println!(
+                        "[geom-diag:variant] point={} model={} geom_delay_sample={:+.17e} geom_rate_hz={:+.17e} geom_accel_hz_s={:+.17e} geom_jerk_hz_s2={:+.17e} delta_delay_sample={:+.17e} delta_rate_hz={:+.17e} delta_accel_hz_s={:+.17e} delta_jerk_hz_s2={:+.17e} delta_phase_from_start_deg={:+.17e} delta_phase_after_linear_deg={:+.17e} delta_phase_after_quadratic_deg={:+.17e}",
+                        checkpoint.label,
+                        variant.key,
+                        variant.geom.delay_s * fs,
+                        geom_phase.rate_sps,
+                        geom_phase.accel_sps2,
+                        geom_phase.jerk_sps3,
+                        variant.delta.delay_s * fs,
+                        delta_phase.rate_sps,
+                        delta_phase.accel_sps2,
+                        delta_phase.jerk_sps3,
+                        variant.delta_phase_from_start_deg,
+                        variant.delta_phase_after_linear_deg,
+                        variant.delta_phase_after_quadratic_deg
+                    );
+                }
+            }
+            println!(
+                "[geom-diag:end] collect={} and stdout log; no additional correlation is required for parameter comparison",
+                report.path.display()
+            );
+        } else {
+            return Err(
+                "--model-diagnostics requires source coordinates; no diagnostic TSV was written"
+                    .into(),
+            );
+        }
+    }
+
+    let dump_delay_model = args.model_diagnostics
+        || std::env::var("YI_DUMP_DELAY_MODEL")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false);
     if dump_delay_model {
         std::fs::create_dir_all(&o_dir)?;
         let dump_path = o_dir.join(format!(
@@ -4909,11 +5239,23 @@ fn run_once(
         let mut ql_fringe_start_offset_s = 0.0_f64;
         let mut ql_fringe_index = 0usize;
 
-        let prefetch_depth = io_pipeline_depth.max(2);
-        println!(
-            "[info] I/O prefetch: process-window reader enabled (pipeline={} chunks)",
+        // auto_pipeline_depth() is already at least two.  Keep an explicit
+        // --pipeline-depth value unchanged, including a requested depth of one.
+        let prefetch_depth = io_pipeline_depth;
+        let paired_ready_capacity = if args.usb {
+            prefetch_depth.saturating_sub(1).max(1)
+        } else {
             prefetch_depth
+        };
+        println!(
+            "[info] I/O prefetch: process-window reader enabled (pipeline={} chunks, paired-ready={} chunks)",
+            prefetch_depth, paired_ready_capacity
         );
+        if args.usb {
+            println!(
+                "[info] Input reader mode: USB-attached storage concurrent readers (one per antenna; unrelated to USB signal sideband)"
+            );
+        }
         let read_align_first = compute_frame_delay_entry(0, &delay_cfg, d_seek);
         let read_align_last_frame = total_f.saturating_sub(1);
         let read_align_last = compute_frame_delay_entry(read_align_last_frame, &delay_cfg, d_seek);
@@ -4939,8 +5281,7 @@ fn run_once(
         }
 
         let sec_counts_for_read = sec_counts.clone();
-        let (tx_sec, rx_sec) =
-            mpsc::sync_channel::<Result<(Vec<u8>, Vec<u8>), String>>(prefetch_depth);
+        let (tx_sec, rx_sec) = mpsc::sync_channel::<PairedSectorRead>(paired_ready_capacity);
         let synth_produced_chunks = Arc::new(AtomicUsize::new(0));
         let synth_produced_bytes = Arc::new(AtomicU64::new(0));
         let synth_consumed_chunks = Arc::new(AtomicUsize::new(0));
@@ -5024,75 +5365,163 @@ fn run_once(
         let sector_read_sample_counts_rd = sector_read_sample_counts.clone();
         let synth_produced_chunks_rd = Arc::clone(&synth_produced_chunks);
         let synth_produced_bytes_rd = Arc::clone(&synth_produced_bytes);
-        let reader_handle = thread::spawn(move || {
-            if let Some(core) = reader_core {
-                let _ = affinity::set_current_thread_core(core);
-            }
-            let mut pr1 = match PackedSampleReader::open(&a1_read, 0, 0) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx_sec.send(Err(format!(
-                        "failed to open {} for sector reader: {e}",
-                        a1_read.display()
-                    )));
-                    return;
+        let reader_pipeline = if args.usb {
+            let sector_count = sec_counts_for_read.len();
+            let ant1_sector_reads = sector_read_starts_rd
+                .iter()
+                .zip(sector_read_sample_counts_rd.iter())
+                .map(|(&(start1, _), &(count1, _))| (start1, count1))
+                .collect::<Vec<_>>();
+            let ant2_sector_reads = sector_read_starts_rd
+                .iter()
+                .zip(sector_read_sample_counts_rd.iter())
+                .map(|(&(_, start2), &(_, count2))| (start2, count2))
+                .collect::<Vec<_>>();
+
+            // Rendezvous channels prevent either station reader from queuing
+            // an additional sector independently of the pairer.
+            let (tx_ant1, rx_ant1) = mpsc::sync_channel::<StationSectorRead>(0);
+            let (tx_ant2, rx_ant2) = mpsc::sync_channel::<StationSectorRead>(0);
+            let ant1_handle = thread::spawn(move || {
+                run_usb_station_reader(
+                    a1_read,
+                    "ant1",
+                    bit1,
+                    ant1_sector_reads,
+                    reader_core,
+                    tx_ant1,
+                );
+            });
+            let ant2_handle = thread::spawn(move || {
+                run_usb_station_reader(a2_read, "ant2", bit2, ant2_sector_reads, None, tx_ant2);
+            });
+            let pairer_handle = thread::spawn(move || {
+                for expected_sector in 0..sector_count {
+                    let (sector1, b1) = match rx_ant1.recv() {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            let _ = tx_sec.send(Err(e));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = tx_sec.send(Err(format!(
+                                "USB ant1 reader channel failed at sector {}: {e}",
+                                expected_sector + 1
+                            )));
+                            return;
+                        }
+                    };
+                    let (sector2, b2) = match rx_ant2.recv() {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            let _ = tx_sec.send(Err(e));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = tx_sec.send(Err(format!(
+                                "USB ant2 reader channel failed at sector {}: {e}",
+                                expected_sector + 1
+                            )));
+                            return;
+                        }
+                    };
+                    if sector1 != expected_sector || sector2 != expected_sector {
+                        let _ = tx_sec.send(Err(format!(
+                            "USB reader sector pairing mismatch: expected={} ant1={} ant2={}",
+                            expected_sector + 1,
+                            sector1 + 1,
+                            sector2 + 1
+                        )));
+                        return;
+                    }
+                    let chunk_bytes = (b1.len() + b2.len()) as u64;
+                    if tx_sec.send(Ok((expected_sector, b1, b2))).is_err() {
+                        return;
+                    }
+                    synth_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
+                    synth_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
                 }
-            };
-            let mut pr2 = match PackedSampleReader::open(&a2_read, 0, 0) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx_sec.send(Err(format!(
-                        "failed to open {} for sector reader: {e}",
-                        a2_read.display()
-                    )));
-                    return;
+            });
+            SynthReaderPipeline::new(
+                rx_sec,
+                vec![
+                    ("USB sector pairer", pairer_handle),
+                    ("USB ant1 reader", ant1_handle),
+                    ("USB ant2 reader", ant2_handle),
+                ],
+            )
+        } else {
+            let reader_handle = thread::spawn(move || {
+                if let Some(core) = reader_core {
+                    let _ = affinity::set_current_thread_core(core);
                 }
-            };
-            for (sector_idx, _nf) in sec_counts_for_read.into_iter().enumerate() {
-                let (read_n1, read_n2) = sector_read_sample_counts_rd[sector_idx];
-                let mut b1 = vec![0u8; ((read_n1 as usize * bit1) + 7) / 8];
-                let mut b2 = vec![0u8; ((read_n2 as usize * bit2) + 7) / 8];
-                let (sector_s1, sector_s2) = sector_read_starts_rd[sector_idx];
-                let bits1 = sector_s1 * bit1 as u64;
-                let bits2 = sector_s2 * bit2 as u64;
-                if let Err(e) = pr1.seek_to(bits1 / 8, (bits1 % 8) as u8) {
-                    let _ = tx_sec.send(Err(format!(
-                        "failed to seek {} at sample {}: {e}",
-                        a1_read.display(),
-                        sector_s1
-                    )));
-                    return;
+                let mut pr1 = match PackedSampleReader::open(&a1_read, 0, 0) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx_sec.send(Err(format!(
+                            "failed to open {} for sector reader: {e}",
+                            a1_read.display()
+                        )));
+                        return;
+                    }
+                };
+                let mut pr2 = match PackedSampleReader::open(&a2_read, 0, 0) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx_sec.send(Err(format!(
+                            "failed to open {} for sector reader: {e}",
+                            a2_read.display()
+                        )));
+                        return;
+                    }
+                };
+                for (sector_idx, _nf) in sec_counts_for_read.into_iter().enumerate() {
+                    let (read_n1, read_n2) = sector_read_sample_counts_rd[sector_idx];
+                    let mut b1 = vec![0u8; ((read_n1 as usize * bit1) + 7) / 8];
+                    let mut b2 = vec![0u8; ((read_n2 as usize * bit2) + 7) / 8];
+                    let (sector_s1, sector_s2) = sector_read_starts_rd[sector_idx];
+                    let bits1 = sector_s1 * bit1 as u64;
+                    let bits2 = sector_s2 * bit2 as u64;
+                    if let Err(e) = pr1.seek_to(bits1 / 8, (bits1 % 8) as u8) {
+                        let _ = tx_sec.send(Err(format!(
+                            "failed to seek {} at sample {}: {e}",
+                            a1_read.display(),
+                            sector_s1
+                        )));
+                        return;
+                    }
+                    if let Err(e) = pr2.seek_to(bits2 / 8, (bits2 % 8) as u8) {
+                        let _ = tx_sec.send(Err(format!(
+                            "failed to seek {} at sample {}: {e}",
+                            a2_read.display(),
+                            sector_s2
+                        )));
+                        return;
+                    }
+                    if let Err(e) = pr1.read_packed_with_padding(&mut b1) {
+                        let _ = tx_sec.send(Err(format!(
+                            "failed reading ant1 input at sample {}: {e}",
+                            sector_s1
+                        )));
+                        return;
+                    }
+                    if let Err(e) = pr2.read_packed_with_padding(&mut b2) {
+                        let _ = tx_sec.send(Err(format!(
+                            "failed reading ant2 input at sample {}: {e}",
+                            sector_s2
+                        )));
+                        return;
+                    }
+                    let chunk_bytes = (b1.len() + b2.len()) as u64;
+                    if tx_sec.send(Ok((sector_idx, b1, b2))).is_err() {
+                        return;
+                    }
+                    synth_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
+                    synth_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Err(e) = pr2.seek_to(bits2 / 8, (bits2 % 8) as u8) {
-                    let _ = tx_sec.send(Err(format!(
-                        "failed to seek {} at sample {}: {e}",
-                        a2_read.display(),
-                        sector_s2
-                    )));
-                    return;
-                }
-                if let Err(e) = pr1.read_packed_with_padding(&mut b1) {
-                    let _ = tx_sec.send(Err(format!(
-                        "failed reading ant1 input at sample {}: {e}",
-                        sector_s1
-                    )));
-                    return;
-                }
-                if let Err(e) = pr2.read_packed_with_padding(&mut b2) {
-                    let _ = tx_sec.send(Err(format!(
-                        "failed reading ant2 input at sample {}: {e}",
-                        sector_s2
-                    )));
-                    return;
-                }
-                let chunk_bytes = (b1.len() + b2.len()) as u64;
-                if tx_sec.send(Ok((b1, b2))).is_err() {
-                    return;
-                }
-                synth_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
-                synth_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+            });
+            SynthReaderPipeline::new(rx_sec, vec![("serial sector reader", reader_handle)])
+        };
         let need_phased_products = write_raw || write_phased_cor || plot_phased;
         let need_acf_products = write_acf_cor;
         let need_xcf_products = write_xcf_cor;
@@ -5240,7 +5669,7 @@ fn run_once(
                 }
             }
             let timing_recv_start = Instant::now();
-            let (raw1_vec, raw2_vec) = match rx_sec.recv() {
+            let (received_sector, raw1_vec, raw2_vec) = match reader_pipeline.recv() {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     return Err(std::io::Error::other(format!("synth reader error: {e}")).into())
@@ -5251,6 +5680,14 @@ fn run_once(
                     )
                 }
             };
+            if received_sector != si {
+                return Err(std::io::Error::other(format!(
+                    "synth reader sector order mismatch: expected={} received={}",
+                    si + 1,
+                    received_sector + 1
+                ))
+                .into());
+            }
             timing_recv_wait_s += timing_recv_start.elapsed().as_secs_f64();
             synth_consumed_chunks.fetch_add(1, Ordering::Relaxed);
             let raw1: &[u8] = &raw1_vec;
@@ -6211,10 +6648,7 @@ fn run_once(
             }
             timing_output_s += timing_output_start.elapsed().as_secs_f64();
         }
-        drop(rx_sec);
-        if reader_handle.join().is_err() {
-            return Err("synth reader thread panicked".into());
-        }
+        reader_pipeline.finish()?;
         if !args.compact_logs {
             println!();
             let elapsed = synth_stats_start.elapsed().as_secs_f64().max(1e-9);
@@ -6227,9 +6661,9 @@ fn run_once(
                 avg_mib_s,
                 synth_read_bytes_total as f64 / (1024.0 * 1024.0),
                 queue_fill,
-                prefetch_depth,
+                paired_ready_capacity,
                 synth_queue_hwm,
-                prefetch_depth
+                paired_ready_capacity
             );
             let timed = timing_delay_s + timing_recv_wait_s + timing_compute_s + timing_output_s;
             let pct = |v: f64| {

@@ -90,7 +90,8 @@ def main():
             f"{sum(rate_hz)/len(rate_hz):+.9f} {rate_hz[0]:+.9f} {rate_hz[-1]:+.9f} {rate_slope:+.9e} "
             f"{sum(accel)/len(accel):+.9f} "
             f"{residual[0]:+.6f} {residual[-1]:+.6f} {residual_slope:+.9f} "
-            f"{dump_phase_slope/360.0:+.9f}"
+            f"{dump_phase_slope/360.0:+.9f} "
+            f"{carrier_phase_slope/360.0:+.9f} {carrier_hz:+.9f}"
         )
     return 0
 

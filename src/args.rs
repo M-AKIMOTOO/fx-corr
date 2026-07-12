@@ -296,6 +296,13 @@ pub struct Args {
 
     #[arg(
         long,
+        default_value_t = false,
+        help = "Read the two antenna inputs concurrently for USB-attached storage; unrelated to USB signal sideband"
+    )]
+    pub usb: bool,
+
+    #[arg(
+        long,
         value_name = "N",
         help = "Reader-worker queue depth [chunks] (auto when omitted)"
     )]
@@ -303,6 +310,20 @@ pub struct Args {
 
     #[arg(long, help = "Enable diagnostic debug logging to file (all frames)")]
     pub debug: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Write one-pass full geometric model comparison diagnostics without changing correlation numerics"
+    )]
+    pub model_diagnostics: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run an unattended five-case full-correlation model sweep into subdirectories"
+    )]
+    pub model_sweep: bool,
 
     #[arg(
         long = "stdout",
@@ -450,5 +471,49 @@ pub fn resolve_weight(
             return Err(format!("{label} gain must be positive").into());
         }
         Ok((gain / tsys, gain, None, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn usb_storage_flag_parses_with_mkxml_and_defaults_off() {
+        let default_args = Args::try_parse_from(["yi-corr", "--mkxml"]).unwrap();
+        assert!(!default_args.usb);
+
+        let usb_args = Args::try_parse_from(["yi-corr", "--mkxml", "--usb"]).unwrap();
+        assert!(usb_args.usb);
+        assert!(usb_args.mkxml);
+    }
+
+    #[test]
+    fn usb_storage_flag_is_distinct_from_usb_signal_sideband() {
+        let sideband_only =
+            Args::try_parse_from(["yi-corr", "--mkxml", "--sideband", "USB"]).unwrap();
+        assert!(!sideband_only.usb);
+        assert_eq!(sideband_only.sideband, vec!["USB".to_string()]);
+
+        let both =
+            Args::try_parse_from(["yi-corr", "--mkxml", "--sideband", "USB", "--usb"]).unwrap();
+        assert!(both.usb);
+        assert_eq!(both.sideband, vec!["USB".to_string()]);
+    }
+
+    #[test]
+    fn model_diagnostic_and_unattended_sweep_flags_parse() {
+        let default_args = Args::try_parse_from(["yi-corr", "--mkxml"]).unwrap();
+        assert!(!default_args.model_diagnostics);
+        assert!(!default_args.model_sweep);
+
+        let diagnostic =
+            Args::try_parse_from(["yi-corr", "--mkxml", "--model-diagnostics"]).unwrap();
+        assert!(diagnostic.model_diagnostics);
+        assert!(!diagnostic.model_sweep);
+
+        let sweep = Args::try_parse_from(["yi-corr", "--mkxml", "--model-sweep"]).unwrap();
+        assert!(sweep.model_sweep);
     }
 }

@@ -491,6 +491,45 @@ fn itrs_to_celestial(
     ]
 }
 
+fn ecef_geodetic_lat_lon(ecef_m: [f64; 3]) -> (f64, f64) {
+    const WGS84_A_M: f64 = 6_378_137.0;
+    const WGS84_F: f64 = 1.0 / 298.257_223_563;
+    let e2 = WGS84_F * (2.0 - WGS84_F);
+    let x = ecef_m[0];
+    let y = ecef_m[1];
+    let z = ecef_m[2];
+    let longitude = y.atan2(x);
+    let p = x.hypot(y);
+    let mut latitude = z.atan2(p * (1.0 - e2));
+    for _ in 0..8 {
+        let sin_lat = latitude.sin();
+        let n = WGS84_A_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+        latitude = (z + e2 * n * sin_lat).atan2(p);
+    }
+    (latitude, longitude)
+}
+
+pub fn source_az_el_with_eop_mode(
+    station_ecef_m: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd_utc: f64,
+    eop: EarthOrientation,
+    source_mode: SourceVectorMode,
+) -> (f64, f64) {
+    let source = source_vector_itrs_with_eop_mode(ra, dec, mjd_utc, eop, source_mode);
+    let (latitude, longitude) = ecef_geodetic_lat_lon(station_ecef_m);
+    let (sin_lat, cos_lat) = latitude.sin_cos();
+    let (sin_lon, cos_lon) = longitude.sin_cos();
+    let east = -sin_lon * source[0] + cos_lon * source[1];
+    let north =
+        -sin_lat * cos_lon * source[0] - sin_lat * sin_lon * source[1] + cos_lat * source[2];
+    let up = cos_lat * cos_lon * source[0] + cos_lat * sin_lon * source[1] + sin_lat * source[2];
+    let azimuth = east.atan2(north).rem_euclid(2.0 * std::f64::consts::PI);
+    let elevation = up.clamp(-1.0, 1.0).asin();
+    (azimuth, elevation)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BaselinePhaseBasis {
     pub u_lambda: f64,
