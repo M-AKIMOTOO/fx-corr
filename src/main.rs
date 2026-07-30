@@ -392,18 +392,21 @@ mod correlation_hot_path_tests {
     }
 
     #[test]
-    fn canonical_phased_raw_round_trips_through_decoder() {
+    fn vsrec_phased_raw_round_trips_through_decoder() {
         let levels = vec![-1.5, -0.5, 0.5, 1.5];
         let samples = vec![
             -1.5_f32, -0.5, 0.5, 1.5, 1.5, 0.5, -0.5, -1.5, -1.5, 0.5, -0.5, 1.5, 0.5, -1.5, 1.5,
             -0.5,
         ];
-        let identity = (0usize..32).collect::<Vec<_>>();
+        let vsrec = parse_shuffle(
+            "24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7",
+        )
+        .unwrap();
         let mut packed = Vec::new();
-        quantise_frame(&samples, 2, &levels, &identity, &mut packed).unwrap();
+        quantise_frame(&samples, 2, &levels, &vsrec, &mut packed).unwrap();
         assert_eq!(packed.len(), 4);
 
-        let plan = build_decode_plan(2, &identity, &levels).unwrap();
+        let plan = build_decode_plan(2, &vsrec, &levels).unwrap();
         let mut decoded = vec![0.0_f32; samples.len()];
         decode_block_into_with_plan(&packed, samples.len(), &plan, &mut decoded, false, false)
             .unwrap();
@@ -3443,9 +3446,12 @@ fn run_once(
         level_power2,
         level_power1,
     )?;
-    // Output is always canonical little-endian packed samples. The default XML
-    // shuffle (31..0 externally) decodes this identity representation.
-    let output_shuffle = (0usize..32).collect::<Vec<_>>();
+    // Repack the virtual station with the physical bit ordering of antenna 1.
+    // This makes the output directly compatible with VSREC readers that use
+    // the station shuffle convention instead of consulting sidecar metadata.
+    // sh1 is the canonical-bit -> physical-bit map required by the encoder,
+    // and therefore performs the inverse operation of decoding the same map.
+    let output_shuffle = sh1.as_ref().clone();
     let a1_name = if_d
         .as_ref()
         .and_then(|d| d.ant1_station_name.as_deref())
@@ -3798,9 +3804,10 @@ fn run_once(
             phased_name
         );
         println!(
-            "  phased-output-format: {} bit, canonical packed order, level={:?}",
-            bit_out, levels1
+            "  phased-output-format: {} bit, {}-compatible packed order, level={:?}",
+            bit_out, a1_name, levels1
         );
+        println!("  shuffle-out: {}={:?}", phased_name, sh1_ext);
         println!(
             "  phased-diagnostics: {}",
             if args.phased_diagnostics {
@@ -6857,7 +6864,7 @@ fn run_once(
             writeln!(
                 meta,
                 "shuffle_external={}",
-                DEFAULT_SHUFFLE_IN
+                sh1_ext
                     .iter()
                     .map(|v| v.to_string())
                     .collect::<Vec<_>>()

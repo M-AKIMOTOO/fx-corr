@@ -212,8 +212,9 @@ For process 2+ logs:
 
 The raw file is first written as `.raw.part`, size-checked, and renamed to
 `.raw` only after successful completion. The output uses antenna 1's bit
-depth and level map, canonical little-endian packed ordering, and USB
-sideband. Absolute SEFD/gain weights are voltage-normalized before
+depth, level map, and physical shuffle ordering so it can be read directly
+by the same VSREC tools as the input, and uses USB sideband. Absolute
+SEFD/gain weights are voltage-normalized before
 requantization so that their ratio is retained without collapsing the output
 quantizer occupancy.
 
@@ -2097,6 +2098,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.2.1` | Fixed `yi-phasedarray` raw output to inherit antenna 1 physical shuffle ordering, so VSREC readers receive the same packed bit layout as the input instead of canonical internal ordering. |
 | `3.2.0` | Optimized normal `yi-corr` ACF/XCF processing with direct contiguous FFT-bin accumulation for eligible grid mappings, added `--usb` concurrent per-antenna input readers for USB-attached storage, and added non-mutating `--model-diagnostics` plus the five-case `--model-sweep`; signal sideband, delay, fringe, and time models are unchanged from `3.1.x`. |
 | `3.1.17` | Added optional `YI_READER_CORE` pinning for yi-corr input reader threads so one CPU can be reserved for RAID/input transfer control experiments. |
 | `3.1.16` | Fused the normal `yi-corr` overlap ACF/XCF accumulation loop so the common full-overlap path reads each FFT bin once during correlation accumulation. |

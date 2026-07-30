@@ -20,8 +20,8 @@ fn write_schedule(path: &Path, station1: &str, station2: &str) {
   <clock key="A"><delay>0</delay><rate>0</rate></clock>
   <clock key="B"><delay>0</delay><rate>0</rate></clock>
   <terminal name="term"><speed>8192</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,0.5,1.5</level></terminal>
-  <shuffle key="A">31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0</shuffle>
-  <shuffle key="B">31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0</shuffle>
+  <shuffle key="A">24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7</shuffle>
+  <shuffle key="B">24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7</shuffle>
   <source name="TARGET"><ra>00h00m00.0</ra><dec>+00d00'00.0</dec></source>
   <stream>
     <frequency>100000000</frequency><fft>128</fft><output>8</output>
@@ -94,6 +94,9 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("bit=2"));
     assert!(meta.contains("sideband=USB"));
+    assert!(meta.contains(
+        "shuffle_external=24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7"
+    ));
 
     let corr_schedule = root.join("corr.xml");
     write_schedule(&corr_schedule, "ARRAY", "ANT1");
