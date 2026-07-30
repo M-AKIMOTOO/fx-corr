@@ -432,6 +432,42 @@ mod correlation_hot_path_tests {
         quantise_frame(&internal_usb, 2, &levels, &vsrec, &mut restored).unwrap();
         assert_eq!(restored, packed);
     }
+
+    #[test]
+    fn native_word_aligned_seek_preserves_vsrec_sample_order() {
+        let levels = vec![-1.5, -0.5, 0.5, 1.5];
+        let vsrec = parse_shuffle(
+            "24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7",
+        )
+        .unwrap();
+        let samples = (0..64)
+            .map(|i| levels[(i * 3 + i / 7) % levels.len()] as f32)
+            .collect::<Vec<_>>();
+        let mut packed = Vec::new();
+        quantise_frame(&samples, 2, &levels, &vsrec, &mut packed).unwrap();
+
+        let plan = build_decode_plan(2, &vsrec, &levels).unwrap();
+        let mut decoded = vec![0.0_f32; 32];
+        let mut scratch = DecodeWindowScratch::new();
+        // Requested sample 13 is represented by a native-word read at sample
+        // zero plus an integer delay shift. No physical bitstream repacking is
+        // allowed before the VSREC word shuffle.
+        decode_shifted_frame_from_chunk(
+            &packed[..12],
+            0,
+            0,
+            32,
+            2,
+            16,
+            &plan,
+            false,
+            -13,
+            &mut decoded,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(decoded, samples[13..45]);
+    }
 }
 
 #[inline]
@@ -3994,12 +4030,15 @@ fn run_once(
     if samples_per_word1 == 0 || samples_per_word2 == 0 {
         return Err("invalid samples-per-word while decoding input".into());
     }
-    // Seek at the exact sample requested by the delay model.
-    // PackedSampleReader accepts bit offsets, so 32-bit word alignment is not needed here.
-    let start_s1_actual_samples = start_s1_samples;
-    let start_s2_actual_samples = start_s2_samples;
-    let start_s1_residual_samples = 0_i64;
-    let start_s2_residual_samples = 0_i64;
+    // VSREC shuffle is defined on the original physical 32-bit word boundary.
+    // Never bit-shift/repack the physical stream before applying that shuffle:
+    // doing so redefines the word boundary and creates four spectral images.
+    // Read from the preceding native word and leave the remaining sample
+    // displacement to the normal integer/fractional delay correction.
+    let start_s1_actual_samples = start_s1_samples / samples_per_word1 * samples_per_word1;
+    let start_s2_actual_samples = start_s2_samples / samples_per_word2 * samples_per_word2;
+    let start_s1_residual_samples = start_s1_samples as i128 - start_s1_actual_samples as i128;
+    let start_s2_residual_samples = start_s2_samples as i128 - start_s2_actual_samples as i128;
     let start_s1_bits = sample_to_total_bits(start_s1_actual_samples, bit1)?;
     let start_s2_bits = sample_to_total_bits(start_s2_actual_samples, bit2)?;
     let start_s1_byte = start_s1_bits / 8;
@@ -4007,11 +4046,11 @@ fn run_once(
     let start_s1_bit = (start_s1_bits % 8) as u8;
     let start_s2_bit = (start_s2_bits % 8) as u8;
     println!(
-        "[info] Input start ant1: desired sample {} -> byte {} + bit {} (actual sample {}, residual {} sample)",
+        "[info] Input start ant1: desired sample {} -> native word byte {} + bit {} (actual sample {}, delay residual {} sample)",
         start_s1_samples, start_s1_byte, start_s1_bit, start_s1_actual_samples, start_s1_residual_samples
     );
     println!(
-        "[info] Input start ant2: desired sample {} -> byte {} + bit {} (actual sample {}, residual {} sample)",
+        "[info] Input start ant2: desired sample {} -> native word byte {} + bit {} (actual sample {}, delay residual {} sample)",
         start_s2_samples, start_s2_byte, start_s2_bit, start_s2_actual_samples, start_s2_residual_samples
     );
     if start_s1_residual_samples != 0 || start_s2_residual_samples != 0 {
@@ -5520,14 +5559,21 @@ fn run_once(
             let logical_s1 = sector_s1 as u64;
             let logical_s2 = sector_s2 as u64;
 
-            let read_s1 = logical_s1;
-            let read_s2 = logical_s2;
+            // Preserve the native 32-bit shuffle boundary for every adaptive
+            // sector as well. The delay model uses the actual aligned read
+            // separation below, so the discarded prefix remains corrected.
+            let read_s1 = logical_s1 / samples_per_word1 * samples_per_word1;
+            let read_s2 = logical_s2 / samples_per_word2 * samples_per_word2;
             let payload_samples = nf as u64 * fft_len as u64;
-            let read_n1 = payload_samples;
-            let read_n2 = payload_samples;
+            // One trailing native word supplies the positive look-ahead used
+            // when the residual integer delay selects samples after the
+            // aligned read origin, including the final frame of a sector.
+            let read_n1 = payload_samples + samples_per_word1;
+            let read_n2 = payload_samples + samples_per_word2;
             sector_read_starts.push((read_s1, read_s2));
             sector_read_sample_counts.push((read_n1, read_n2));
-            sector_d_seeks.push(sector_d_seek_samples as f64 / fs);
+            let actual_sector_d_seek_samples = read_s2 as i128 - read_s1 as i128;
+            sector_d_seeks.push(actual_sector_d_seek_samples as f64 / fs);
             sector_start_frame += nf;
         }
         let sector_read_starts_rd = sector_read_starts.clone();

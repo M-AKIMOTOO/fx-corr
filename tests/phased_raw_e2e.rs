@@ -84,6 +84,16 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
     let phased_raw = phased_dir.join(format!("ARRAY_{tag}.raw"));
     let phased_meta = phased_dir.join(format!("ARRAY_{tag}.raw.meta"));
     assert_eq!(fs::metadata(&phased_raw).unwrap().len(), 2048);
+    let phased_bytes = fs::read(&phased_raw).unwrap();
+    let mismatches = phased_bytes
+        .iter()
+        .zip(raw.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        mismatches <= 32,
+        "native VSREC/LSB packed order changed across the phased round trip: {mismatches} mismatched bytes"
+    );
     assert!(phased_meta.is_file());
     assert!(!phased_dir.join(format!("ARRAY_{tag}.raw.part")).exists());
     assert!(!phased_dir
@@ -91,7 +101,7 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
-    assert!(meta.contains("software_version=3.2.2"));
+    assert!(meta.contains("software_version=3.2.3"));
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));

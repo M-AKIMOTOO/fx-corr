@@ -2107,6 +2107,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.2.3` | Preserved the original physical 32-bit VSREC word boundary during non-word-aligned delay seeks. The reader now starts at a preceding native word and leaves the remaining samples to FX integer/fractional delay correction, preventing the four spectral images caused by shuffle-after-bit-repack. |
 | `3.2.2` | Fixed `yi-phasedarray` to restore the native sideband and the complete packed-data format bundle of the selected output-grid antenna. In particular, LSB input is converted back from the internal USB processing domain before requantization. |
 | `3.2.1` | Fixed `yi-phasedarray` raw output to inherit antenna 1 physical shuffle ordering, so VSREC readers receive the same packed bit layout as the input instead of canonical internal ordering. |
 | `3.2.0` | Optimized normal `yi-corr` ACF/XCF processing with direct contiguous FFT-bin accumulation for eligible grid mappings, added `--usb` concurrent per-antenna input readers for USB-attached storage, and added non-mutating `--model-diagnostics` plus the five-case `--model-sweep`; signal sideband, delay, fringe, and time models are unchanged from `3.1.x`. |
