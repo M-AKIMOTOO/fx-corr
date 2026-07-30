@@ -25,8 +25,8 @@ fn write_schedule(path: &Path, station1: &str, station2: &str) {
   <source name="TARGET"><ra>00h00m00.0</ra><dec>+00d00'00.0</dec></source>
   <stream>
     <frequency>100000000</frequency><fft>128</fft><output>8</output>
-    <special key="A"><rotation>0</rotation><sideband>USB</sideband></special>
-    <special key="B"><rotation>0</rotation><sideband>USB</sideband></special>
+    <special key="A"><rotation>0</rotation><sideband>LSB</sideband></special>
+    <special key="B"><rotation>0</rotation><sideband>LSB</sideband></special>
   </stream>
   <process><epoch>2000/001 00:00:00</epoch><length>1</length><object>TARGET</object><stations>AB</stations><baseline>AB</baseline></process>
 </schedule>
@@ -91,9 +91,12 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
+    assert!(meta.contains("software_version=3.2.2"));
     assert!(meta.contains("virtual_station=ARRAY"));
+    assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));
-    assert!(meta.contains("sideband=USB"));
+    assert!(meta.contains("sideband=LSB"));
+    assert!(meta.contains("rotation_hz=0.000000000"));
     assert!(meta.contains(
         "shuffle_external=24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7"
     ));

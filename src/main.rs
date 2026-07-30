@@ -411,6 +411,26 @@ mod correlation_hot_path_tests {
         decode_block_into_with_plan(&packed, samples.len(), &plan, &mut decoded, false, false)
             .unwrap();
         assert_eq!(decoded, samples);
+
+        // LSB input is normalized to USB internally by negating odd samples.
+        // Applying the same involution before output packing must reproduce
+        // the original native VSREC bytes exactly.
+        let mut internal_usb = vec![0.0_f32; samples.len()];
+        decode_block_into_with_plan(
+            &packed,
+            samples.len(),
+            &plan,
+            &mut internal_usb,
+            true,
+            false,
+        )
+        .unwrap();
+        for odd in internal_usb.iter_mut().skip(1).step_by(2) {
+            *odd = -*odd;
+        }
+        let mut restored = Vec::new();
+        quantise_frame(&internal_usb, 2, &levels, &vsrec, &mut restored).unwrap();
+        assert_eq!(restored, packed);
     }
 }
 
@@ -2613,10 +2633,6 @@ fn run_once(
         resolve_per_antenna_config_with_defaults(&bit_a, bit1_def, bit2_def, |s: &str| {
             Ok(s.parse()?)
         })?;
-    // The virtual station uses antenna 1's quantizer format. Both inputs have
-    // already been decoded to voltage samples, so their input bit depths may
-    // differ without making the output format ambiguous.
-    let bit_out = bit1;
     let level_src = args.level.clone();
     let level_args = normalize_level_args(&level_src, bit1, bit2)?;
     let lv1_def = if_d
@@ -2687,8 +2703,6 @@ fn run_once(
     let (lsb1_raw, lsb2_raw) = (sb1_s.as_str() == "LSB", sb2_s.as_str() == "LSB");
     let lsb1 = ant_lsb_override(lsb1_raw, "YI_ANT1_LSB_TO_USB");
     let lsb2 = ant_lsb_override(lsb2_raw, "YI_ANT2_LSB_TO_USB");
-    let output_lsb = false;
-
     let (tsys1, tsys2) = resolve_per_antenna_config(&args.tsys, 1.0, |s| Ok(s.parse()?))?;
     let (dia1, dia2) = resolve_per_antenna_config(&args.diameter, 0.0, |s| Ok(s.parse()?))?;
     let (eta1, eta2) = resolve_per_antenna_config(&args.eta, 0.65, |s| Ok(s.parse()?))?;
@@ -3199,6 +3213,41 @@ fn run_once(
     } else {
         OutputGrid::Ant2
     };
+    // The phased raw is returned to the native packed-data representation of
+    // the selected output-grid antenna. Bit depth, levels, shuffle, sideband,
+    // and rotation are one format bundle and must not be mixed between
+    // stations.
+    let (
+        bit_out,
+        levels_out,
+        level_power_out,
+        output_shuffle,
+        output_shuffle_ext,
+        output_sideband,
+        output_lsb_restore,
+        output_rotation_hz,
+    ) = match out_grid {
+        OutputGrid::Ant1 => (
+            bit1,
+            Arc::clone(&levels1),
+            level_power1,
+            sh1.as_ref().clone(),
+            sh1_ext.clone(),
+            sb1_s.clone(),
+            lsb1,
+            rot1,
+        ),
+        OutputGrid::Ant2 => (
+            bit2,
+            Arc::clone(&levels2),
+            level_power2,
+            sh2.as_ref().clone(),
+            sh2_ext.clone(),
+            sb2_s.clone(),
+            lsb2,
+            rot2,
+        ),
+    };
 
     let bpf1 = (fft_len * bit1 + 7) / 8;
     let bpf2 = (fft_len * bit2 + 7) / 8;
@@ -3437,21 +3486,15 @@ fn run_once(
         "A2",
     )?;
     // Absolute SEFD weights can be very small. Normalize their common scale so
-    // independent receiver noise occupies the same quantizer power as antenna
-    // 1 while preserving the scientifically meaningful weight ratio.
+    // independent receiver noise occupies the output quantizer power while
+    // preserving the scientifically meaningful weight ratio.
     let (w1, w2, beam_voltage_scale) = normalized_beam_weights(
         weight1_raw,
         weight2_raw,
         level_power1,
         level_power2,
-        level_power1,
+        level_power_out,
     )?;
-    // Repack the virtual station with the physical bit ordering of antenna 1.
-    // This makes the output directly compatible with VSREC readers that use
-    // the station shuffle convention instead of consulting sidecar metadata.
-    // sh1 is the canonical-bit -> physical-bit map required by the encoder,
-    // and therefore performs the inverse operation of decoding the same map.
-    let output_shuffle = sh1.as_ref().clone();
     let a1_name = if_d
         .as_ref()
         .and_then(|d| d.ant1_station_name.as_deref())
@@ -3460,6 +3503,10 @@ fn run_once(
         .as_ref()
         .and_then(|d| d.ant2_station_name.as_deref())
         .unwrap_or("YAMAGU34");
+    let output_format_name = match out_grid {
+        OutputGrid::Ant1 => a1_name,
+        OutputGrid::Ant2 => a2_name,
+    };
     let phased_name = sanitize_file_token(&args.phased_name);
     let a1_key_opt = if_d.as_ref().and_then(|d| d.ant1_station_key.as_deref());
     let a2_key_opt = if_d.as_ref().and_then(|d| d.ant2_station_key.as_deref());
@@ -3799,15 +3846,23 @@ fn run_once(
             if lsb2 { "LSB->USB" } else { "USB" }
         );
         println!(
-            "  sideband-output: {} ({} raw)",
-            if output_lsb { "LSB" } else { "USB" },
-            phased_name
+            "  sideband-output: {} ({} raw; inverse normalization={})",
+            output_sideband,
+            phased_name,
+            if output_lsb_restore {
+                "odd-sample sign restore"
+            } else {
+                "none"
+            }
         );
         println!(
             "  phased-output-format: {} bit, {}-compatible packed order, level={:?}",
-            bit_out, a1_name, levels1
+            bit_out, output_format_name, levels_out
         );
-        println!("  shuffle-out: {}={:?}", phased_name, sh1_ext);
+        println!(
+            "  shuffle-out: {}={:?} (from {})",
+            phased_name, output_shuffle_ext, output_format_name
+        );
         println!(
             "  phased-diagnostics: {}",
             if args.phased_diagnostics {
@@ -5960,7 +6015,7 @@ fn run_once(
                                         sector_failures.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    if output_lsb {
+                                    if output_lsb_restore {
                                         for odd in out_t.iter_mut().skip(1).step_by(2) {
                                             *odd = -*odd;
                                         }
@@ -5969,7 +6024,7 @@ fn run_once(
                                     if quantise_frame(
                                         &out_t,
                                         bit_out,
-                                        &levels1,
+                                        &levels_out,
                                         &output_shuffle,
                                         &mut tmp_enc,
                                     )
@@ -6040,7 +6095,7 @@ fn run_once(
                                         sector_failures.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    if output_lsb {
+                                    if output_lsb_restore {
                                         for odd in out_t.iter_mut().skip(1).step_by(2) {
                                             *odd = -*odd;
                                         }
@@ -6049,7 +6104,7 @@ fn run_once(
                                     if quantise_frame(
                                         &out_t,
                                         bit_out,
-                                        &levels1,
+                                        &levels_out,
                                         &output_shuffle,
                                         &mut tmp_enc,
                                     )
@@ -6837,12 +6892,14 @@ fn run_once(
             let meta_path = o_path.with_extension("raw.meta");
             let mut meta = BufWriter::new(File::create(&meta_path)?);
             writeln!(meta, "format=yi-phasedarray-raw-v1")?;
+            writeln!(meta, "software_version={}", env!("CARGO_PKG_VERSION"))?;
             writeln!(meta, "virtual_station={}", phased_name)?;
             writeln!(meta, "raw_file={}", o_path.display())?;
             writeln!(meta, "epoch_utc={}", ep_i)?;
             writeln!(meta, "output_tag={}", c_tag)?;
             writeln!(meta, "source={}", source_name)?;
             writeln!(meta, "reference_station={}", phased_reference_name)?;
+            writeln!(meta, "native_format_station={}", output_format_name)?;
             writeln!(
                 meta,
                 "reference_ecef_m={:.9},{:.9},{:.9}",
@@ -6850,12 +6907,13 @@ fn run_once(
             )?;
             writeln!(meta, "sampling_hz={:.9}", fs)?;
             writeln!(meta, "observing_frequency_mhz={:.9}", obs_mhz)?;
-            writeln!(meta, "sideband=USB")?;
+            writeln!(meta, "rotation_hz={:.9}", output_rotation_hz)?;
+            writeln!(meta, "sideband={}", output_sideband)?;
             writeln!(meta, "bit={}", bit_out)?;
             writeln!(
                 meta,
                 "level={}",
-                levels1
+                levels_out
                     .iter()
                     .map(|v| v.to_string())
                     .collect::<Vec<_>>()
@@ -6864,7 +6922,7 @@ fn run_once(
             writeln!(
                 meta,
                 "shuffle_external={}",
-                sh1_ext
+                output_shuffle_ext
                     .iter()
                     .map(|v| v.to_string())
                     .collect::<Vec<_>>()

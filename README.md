@@ -126,6 +126,14 @@ The generated raw stream can be used as a virtual station in a later yi-corr
 run. Use `--phased-name NAME` to change its station/file name. The default is
 `YAMAGU66`.
 
+For VSREC LSB input, inspect the generated stream with the same native decode
+parameters as the original antenna data. `vdif2spec` does not read the sidecar
+metadata automatically, so use for example:
+
+```bash
+vdif2spec --vdif YAMAGU66_<TAG>.raw --vsrec --sideband LSB
+```
+
 ## How input files are resolved
 
 By default, input raw files are auto-resolved from:
@@ -211,10 +219,11 @@ For process 2+ logs:
 - `YAMAGU66_<TAG>.raw.meta` (virtual-station reference and packed-data format)
 
 The raw file is first written as `.raw.part`, size-checked, and renamed to
-`.raw` only after successful completion. The output uses antenna 1's bit
-depth, level map, and physical shuffle ordering so it can be read directly
-by the same VSREC tools as the input, and uses USB sideband. Absolute
-SEFD/gain weights are voltage-normalized before
+`.raw` only after successful completion. The output restores the bit depth,
+level map, physical shuffle ordering, sideband, and rotation metadata of the
+antenna selected as the output frequency grid, so it can be read directly by
+the same VSREC tools as the input. Absolute SEFD/gain weights are
+voltage-normalized before
 requantization so that their ratio is retained without collapsing the output
 quantizer occupancy.
 
@@ -2098,6 +2107,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.2.2` | Fixed `yi-phasedarray` to restore the native sideband and the complete packed-data format bundle of the selected output-grid antenna. In particular, LSB input is converted back from the internal USB processing domain before requantization. |
 | `3.2.1` | Fixed `yi-phasedarray` raw output to inherit antenna 1 physical shuffle ordering, so VSREC readers receive the same packed bit layout as the input instead of canonical internal ordering. |
 | `3.2.0` | Optimized normal `yi-corr` ACF/XCF processing with direct contiguous FFT-bin accumulation for eligible grid mappings, added `--usb` concurrent per-antenna input readers for USB-attached storage, and added non-mutating `--model-diagnostics` plus the five-case `--model-sweep`; signal sideband, delay, fringe, and time models are unchanged from `3.1.x`. |
 | `3.1.17` | Added optional `YI_READER_CORE` pinning for yi-corr input reader threads so one CPU can be reserved for RAID/input transfer control experiments. |
