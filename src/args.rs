@@ -60,6 +60,21 @@ pub struct Args {
     )]
     pub cor_directory: Option<PathBuf>,
 
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "YAMAGU66",
+        help = "Virtual-station name used by yi-phasedarray output"
+    )]
+    pub phased_name: String,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Also write phased autocorrelation .cor and diagnostic plots"
+    )]
+    pub phased_diagnostics: bool,
+
     // Correlation processing parameters
     #[arg(
         long,
@@ -447,17 +462,17 @@ pub fn resolve_weight(
     eta: f64,
     label: &str,
 ) -> Result<(f64, f64, Option<f64>, Option<f64>), DynError> {
-    if tsys == 0.0 {
-        return Err(format!("{label} Tsys must be non-zero").into());
+    if !tsys.is_finite() || tsys <= 0.0 {
+        return Err(format!("{label} Tsys must be positive and finite").into());
     }
     if let Some(sefd_v) = sefd {
-        if sefd_v <= 0.0 {
+        if !sefd_v.is_finite() || sefd_v <= 0.0 {
             return Err(format!("{label} SEFD must be positive").into());
         }
         let w = 1.0 / sefd_v;
         Ok((w, tsys * w, Some(sefd_v), None))
     } else if let Some(dia_v) = diameter {
-        if dia_v <= 0.0 || eta <= 0.0 {
+        if !dia_v.is_finite() || !eta.is_finite() || dia_v <= 0.0 || eta <= 0.0 {
             return Err(format!("{label} diameter/eta must be positive").into());
         }
         let geom_area = PI * (dia_v / 2.0).powi(2);
@@ -467,7 +482,7 @@ pub fn resolve_weight(
         let w = 1.0 / sefd_jy;
         Ok((w, tsys * w, Some(sefd_jy), Some(eff_area)))
     } else {
-        if gain <= 0.0 {
+        if !gain.is_finite() || gain <= 0.0 {
             return Err(format!("{label} gain must be positive").into());
         }
         Ok((gain / tsys, gain, None, None))
@@ -476,7 +491,7 @@ pub fn resolve_weight(
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{resolve_weight, Args};
     use clap::Parser;
 
     #[test]
@@ -515,5 +530,30 @@ mod tests {
 
         let sweep = Args::try_parse_from(["yi-corr", "--mkxml", "--model-sweep"]).unwrap();
         assert!(sweep.model_sweep);
+    }
+
+    #[test]
+    fn phased_output_options_have_safe_defaults() {
+        let args = Args::try_parse_from(["yi-phasedarray", "--mkxml"]).unwrap();
+        assert_eq!(args.phased_name, "YAMAGU66");
+        assert!(!args.phased_diagnostics);
+
+        let args = Args::try_parse_from([
+            "yi-phasedarray",
+            "--mkxml",
+            "--phased-name",
+            "ARRAY1",
+            "--phased-diagnostics",
+        ])
+        .unwrap();
+        assert_eq!(args.phased_name, "ARRAY1");
+        assert!(args.phased_diagnostics);
+    }
+
+    #[test]
+    fn phased_weights_reject_nonphysical_inputs() {
+        assert!(resolve_weight(0.0, 1.0, None, None, 0.65, "A1").is_err());
+        assert!(resolve_weight(-1.0, 1.0, None, None, 0.65, "A1").is_err());
+        assert!(resolve_weight(100.0, f64::NAN, None, None, 0.65, "A1").is_err());
     }
 }

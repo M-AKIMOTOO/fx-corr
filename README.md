@@ -103,12 +103,28 @@ target/release/yi-corr \
   --cor test/
 ```
 
-### 3) Run phased-array synthesis
+### 3) Create a virtual-telescope raw stream
 
 ```bash
-# Phased-array (writes outputs to current directory)
-target/release/yi-phasedarray --sc test.xml --raw raw
+target/release/yi-phasedarray \
+  --sc test.xml \
+  --raw raw \
+  --output phased
 ```
+
+`yi-phasedarray` shares yi-corr's raw decode, sideband normalization,
+integer/fractional delay, fringe phase, and XML-frequency-grid processing.
+After that common stage, yi-corr forms and integrates `X1 * conj(X2)`, while
+yi-phasedarray coherently adds the corrected voltages, performs the inverse
+FFT, requantizes them, and writes a new raw stream:
+
+```text
+corrected_voltage = normalized(w1 * X1 + w2 * X2)
+```
+
+The generated raw stream can be used as a virtual station in a later yi-corr
+run. Use `--phased-name NAME` to change its station/file name. The default is
+`YAMAGU66`.
 
 ## How input files are resolved
 
@@ -192,10 +208,24 @@ For process 2+ logs:
 ### yi-phasedarray
 
 - `YAMAGU66_<TAG>.raw` (phased time-series)
+- `YAMAGU66_<TAG>.raw.meta` (virtual-station reference and packed-data format)
+
+The raw file is first written as `.raw.part`, size-checked, and renamed to
+`.raw` only after successful completion. The output uses antenna 1's bit
+depth and level map, canonical little-endian packed ordering, and USB
+sideband. Absolute SEFD/gain weights are voltage-normalized before
+requantization so that their ratio is retained without collapsing the output
+quantizer occupancy.
+
+Optional `--phased-diagnostics` also writes:
+
 - `YAMAGU66_YAMAGU66_<TAG>_phasedarray.cor`
 - `YAMAGU66_<TAG>_phased_auto_spectrum.png`
 - `YAMAGU66_<TAG>_phased_spectrum_amplitude.png`
 - `YAMAGU66_<TAG>_phased_autocorrelation.png`
+
+`--output DIR` selects the destination directory. If omitted,
+yi-phasedarray writes to the current directory.
 
 ### In-band `.cor` splitting
 

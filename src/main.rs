@@ -377,6 +377,38 @@ mod correlation_hot_path_tests {
         assert_eq!(direct12, mapped12);
         assert_eq!(direct22, mapped22);
     }
+
+    #[test]
+    fn beam_weights_preserve_ratio_and_output_noise_power() {
+        let (w1, w2, scale) = normalized_beam_weights(2.0, 1.0, 1.25, 1.25, 1.25).unwrap();
+        assert!((w1 / w2 - 2.0).abs() < 1.0e-12);
+        assert!(scale > 0.0);
+        let power = w1 * w1 * 1.25 + w2 * w2 * 1.25;
+        assert!((power - 1.25).abs() < 1.0e-12);
+
+        let (tiny1, tiny2, _) = normalized_beam_weights(2.0e-6, 1.0e-6, 1.25, 1.25, 1.25).unwrap();
+        assert!((tiny1 - w1).abs() < 1.0e-12);
+        assert!((tiny2 - w2).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn canonical_phased_raw_round_trips_through_decoder() {
+        let levels = vec![-1.5, -0.5, 0.5, 1.5];
+        let samples = vec![
+            -1.5_f32, -0.5, 0.5, 1.5, 1.5, 0.5, -0.5, -1.5, -1.5, 0.5, -0.5, 1.5, 0.5, -1.5, 1.5,
+            -0.5,
+        ];
+        let identity = (0usize..32).collect::<Vec<_>>();
+        let mut packed = Vec::new();
+        quantise_frame(&samples, 2, &levels, &identity, &mut packed).unwrap();
+        assert_eq!(packed.len(), 4);
+
+        let plan = build_decode_plan(2, &identity, &levels).unwrap();
+        let mut decoded = vec![0.0_f32; samples.len()];
+        decode_block_into_with_plan(&packed, samples.len(), &plan, &mut decoded, false, false)
+            .unwrap();
+        assert_eq!(decoded, samples);
+    }
 }
 
 #[inline]
@@ -1390,6 +1422,34 @@ fn quantization_mean_power(levels: &[f64], label: &str) -> Result<f64, DynError>
     Ok(p)
 }
 
+fn normalized_beam_weights(
+    weight1: f64,
+    weight2: f64,
+    input_power1: f64,
+    input_power2: f64,
+    output_power: f64,
+) -> Result<(f64, f64, f64), DynError> {
+    if !weight1.is_finite() || !weight2.is_finite() || weight1 <= 0.0 || weight2 <= 0.0 {
+        return Err("phased-array weights must be positive finite values".into());
+    }
+    if !input_power1.is_finite()
+        || !input_power2.is_finite()
+        || !output_power.is_finite()
+        || input_power1 <= 0.0
+        || input_power2 <= 0.0
+        || output_power <= 0.0
+    {
+        return Err("phased-array quantizer powers must be positive finite values".into());
+    }
+    let unscaled_power = weight1 * weight1 * input_power1 + weight2 * weight2 * input_power2;
+    let voltage_scale = (output_power / unscaled_power).sqrt();
+    Ok((
+        weight1 * voltage_scale,
+        weight2 * voltage_scale,
+        voltage_scale,
+    ))
+}
+
 fn normalize_level_args(
     level_args: &[String],
     bit1: usize,
@@ -1788,9 +1848,15 @@ fn resolve_output_layout(
     tag: &str,
     run_mode: RunMode,
 ) -> Result<(PathBuf, PathBuf), DynError> {
-    let stem = format!("YAMAGU66_{tag}");
+    let phased_name = sanitize_file_token(&args.phased_name);
+    let stem = format!("{phased_name}_{tag}");
     let dir = if matches!(run_mode, RunMode::PhasedArray) {
-        std::env::current_dir()?
+        let d = args
+            .cor_directory
+            .clone()
+            .unwrap_or(std::env::current_dir()?);
+        std::fs::create_dir_all(&d)?;
+        d
     } else {
         let d = args
             .cor_directory
@@ -2487,8 +2553,8 @@ fn run_once(
     let write_raw = matches!(run_mode, RunMode::PhasedArray);
     let write_acf_cor = matches!(run_mode, RunMode::Corr);
     let write_xcf_cor = matches!(run_mode, RunMode::Corr);
-    let write_phased_cor = matches!(run_mode, RunMode::PhasedArray);
-    let plot_phased = matches!(run_mode, RunMode::PhasedArray);
+    let write_phased_cor = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
+    let plot_phased = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
     let if_d = if let Some(p) = &args.schedule {
         let is_xml = p
             .extension()
@@ -2544,7 +2610,10 @@ fn run_once(
         resolve_per_antenna_config_with_defaults(&bit_a, bit1_def, bit2_def, |s: &str| {
             Ok(s.parse()?)
         })?;
-    let bit_out = bit1.max(bit2);
+    // The virtual station uses antenna 1's quantizer format. Both inputs have
+    // already been decoded to voltage samples, so their input bit depths may
+    // differ without making the output format ambiguous.
+    let bit_out = bit1;
     let level_src = args.level.clone();
     let level_args = normalize_level_args(&level_src, bit1, bit2)?;
     let lv1_def = if_d
@@ -3348,7 +3417,7 @@ fn run_once(
     // Keep only complete FFT frames.
     let total_f = complete_fft_frame_count(total_sec, fs, fft_len);
 
-    let (w1, _, _, _) = resolve_weight(
+    let (weight1_raw, _, _, _) = resolve_weight(
         tsys1,
         gain1,
         if sefd1 > 0.0 { Some(sefd1) } else { None },
@@ -3356,7 +3425,7 @@ fn run_once(
         eta1,
         "A1",
     )?;
-    let (w2, _, _, _) = resolve_weight(
+    let (weight2_raw, _, _, _) = resolve_weight(
         tsys2,
         gain2,
         if sefd2 > 0.0 { Some(sefd2) } else { None },
@@ -3364,6 +3433,19 @@ fn run_once(
         eta2,
         "A2",
     )?;
+    // Absolute SEFD weights can be very small. Normalize their common scale so
+    // independent receiver noise occupies the same quantizer power as antenna
+    // 1 while preserving the scientifically meaningful weight ratio.
+    let (w1, w2, beam_voltage_scale) = normalized_beam_weights(
+        weight1_raw,
+        weight2_raw,
+        level_power1,
+        level_power2,
+        level_power1,
+    )?;
+    // Output is always canonical little-endian packed samples. The default XML
+    // shuffle (31..0 externally) decodes this identity representation.
+    let output_shuffle = (0usize..32).collect::<Vec<_>>();
     let a1_name = if_d
         .as_ref()
         .and_then(|d| d.ant1_station_name.as_deref())
@@ -3372,6 +3454,7 @@ fn run_once(
         .as_ref()
         .and_then(|d| d.ant2_station_name.as_deref())
         .unwrap_or("YAMAGU34");
+    let phased_name = sanitize_file_token(&args.phased_name);
     let a1_key_opt = if_d.as_ref().and_then(|d| d.ant1_station_key.as_deref());
     let a2_key_opt = if_d.as_ref().and_then(|d| d.ant2_station_key.as_deref());
     let a1_key = a1_key_opt.unwrap_or("-");
@@ -3710,8 +3793,21 @@ fn run_once(
             if lsb2 { "LSB->USB" } else { "USB" }
         );
         println!(
-            "  sideband-output: {} (YAMAGU66 raw)",
-            if output_lsb { "LSB" } else { "USB" }
+            "  sideband-output: {} ({} raw)",
+            if output_lsb { "LSB" } else { "USB" },
+            phased_name
+        );
+        println!(
+            "  phased-output-format: {} bit, canonical packed order, level={:?}",
+            bit_out, levels1
+        );
+        println!(
+            "  phased-diagnostics: {}",
+            if args.phased_diagnostics {
+                "enabled"
+            } else {
+                "disabled (raw only)"
+            }
         );
         println!("  obs-band:   {:.3} .. {:.3} MHz", obs_mhz, obs_mhz + bw);
     }
@@ -3789,8 +3885,12 @@ fn run_once(
                 gain1, a1_name, gain2, a2_name
             );
             println!(
-                "  weight:     {:.6} ({}), {:.6} ({})",
-                w1, a1_name, w2, a2_name
+                "  weight-raw: {:.9e} ({}), {:.9e} ({})",
+                weight1_raw, a1_name, weight2_raw, a2_name
+            );
+            println!(
+                "  weight-effective: {:.9e} ({}), {:.9e} ({}) voltage-scale={:.9e}",
+                w1, a1_name, w2, a2_name, beam_voltage_scale
             );
             println!("  results:    {}", o_dir.display());
             println!("  output:     {}", o_path.display());
@@ -4846,8 +4946,9 @@ fn run_once(
         } else {
             println!("[info] Integrating correlation sectors...");
         }
+        let raw_partial_path = o_path.with_extension("raw.part");
         let mut wr: Option<BufWriter<File>> = if write_raw {
-            Some(BufWriter::new(File::create(&o_path)?))
+            Some(BufWriter::new(File::create(&raw_partial_path)?))
         } else {
             None
         };
@@ -5154,19 +5255,25 @@ fn run_once(
             }
             Ok(writers)
         };
+        let (phased_reference_name, phased_reference_ecef) = if residual_on_ant2 {
+            (a1_name, ant1_ecef)
+        } else {
+            (a2_name, ant2_ecef)
+        };
+        let phased_code = phased_name.as_bytes().first().copied().unwrap_or(b'M');
         let mut cw_ph = create_cor_writers(
             write_phased_cor,
-            "YAMAGU66",
-            "YAMAGU66",
+            &phased_name,
+            &phased_name,
             CorStation {
-                name: "YAMAGU66",
-                code: b'M',
-                ecef_m: ant1_ecef,
+                name: &phased_name,
+                code: phased_code,
+                ecef_m: phased_reference_ecef,
             },
             CorStation {
-                name: "YAMAGU66",
-                code: b'M',
-                ecef_m: ant1_ecef,
+                name: &phased_name,
+                code: phased_code,
+                ecef_m: phased_reference_ecef,
             },
         )?;
         let mut cw_11 = create_cor_writers(
@@ -5856,7 +5963,7 @@ fn run_once(
                                         &out_t,
                                         bit_out,
                                         &levels1,
-                                        sh1.as_ref(),
+                                        &output_shuffle,
                                         &mut tmp_enc,
                                     )
                                     .is_err()
@@ -5936,7 +6043,7 @@ fn run_once(
                                         &out_t,
                                         bit_out,
                                         &levels1,
-                                        sh1.as_ref(),
+                                        &output_shuffle,
                                         &mut tmp_enc,
                                     )
                                     .is_err()
@@ -6703,8 +6810,75 @@ fn run_once(
                 );
             }
         }
-        if let Some(w) = wr.as_mut() {
+        if let Some(mut w) = wr.take() {
             w.flush()?;
+            drop(w);
+            let expected_raw_bytes = total_f
+                .checked_mul(bpf_o)
+                .ok_or("phased raw byte count overflow")?
+                as u64;
+            let actual_raw_bytes = std::fs::metadata(&raw_partial_path)?.len();
+            if actual_raw_bytes != expected_raw_bytes {
+                return Err(format!(
+                    "phased raw size mismatch: wrote {} bytes, expected {}",
+                    actual_raw_bytes, expected_raw_bytes
+                )
+                .into());
+            }
+            std::fs::rename(&raw_partial_path, &o_path)?;
+
+            let meta_path = o_path.with_extension("raw.meta");
+            let mut meta = BufWriter::new(File::create(&meta_path)?);
+            writeln!(meta, "format=yi-phasedarray-raw-v1")?;
+            writeln!(meta, "virtual_station={}", phased_name)?;
+            writeln!(meta, "raw_file={}", o_path.display())?;
+            writeln!(meta, "epoch_utc={}", ep_i)?;
+            writeln!(meta, "output_tag={}", c_tag)?;
+            writeln!(meta, "source={}", source_name)?;
+            writeln!(meta, "reference_station={}", phased_reference_name)?;
+            writeln!(
+                meta,
+                "reference_ecef_m={:.9},{:.9},{:.9}",
+                phased_reference_ecef[0], phased_reference_ecef[1], phased_reference_ecef[2]
+            )?;
+            writeln!(meta, "sampling_hz={:.9}", fs)?;
+            writeln!(meta, "observing_frequency_mhz={:.9}", obs_mhz)?;
+            writeln!(meta, "sideband=USB")?;
+            writeln!(meta, "bit={}", bit_out)?;
+            writeln!(
+                meta,
+                "level={}",
+                levels1
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+            writeln!(
+                meta,
+                "shuffle_external={}",
+                DEFAULT_SHUFFLE_IN
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+            writeln!(meta, "fft={}", fft_len)?;
+            writeln!(meta, "frames={}", total_f)?;
+            writeln!(meta, "samples={}", total_f * fft_len)?;
+            writeln!(meta, "duration_s={:.12}", total_f as f64 * frame_sec)?;
+            writeln!(meta, "input_ant1={}", a1p.display())?;
+            writeln!(meta, "input_ant2={}", a2p.display())?;
+            writeln!(meta, "weight_ant1={:.17e}", w1)?;
+            writeln!(meta, "weight_ant2={:.17e}", w2)?;
+            writeln!(meta, "voltage_scale={:.17e}", beam_voltage_scale)?;
+            meta.flush()?;
+            println!(
+                "[info] Completed phased raw: {} ({} bytes), metadata: {}",
+                o_path.display(),
+                actual_raw_bytes,
+                meta_path.display()
+            );
         }
         for w in cw_ph {
             w.finalize()?;
@@ -6750,7 +6924,10 @@ fn run_once(
                 phased_plot,
                 "Phased Auto-Spectrum (ObsRef)",
                 &o_dir
-                    .join(format!("YAMAGU66_{}_phased_auto_spectrum.png", c_tag))
+                    .join(format!(
+                        "{}_{}_phased_auto_spectrum.png",
+                        phased_name, c_tag
+                    ))
                     .to_string_lossy(),
                 "Frequency (MHz)",
                 "Power",
@@ -6766,13 +6943,16 @@ fn run_once(
             plot_multi_series_f64_x(
                 &freqs_obs_mhz,
                 &[
-                    (&amp_ph, &BLUE, "YAMAGU66 (Phased)"),
+                    (&amp_ph, &BLUE, &format!("{} (Phased)", phased_name)),
                     (&amp_11, &GREEN, &l1),
                     (&amp_22, &RED, &l2),
                 ],
                 "Phased Spectrum Amplitude (ObsRef)",
                 &o_dir
-                    .join(format!("YAMAGU66_{}_phased_spectrum_amplitude.png", c_tag))
+                    .join(format!(
+                        "{}_{}_phased_spectrum_amplitude.png",
+                        phased_name, c_tag
+                    ))
                     .to_string_lossy(),
                 "Frequency (MHz)",
                 "Amplitude",
@@ -6802,7 +6982,10 @@ fn run_once(
                 &[(&acf_shifted, &BLUE)],
                 "Phased Autocorrelation",
                 &o_dir
-                    .join(format!("YAMAGU66_{}_phased_autocorrelation.png", c_tag))
+                    .join(format!(
+                        "{}_{}_phased_autocorrelation.png",
+                        phased_name, c_tag
+                    ))
                     .to_string_lossy(),
                 "Lag (samples)",
                 "ACF",
