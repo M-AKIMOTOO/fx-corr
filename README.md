@@ -240,6 +240,101 @@ Optional `--phased-diagnostics` also writes:
 `--output DIR` selects the destination directory. If omitted,
 yi-phasedarray writes to the current directory.
 
+#### Automatic gain phase-reference workflow
+
+For a normal `target -> gain -> target -> gain ...` schedule, yi-phasedarray can
+solve the Y32--Y34 gain phase and then synthesize every target and gain scan in
+one unattended command:
+
+```bash
+nohup yi-phasedarray \
+  --sc S25302A_KL.xml \
+  --raw ../raw \
+  --output phased_array \
+  --phased-name YAMAGU66 \
+  --gain-phasecal \
+  --gain-source NRAO530 \
+  --gain-reference-key K \
+  --gain-corrected-key L \
+  --gain-fringe-length 1 \
+  > yi-phasedarray_phasecal.log 2>&1 &
+```
+
+`--gain-source` must exactly match the gain scan `<object>` name. The workflow
+uses only ordered `K-L` processes for the solution and leaves K unchanged. It:
+
+1. correlates every gain scan as XCF-only `gain_phasecal_off.cor`;
+2. merges those files without changing their absolute sector timestamps, so
+   gaps between scans remain gaps on the fit time axis;
+3. runs `frinZ --search acel --frequency --length N --loop M`;
+4. converts the fitted phase `c2*t^2 + c1*t + c0` at the schedule observing
+   frequency into L clock increments
+   `delay=c0/(2*pi*f)`, `rate=c1/(2*pi*f)`, and
+   `accel=c2/(pi*f)`;
+5. writes a new XML containing the updated L delay polynomial, correlates all
+   gain scans again as `gain_phasecal_on.cor`, and synthesizes every K-L target
+   and gain process with the corrected XML.
+
+The input XML is never overwritten. By default the corrected schedule is
+`<output>/<schedule-stem>_L_phasecal.xml`; select another path with
+`--phasecal-schedule-output`. Intermediate and verification products are in
+`<output>/gain_correlation/`:
+
+- per-scan `gain_phasecal_off.cor` and `gain_phasecal_on.cor` files;
+- `<Y32>_<Y34>_gain_phasecal_merged.cor`;
+- `frinZ/acel_search/*_step1_quadric.txt` and its plot;
+- `gain_phasecal_solution.txt`, including fit coefficients, exact clock
+  increments, old/new L polynomial values, paths, and the phase-delay ambiguity.
+
+Each gain scan sector count must be divisible by `--gain-fringe-length`, which
+prevents a frinZ integration window from crossing a target/gain scan boundary.
+At least three windows are required for the quadratic fit. Set `YI_FRINZ` when
+the desired frinZ executable is not on `PATH`. The `c0` delay is a phase delay:
+it is ambiguous by one observing-frequency cycle (`1/f`). Existing geometric
+and group-delay models still select the physical delay branch. The generated
+XML uses an absolute clock epoch, so leave `YI_CLOCK_EPOCH_MODE` unset (the
+default is `clock`).
+
+#### Gain phase-calibration before/after correlation
+
+After deriving the Y32--Y34 residual delay/rate/acceleration from the gain
+source, keep the original gain XML and write a second XML in which only the
+Y34 (`L`) clock polynomial is corrected. `yi-phasedarray` can correlate the
+same gain raw data with both XMLs before synthesizing the calibrated virtual
+station:
+
+```bash
+yi-phasedarray \
+  --sc gain_Y34_phasecal.xml \
+  --gain-uncalibrated-sc gain_original.xml \
+  --gain-reference-key K \
+  --gain-corrected-key L \
+  --raw ../raw \
+  --output phased_array \
+  --phased-name YAMAGU66
+```
+
+`--sc` is the calibrated XML used for the final phased raw.
+`--gain-uncalibrated-sc` is the otherwise-identical XML before adding the gain
+fringe solution. The command verifies that process time/source, baseline order,
+source coordinates, ECEF positions, sampling/FFT, packed-data format, band,
+sideband, rotation, EOP, and the K clock agree. The baseline must be ordered
+`K-L`; K must be unchanged and L must differ. This prevents a reversed fringe
+sign or accidental modification of the reference station.
+
+For every gain process entry, only the two XCF files required by frinZ are
+written below `<output>/gain_correlation/`:
+
+- `YAMAGU32_YAMAGU34_<TAG>_gain_phasecal_off.cor`
+- `YAMAGU32_YAMAGU34_<TAG>_gain_phasecal_on.cor`
+
+The normal geometric delay and the original XML clock are active in both
+products. Here `off/on` means only the additional gain-derived L clock
+calibration. After writing the comparison pair, synthesis continues with the
+calibrated `--sc` XML. Use `--gain-correlation-directory DIR` to override the
+comparison destination. A gain-only multi-process XML processes all gain scans;
+the hidden diagnostic `--process-index` selects one scan.
+
 #### Three-station phased visibility validation
 
 `tools/phased_visibility_validation.py` combines the complete correlation set
@@ -2180,6 +2275,8 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.5.0` | Added a fully unattended yi-phasedarray gain phase-reference workflow. `--gain-phasecal --gain-source NAME` correlates and timestamp-preserving merges all K-L gain scans, runs `frinZ --search acel --frequency`, absorbs the quadratic phase into the L delay/rate/acceleration polynomial at an absolute epoch, writes a corrected schedule without overwriting the input, produces phasecal-off/on XCF verification files and a solution audit file, then synthesizes every target and gain scan. |
+| `3.4.0` | Added gain phase-calibration comparison to yi-phasedarray. A calibrated XML plus `--gain-uncalibrated-sc` now writes XCF-only Y32--Y34 `gain_phasecal_off` and `gain_phasecal_on` products before phased synthesis, requires K-L baseline order, verifies that K is unchanged and that the XMLs differ only in the L clock calibration, and records the comparison provenance in phased raw metadata. |
 | `3.3.0` | Added unattended three-station phased validation. yi-phasedarray selects the shortest closure baseline as the phased pair, preserves its input ACFs/XCF and pre-quantization phased ACF, correlates both component stations and the requantized virtual station against the independent station, and writes all raw/normalized complex visibilities, amplitudes, phases, Pearson coefficients, closure phase, prediction coherence, and residuals to one NPZ. Explicit process lengths now retain identical boundary-padded time grids in yi-corr and yi-phasedarray. |
 | `3.2.4` | Preserved the nominal phased raw scan duration across a nonzero delay seek, padding only the unavailable EOF boundary instead of dropping complete FFT frames. |
 | `3.2.3` | Preserved the original physical 32-bit VSREC word boundary during non-word-aligned delay seeks. The reader now starts at a preceding native word and leaves the remaining samples to FX integer/fractional delay correction, preventing the four spectral images caused by shuffle-after-bit-repack. |

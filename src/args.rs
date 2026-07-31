@@ -89,6 +89,75 @@ pub struct Args {
     )]
     pub phased_validation_npz: Option<PathBuf>,
 
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Automatically solve gain-source Y32-Y34 phase with frinZ acel, update L clock, and synthesize all scans"
+    )]
+    pub gain_phasecal: bool,
+
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        help = "Schedule process/object name identifying the gain calibrator"
+    )]
+    pub gain_source: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "SECTORS",
+        default_value_t = 1,
+        help = "frinZ acel fitting window in correlator sectors; each gain scan must be divisible by it"
+    )]
+    pub gain_fringe_length: usize,
+
+    #[arg(
+        long,
+        value_name = "XML",
+        help = "Generated schedule with gain-derived L clock (default: OUTPUT/SCHEDULE-STEM_CORRECTED-KEY_phasecal.xml)"
+    )]
+    pub phasecal_schedule_output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        visible_alias = "gain-uncalibrated-sc",
+        value_name = "XML",
+        help = "Uncalibrated gain schedule used to write Y32-Y34 phasecal-off/on comparison .cor files"
+    )]
+    pub gain_uncalibrated_schedule: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory for gain phasecal-off/on .cor files (default: OUTPUT/gain_correlation)"
+    )]
+    pub gain_correlation_directory: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "KEY",
+        default_value = "K",
+        help = "Reference-station key which must remain unchanged in gain comparison XMLs"
+    )]
+    pub gain_reference_key: String,
+
+    #[arg(
+        long,
+        value_name = "KEY",
+        default_value = "L",
+        help = "Station key receiving the gain delay calibration"
+    )]
+    pub gain_corrected_key: String,
+
+    // Internal orchestration controls. They are never exposed on the command
+    // line, but let yi-phasedarray reuse the yi-corr path without writing the
+    // two ACF products or colliding with the normal stream label.
+    #[arg(skip)]
+    pub xcf_only: bool,
+
+    #[arg(skip)]
+    pub cor_label_override: Option<String>,
+
     // Correlation processing parameters
     #[arg(
         long,
@@ -560,6 +629,16 @@ mod tests {
         assert!(!args.phased_diagnostics);
         assert!(!args.phased_validation);
         assert!(args.phased_validation_npz.is_none());
+        assert!(!args.gain_phasecal);
+        assert!(args.gain_source.is_none());
+        assert_eq!(args.gain_fringe_length, 1);
+        assert!(args.phasecal_schedule_output.is_none());
+        assert!(args.gain_uncalibrated_schedule.is_none());
+        assert!(args.gain_correlation_directory.is_none());
+        assert_eq!(args.gain_reference_key, "K");
+        assert_eq!(args.gain_corrected_key, "L");
+        assert!(!args.xcf_only);
+        assert!(args.cor_label_override.is_none());
 
         let args = Args::try_parse_from([
             "yi-phasedarray",
@@ -584,6 +663,50 @@ mod tests {
         assert_eq!(
             args.phased_validation_npz,
             Some(PathBuf::from("validation.npz"))
+        );
+
+        let args = Args::try_parse_from([
+            "yi-phasedarray",
+            "--mkxml",
+            "--gain-uncalibrated-sc",
+            "gain-original.xml",
+            "--gain-correlation-directory",
+            "gain-cor",
+            "--gain-reference-key",
+            "K",
+            "--gain-corrected-key",
+            "L",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.gain_uncalibrated_schedule,
+            Some(PathBuf::from("gain-original.xml"))
+        );
+        assert_eq!(
+            args.gain_correlation_directory,
+            Some(PathBuf::from("gain-cor"))
+        );
+        assert_eq!(args.gain_reference_key, "K");
+        assert_eq!(args.gain_corrected_key, "L");
+
+        let args = Args::try_parse_from([
+            "yi-phasedarray",
+            "--mkxml",
+            "--gain-phasecal",
+            "--gain-source",
+            "J1924-2914",
+            "--gain-fringe-length",
+            "2",
+            "--phasecal-schedule-output",
+            "phasecal.xml",
+        ])
+        .unwrap();
+        assert!(args.gain_phasecal);
+        assert_eq!(args.gain_source.as_deref(), Some("J1924-2914"));
+        assert_eq!(args.gain_fringe_length, 2);
+        assert_eq!(
+            args.phasecal_schedule_output,
+            Some(PathBuf::from("phasecal.xml"))
         );
     }
 

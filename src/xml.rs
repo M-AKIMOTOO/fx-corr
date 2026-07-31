@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use roxmltree::{Document, Node};
 
@@ -696,6 +696,94 @@ pub fn parse_xml_schedule_for_process(
         yp_arcsec,
         eop_file,
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClockPolynomial {
+    pub epoch: String,
+    pub delay_s: f64,
+    pub rate_sps: f64,
+    pub accel_sps2: f64,
+    pub jerk_sps3: f64,
+    pub snap_sps4: f64,
+}
+
+pub fn write_schedule_with_clock_polynomial(
+    input: &Path,
+    output: &Path,
+    station_key: &str,
+    clock: &ClockPolynomial,
+) -> Result<(), DynError> {
+    if input == output
+        || (output.exists() && std::fs::canonicalize(input)? == std::fs::canonicalize(output)?)
+    {
+        return Err("phase-calibrated schedule output must differ from input XML".into());
+    }
+    if station_key.is_empty()
+        || !station_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
+    {
+        return Err(format!("invalid XML station key for clock update: {}", station_key).into());
+    }
+    for (name, value) in [
+        ("delay", clock.delay_s),
+        ("rate", clock.rate_sps),
+        ("accel", clock.accel_sps2),
+        ("jerk", clock.jerk_sps3),
+        ("snap", clock.snap_sps4),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("non-finite phase-calibrated clock {}", name).into());
+        }
+    }
+
+    let text = std::fs::read_to_string(input)?;
+    let range = {
+        let doc = Document::parse(&text)?;
+        let node = doc
+            .descendants()
+            .find(|n| is_tag(*n, "clock") && n.attribute("key").map(str::trim) == Some(station_key))
+            .ok_or_else(|| format!("clock key {} not found in schedule", station_key))?;
+        node.range()
+    };
+    let line_start = text[..range.start].rfind("\n").map_or(0, |i| i + 1);
+    let indent = &text[line_start..range.start];
+    if !indent.chars().all(char::is_whitespace) {
+        return Err("could not determine XML indentation for clock update".into());
+    }
+    let child_indent = format!("{}  ", indent);
+    let replacement = format!(
+        "<clock key=\"{}\">\n{}<epoch>{}</epoch>\n{}<delay>{:+.17e}</delay>\n{}<rate>{:+.17e}</rate>\n{}<accel>{:+.17e}</accel>\n{}<jerk>{:+.17e}</jerk>\n{}<snap>{:+.17e}</snap>\n{}</clock>",
+        station_key,
+        child_indent,
+        clock.epoch,
+        child_indent,
+        clock.delay_s,
+        child_indent,
+        clock.rate_sps,
+        child_indent,
+        clock.accel_sps2,
+        child_indent,
+        clock.jerk_sps3,
+        child_indent,
+        clock.snap_sps4,
+        indent
+    );
+    let mut updated = String::with_capacity(text.len() + replacement.len());
+    updated.push_str(&text[..range.start]);
+    updated.push_str(&replacement);
+    updated.push_str(&text[range.end..]);
+    Document::parse(&updated)
+        .map_err(|e| format!("generated phase-calibrated XML is invalid: {}", e))?;
+
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let partial = PathBuf::from(format!("{}.part", output.display()));
+    std::fs::write(&partial, updated)?;
+    std::fs::rename(&partial, output)?;
+    Ok(())
 }
 
 pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {

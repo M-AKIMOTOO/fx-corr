@@ -18,7 +18,7 @@ mod xml;
 use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -2537,6 +2537,34 @@ fn main() -> Result<(), DynError> {
     } else {
         None
     };
+    if args.gain_phasecal {
+        if !matches!(run_mode, RunMode::PhasedArray) {
+            return Err("--gain-phasecal is supported only by yi-phasedarray".into());
+        }
+        let meta = if_d
+            .as_ref()
+            .ok_or("--gain-phasecal requires a schedule XML")?;
+        return run_automatic_gain_phasecal_workflow(args, meta, cpu_threads, reader_core);
+    }
+    if args.gain_source.is_some() || args.phasecal_schedule_output.is_some() {
+        return Err("--gain-source and --phasecal-schedule-output require --gain-phasecal".into());
+    }
+    if args.gain_uncalibrated_schedule.is_some() {
+        if !matches!(run_mode, RunMode::PhasedArray) {
+            return Err("--gain-uncalibrated-schedule is supported only by yi-phasedarray".into());
+        }
+        if args.phased_validation {
+            return Err(
+                "--gain-uncalibrated-schedule cannot be combined with --phased-validation".into(),
+            );
+        }
+        let meta = if_d
+            .as_ref()
+            .ok_or("--gain-uncalibrated-schedule requires a calibrated --schedule XML")?;
+        run_gain_correlation_pair(&args, meta, cpu_threads, reader_core)?;
+    } else if args.gain_correlation_directory.is_some() {
+        return Err("--gain-correlation-directory requires --gain-uncalibrated-schedule".into());
+    }
     if args.phased_validation {
         if !matches!(run_mode, RunMode::PhasedArray) {
             return Err("--phased-validation is supported only by yi-phasedarray".into());
@@ -2681,6 +2709,866 @@ fn cor_product_path(
         tag,
         sanitize_file_token(label)
     ))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GainClockSignature {
+    delay_s: Option<f64>,
+    rate_sps: Option<f64>,
+    accel_sps2: Option<f64>,
+    jerk_sps3: Option<f64>,
+    snap_sps4: Option<f64>,
+    epoch: Option<String>,
+}
+
+fn gain_clock_signature(
+    data: &ifile::IFileData,
+    station_key: &str,
+) -> Result<GainClockSignature, DynError> {
+    if data.ant1_station_key.as_deref() == Some(station_key) {
+        Ok(GainClockSignature {
+            delay_s: data.ant1_clock_delay_s,
+            rate_sps: data.ant1_clock_rate_sps,
+            accel_sps2: data.ant1_clock_accel_sps2,
+            jerk_sps3: data.ant1_clock_jerk_sps3,
+            snap_sps4: data.ant1_clock_snap_sps4,
+            epoch: data.ant1_clock_epoch.clone(),
+        })
+    } else if data.ant2_station_key.as_deref() == Some(station_key) {
+        Ok(GainClockSignature {
+            delay_s: data.ant2_clock_delay_s,
+            rate_sps: data.ant2_clock_rate_sps,
+            accel_sps2: data.ant2_clock_accel_sps2,
+            jerk_sps3: data.ant2_clock_jerk_sps3,
+            snap_sps4: data.ant2_clock_snap_sps4,
+            epoch: data.ant2_clock_epoch.clone(),
+        })
+    } else {
+        Err(format!(
+            "gain comparison baseline does not contain station key {}",
+            station_key
+        )
+        .into())
+    }
+}
+
+fn same_optional_f64(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn validate_gain_comparison_scan(
+    uncal_process: &ifile::ProcessEntry,
+    calibrated_process: &ifile::ProcessEntry,
+    uncal: &ifile::IFileData,
+    calibrated: &ifile::IFileData,
+    reference_key: &str,
+    corrected_key: &str,
+) -> Result<(String, String, GainClockSignature, GainClockSignature), DynError> {
+    if reference_key == corrected_key {
+        return Err("gain reference and corrected station keys must differ".into());
+    }
+    if !same_validation_scan(uncal_process, calibrated_process) {
+        return Err(
+            "uncalibrated and calibrated gain XML process epoch/skip/length/source differ".into(),
+        );
+    }
+    let uncal_keys = process_keys(uncal_process)?;
+    let calibrated_keys = process_keys(calibrated_process)?;
+    if uncal_keys != calibrated_keys {
+        return Err("gain XML baseline order differs between phasecal-off and phasecal-on".into());
+    }
+    if uncal_keys.0 != reference_key || uncal_keys.1 != corrected_key {
+        return Err(format!(
+            "gain baseline order must be reference-corrected: {}-{}",
+            reference_key, corrected_key
+        )
+        .into());
+    }
+
+    let reference_name_uncal = station_name_for_key(uncal, reference_key)?;
+    let reference_name_cal = station_name_for_key(calibrated, reference_key)?;
+    let corrected_name_uncal = station_name_for_key(uncal, corrected_key)?;
+    let corrected_name_cal = station_name_for_key(calibrated, corrected_key)?;
+    if reference_name_uncal != reference_name_cal || corrected_name_uncal != corrected_name_cal {
+        return Err("gain station names differ between comparison XMLs".into());
+    }
+
+    let invariant = uncal.ra == calibrated.ra
+        && uncal.dec == calibrated.dec
+        && uncal.source == calibrated.source
+        && uncal.fft == calibrated.fft
+        && uncal.inband.unwrap_or(1) == 1
+        && calibrated.inband.unwrap_or(1) == 1
+        && same_optional_f64(uncal.sampling_hz, calibrated.sampling_hz)
+        && same_optional_f64(uncal.obsfreq_mhz, calibrated.obsfreq_mhz)
+        && uncal.ant1_bit == calibrated.ant1_bit
+        && uncal.ant2_bit == calibrated.ant2_bit
+        && uncal.ant1_level == calibrated.ant1_level
+        && uncal.ant2_level == calibrated.ant2_level
+        && uncal.ant1_shuffle == calibrated.ant1_shuffle
+        && uncal.ant2_shuffle == calibrated.ant2_shuffle
+        && uncal.ant1_sideband == calibrated.ant1_sideband
+        && uncal.ant2_sideband == calibrated.ant2_sideband
+        && uncal.ant1_ecef_m == calibrated.ant1_ecef_m
+        && uncal.ant2_ecef_m == calibrated.ant2_ecef_m
+        && same_optional_f64(uncal.output_sec, calibrated.output_sec)
+        && same_optional_f64(uncal.ant1_rotation_hz, calibrated.ant1_rotation_hz)
+        && same_optional_f64(uncal.ant2_rotation_hz, calibrated.ant2_rotation_hz)
+        && same_optional_f64(uncal.ant1_rotation2_hz, calibrated.ant1_rotation2_hz)
+        && same_optional_f64(uncal.ant2_rotation2_hz, calibrated.ant2_rotation2_hz)
+        && same_optional_f64(uncal.ant1_center_mhz, calibrated.ant1_center_mhz)
+        && same_optional_f64(uncal.ant2_center_mhz, calibrated.ant2_center_mhz)
+        && same_optional_f64(uncal.ant1_bw_mhz, calibrated.ant1_bw_mhz)
+        && same_optional_f64(uncal.ant2_bw_mhz, calibrated.ant2_bw_mhz)
+        && same_optional_f64(uncal.model_time_offset_s, calibrated.model_time_offset_s)
+        && same_optional_f64(uncal.dut1_s, calibrated.dut1_s)
+        && same_optional_f64(uncal.tt_utc_s, calibrated.tt_utc_s)
+        && same_optional_f64(uncal.xp_arcsec, calibrated.xp_arcsec)
+        && same_optional_f64(uncal.yp_arcsec, calibrated.yp_arcsec)
+        && uncal.eop_file == calibrated.eop_file;
+    if !invariant {
+        return Err("gain comparison XMLs differ outside the station clock calibration".into());
+    }
+
+    let reference_uncal = gain_clock_signature(uncal, reference_key)?;
+    let reference_cal = gain_clock_signature(calibrated, reference_key)?;
+    if reference_uncal != reference_cal {
+        return Err(format!(
+            "reference station {} clock changed; it must remain fixed",
+            reference_key
+        )
+        .into());
+    }
+    let corrected_uncal = gain_clock_signature(uncal, corrected_key)?;
+    let corrected_cal = gain_clock_signature(calibrated, corrected_key)?;
+    if corrected_uncal == corrected_cal {
+        return Err(format!(
+            "corrected station {} clock is identical in both XMLs",
+            corrected_key
+        )
+        .into());
+    }
+
+    Ok((
+        reference_name_cal.to_string(),
+        corrected_name_cal.to_string(),
+        corrected_uncal,
+        corrected_cal,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrinzQuadratic {
+    c0_rad: f64,
+    c1_rad_s: f64,
+    c2_rad_s2: f64,
+}
+
+fn parse_frinz_quadratic(path: &Path) -> Result<FrinzQuadratic, DynError> {
+    let text = read_to_string(path)?;
+    for line in text.lines() {
+        let Some(rhs) = line.trim().strip_prefix("# Fitted: y = ") else {
+            continue;
+        };
+        let Some((c2, remainder)) = rhs.split_once(" * x^2 + ") else {
+            continue;
+        };
+        let Some((c1, c0)) = remainder.split_once(" * x + ") else {
+            continue;
+        };
+        let result = FrinzQuadratic {
+            c0_rad: c0.trim().parse()?,
+            c1_rad_s: c1.trim().parse()?,
+            c2_rad_s2: c2.trim().parse()?,
+        };
+        if !result.c0_rad.is_finite()
+            || !result.c1_rad_s.is_finite()
+            || !result.c2_rad_s2.is_finite()
+        {
+            return Err(format!("non-finite frinZ quadratic in {}", path.display()).into());
+        }
+        return Ok(result);
+    }
+    Err(format!(
+        "frinZ quadratic line '# Fitted: y = c2 * x^2 + c1 * x + c0' not found in {}",
+        path.display()
+    )
+    .into())
+}
+
+fn cor_sector_count(path: &Path) -> Result<usize, DynError> {
+    let mut input = File::open(path)?;
+    let size = input.metadata()?.len();
+    if size < 256 {
+        return Err(format!(
+            ".cor file is shorter than its 256-byte header: {}",
+            path.display()
+        )
+        .into());
+    }
+    input.seek(SeekFrom::Start(28))?;
+    let mut raw = [0_u8; 4];
+    input.read_exact(&mut raw)?;
+    let count = i32::from_le_bytes(raw);
+    if count < 0 {
+        return Err(format!("negative sector count in {}", path.display()).into());
+    }
+    Ok(count as usize)
+}
+
+fn merge_gain_cor_files(
+    inputs: &[PathBuf],
+    output: &Path,
+    fringe_length: usize,
+) -> Result<(usize, usize), DynError> {
+    if inputs.is_empty() {
+        return Err("cannot merge an empty gain .cor list".into());
+    }
+    if fringe_length == 0 {
+        return Err("--gain-fringe-length must be >= 1".into());
+    }
+    let mut counts = Vec::with_capacity(inputs.len());
+    let mut total_sectors = 0_usize;
+    for path in inputs {
+        let count = cor_sector_count(path)?;
+        if count == 0 {
+            return Err(format!("gain .cor contains no sectors: {}", path.display()).into());
+        }
+        if count % fringe_length != 0 {
+            return Err(format!(
+                "gain scan {} has {} sectors, not divisible by --gain-fringe-length {}",
+                path.display(),
+                count,
+                fringe_length
+            )
+            .into());
+        }
+        total_sectors = total_sectors
+            .checked_add(count)
+            .ok_or("merged gain sector count overflow")?;
+        counts.push(count);
+    }
+    if total_sectors > i32::MAX as usize {
+        return Err("merged gain .cor sector count exceeds format limit".into());
+    }
+    let total_windows = counts
+        .iter()
+        .map(|count| count / fringe_length)
+        .sum::<usize>();
+    if total_windows < 3 {
+        return Err(format!(
+            "frinZ acel needs at least 3 gain windows; got {} (length={} sectors)",
+            total_windows, fringe_length
+        )
+        .into());
+    }
+
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let partial = PathBuf::from(format!("{}.part", output.display()));
+    let mut first = File::open(&inputs[0])?;
+    let mut header = [0_u8; 256];
+    first.read_exact(&mut header)?;
+    header[28..32].copy_from_slice(&(total_sectors as i32).to_le_bytes());
+    let mut merged = BufWriter::new(File::create(&partial)?);
+    merged.write_all(&header)?;
+    for path in inputs {
+        let mut input = File::open(path)?;
+        input.seek(SeekFrom::Start(256))?;
+        std::io::copy(&mut input, &mut merged)?;
+    }
+    merged.flush()?;
+    drop(merged);
+    std::fs::rename(&partial, output)?;
+    Ok((total_sectors, total_windows))
+}
+
+fn process_output_tag(process: &ifile::ProcessEntry) -> Result<(i64, String), DynError> {
+    if (process.skip_sec - process.skip_sec.round()).abs() > 1.0e-6 {
+        return Err(format!(
+            "gain phasecal requires integral process skip seconds; got {:.9} at {}",
+            process.skip_sec, process.epoch
+        )
+        .into());
+    }
+    let (epoch_unix, _) = epoch_to_yyyydddhhmmss(&process.epoch)?;
+    let start_unix = epoch_unix + process.skip_sec.round() as i64;
+    Ok((start_unix, unix_seconds_to_yyyydddhhmmss(start_unix)?))
+}
+
+fn tag_to_xml_epoch(tag: &str) -> Result<String, DynError> {
+    if tag.len() != 13 || !tag.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid YYYYDDDhhmmss tag: {}", tag).into());
+    }
+    Ok(format!(
+        "{}/{} {}:{}:{}",
+        &tag[0..4],
+        &tag[4..7],
+        &tag[7..9],
+        &tag[9..11],
+        &tag[11..13]
+    ))
+}
+
+fn propagate_clock_to_epoch(
+    clock: &GainClockSignature,
+    process_epoch_unix: i64,
+) -> Result<xml::ClockPolynomial, DynError> {
+    let d = clock.delay_s.unwrap_or(0.0);
+    let r = clock.rate_sps.unwrap_or(0.0);
+    let a = clock.accel_sps2.unwrap_or(0.0);
+    let j = clock.jerk_sps3.unwrap_or(0.0);
+    let s = clock.snap_sps4.unwrap_or(0.0);
+    let dt = match clock.epoch.as_deref().map(str::trim) {
+        None
+        | Some("")
+        | Some("process")
+        | Some("process-epoch")
+        | Some("scan")
+        | Some("scan-epoch")
+        | Some("current") => 0.0,
+        Some(epoch) => {
+            let (clock_unix, _) = epoch_to_yyyydddhhmmss(epoch)
+                .map_err(|e| format!("invalid corrected-station clock epoch '{}': {}", epoch, e))?;
+            (process_epoch_unix - clock_unix) as f64
+        }
+    };
+    let dt2 = dt * dt;
+    let dt3 = dt2 * dt;
+    let dt4 = dt2 * dt2;
+    Ok(xml::ClockPolynomial {
+        epoch: String::new(),
+        delay_s: d + r * dt + 0.5 * a * dt2 + j * dt3 / 6.0 + s * dt4 / 24.0,
+        rate_sps: r + a * dt + 0.5 * j * dt2 + s * dt3 / 6.0,
+        accel_sps2: a + j * dt + 0.5 * s * dt2,
+        jerk_sps3: j + s * dt,
+        snap_sps4: s,
+    })
+}
+
+fn automatic_gain_corr_args(
+    args: &args::Args,
+    schedule: &Path,
+    process_index: usize,
+    output_dir: &Path,
+    label: &str,
+) -> args::Args {
+    let mut corr_args = args.clone();
+    corr_args.schedule = Some(schedule.to_path_buf());
+    corr_args.process_index = Some(process_index);
+    corr_args.cor_directory = Some(output_dir.to_path_buf());
+    corr_args.ant1 = None;
+    corr_args.ant2 = None;
+    corr_args.ant1_name_override = None;
+    corr_args.ant2_name_override = None;
+    corr_args.phased_diagnostics = false;
+    corr_args.phased_validation = false;
+    corr_args.phased_validation_npz = None;
+    corr_args.gain_phasecal = false;
+    corr_args.gain_source = None;
+    corr_args.phasecal_schedule_output = None;
+    corr_args.gain_uncalibrated_schedule = None;
+    corr_args.gain_correlation_directory = None;
+    corr_args.xcf_only = true;
+    corr_args.cor_label_override = Some(label.to_string());
+    corr_args.model_diagnostics = false;
+    corr_args.model_sweep = false;
+    corr_args.fringe = None;
+    corr_args.compact_logs = true;
+    corr_args
+}
+
+fn run_automatic_gain_phasecal_workflow(
+    args: args::Args,
+    schedule_meta: &ifile::IFileData,
+    cpu_threads: usize,
+    reader_core: Option<core_affinity::CoreId>,
+) -> Result<(), DynError> {
+    if args.ant1.is_some()
+        || args.ant2.is_some()
+        || args.process_index.is_some()
+        || args.epoch.is_some()
+        || args.ra.is_some()
+        || args.dec.is_some()
+        || args.length.is_some()
+        || args.skip != 0.0
+    {
+        return Err("--gain-phasecal follows every schedule scan; do not override antennas/process/epoch/source/length/skip on the CLI".into());
+    }
+    if args.phased_validation || args.gain_uncalibrated_schedule.is_some() {
+        return Err(
+            "--gain-phasecal cannot be combined with phased validation or manual gain comparison"
+                .into(),
+        );
+    }
+    if args.gain_fringe_length == 0 {
+        return Err("--gain-fringe-length must be >= 1".into());
+    }
+    if let Ok(mode) = std::env::var("YI_CLOCK_EPOCH_MODE") {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "" | "clock" | "clock-epoch" | "propagate" | "absolute" => {}
+            _ => return Err("--gain-phasecal writes an absolute clock epoch; use YI_CLOCK_EPOCH_MODE=clock or unset it".into()),
+        }
+    }
+    let gain_source = args
+        .gain_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or("--gain-phasecal requires --gain-source matching schedule <object>")?;
+    if args.gain_reference_key == args.gain_corrected_key {
+        return Err("gain reference and corrected station keys must differ".into());
+    }
+    let schedule = args
+        .schedule
+        .as_ref()
+        .ok_or("--gain-phasecal requires --schedule")?;
+
+    let mut phase_indices = Vec::new();
+    let mut gain_indices = Vec::new();
+    for (index, process) in schedule_meta.processes.iter().enumerate() {
+        if process_keys(process)?
+            == (
+                args.gain_reference_key.as_str(),
+                args.gain_corrected_key.as_str(),
+            )
+        {
+            phase_indices.push(index);
+            if process.object.as_deref().map(str::trim) == Some(gain_source) {
+                gain_indices.push(index);
+            }
+        }
+    }
+    if phase_indices.is_empty() {
+        return Err(format!(
+            "schedule contains no ordered {}-{} process",
+            args.gain_reference_key, args.gain_corrected_key
+        )
+        .into());
+    }
+    if gain_indices.is_empty() {
+        return Err(format!(
+            "schedule contains no ordered {}-{} process with object '{}'",
+            args.gain_reference_key, args.gain_corrected_key, gain_source
+        )
+        .into());
+    }
+    gain_indices.sort_by_key(|&index| {
+        process_output_tag(&schedule_meta.processes[index])
+            .map(|(unix, _)| unix)
+            .unwrap_or(i64::MAX)
+    });
+    phase_indices.sort_by_key(|&index| {
+        process_output_tag(&schedule_meta.processes[index])
+            .map(|(unix, _)| unix)
+            .unwrap_or(i64::MAX)
+    });
+
+    let base_output = args
+        .cor_directory
+        .clone()
+        .unwrap_or(std::env::current_dir()?);
+    let gain_dir = args
+        .gain_correlation_directory
+        .clone()
+        .unwrap_or_else(|| base_output.join("gain_correlation"));
+    std::fs::create_dir_all(&gain_dir)?;
+    let first_index = gain_indices[0];
+    let first_data = ifile::parse_ifile_for_process(schedule, Some(first_index))?;
+    let reference_name = station_name_for_key(&first_data, &args.gain_reference_key)?.to_string();
+    let corrected_name = station_name_for_key(&first_data, &args.gain_corrected_key)?.to_string();
+    let old_corrected_clock = gain_clock_signature(&first_data, &args.gain_corrected_key)?;
+    let obsfreq_hz = first_data
+        .obsfreq_mhz
+        .ok_or("gain phasecal requires observing frequency in schedule")?
+        * 1.0e6;
+    if !obsfreq_hz.is_finite() || obsfreq_hz <= 0.0 {
+        return Err("gain phasecal observing frequency must be positive".into());
+    }
+    let (fit_epoch_unix, fit_tag) = process_output_tag(&schedule_meta.processes[first_index])?;
+    let fit_epoch = tag_to_xml_epoch(&fit_tag)?;
+
+    println!("[phasecal] automatic gain calibration started");
+    println!(
+        "[phasecal] source='{}' baseline={}-{} scans={} all-phase-scans={}",
+        gain_source,
+        args.gain_reference_key,
+        args.gain_corrected_key,
+        gain_indices.len(),
+        phase_indices.len()
+    );
+    println!("[phasecal] stage 1/5: phasecal-off gain correlations");
+    let mut off_products = Vec::with_capacity(gain_indices.len());
+    for (position, &index) in gain_indices.iter().enumerate() {
+        let process = &schedule_meta.processes[index];
+        let (_, tag) = process_output_tag(process)?;
+        println!(
+            "[phasecal] gain scan {}/{} epoch={} object={}",
+            position + 1,
+            gain_indices.len(),
+            process.epoch,
+            process.object.as_deref().unwrap_or("-")
+        );
+        run_once(
+            automatic_gain_corr_args(&args, schedule, index, &gain_dir, "gain_phasecal_off"),
+            RunMode::Corr,
+            cpu_threads,
+            reader_core,
+        )?;
+        let product = cor_product_path(
+            &gain_dir,
+            &reference_name,
+            &corrected_name,
+            &tag,
+            "gain_phasecal_off",
+        );
+        if !product.is_file() {
+            return Err(format!("expected gain XCF was not written: {}", product.display()).into());
+        }
+        off_products.push(product);
+    }
+
+    println!("[phasecal] stage 2/5: merge gain scans and run frinZ --search acel --frequency");
+    let merged = gain_dir.join(format!(
+        "{}_{}_gain_phasecal_merged.cor",
+        sanitize_file_token(&reference_name),
+        sanitize_file_token(&corrected_name)
+    ));
+    let (total_sectors, total_windows) =
+        merge_gain_cor_files(&off_products, &merged, args.gain_fringe_length)?;
+    let merged_stem = merged
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("merged gain .cor filename is not UTF-8")?;
+    let fit_path = gain_dir
+        .join("frinZ")
+        .join("acel_search")
+        .join(format!("{}_step1_quadric.txt", merged_stem));
+    if fit_path.exists() {
+        std::fs::remove_file(&fit_path)?;
+    }
+    let frinz = std::env::var_os("YI_FRINZ").unwrap_or_else(|| "frinZ".into());
+    let status = Command::new(&frinz)
+        .arg("--input")
+        .arg(&merged)
+        .arg("--length")
+        .arg(args.gain_fringe_length.to_string())
+        .arg("--loop")
+        .arg(total_windows.to_string())
+        .arg("--search")
+        .arg("acel")
+        .arg("--frequency")
+        .arg("--plot")
+        .arg("--output")
+        .status()
+        .map_err(|e| format!("failed to start frinZ {:?}: {}", frinz, e))?;
+    if !status.success() {
+        return Err(format!("frinZ --search acel failed with status {}", status).into());
+    }
+    let fit = parse_frinz_quadratic(&fit_path)?;
+    let two_pi_f = 2.0 * std::f64::consts::PI * obsfreq_hz;
+    let delta_delay_s = fit.c0_rad / two_pi_f;
+    let delta_rate_sps = fit.c1_rad_s / two_pi_f;
+    let delta_accel_sps2 = fit.c2_rad_s2 / (std::f64::consts::PI * obsfreq_hz);
+
+    let mut updated_clock = propagate_clock_to_epoch(&old_corrected_clock, fit_epoch_unix)?;
+    let old_at_fit = updated_clock.clone();
+    updated_clock.epoch = fit_epoch.clone();
+    updated_clock.delay_s += delta_delay_s;
+    updated_clock.rate_sps += delta_rate_sps;
+    updated_clock.accel_sps2 += delta_accel_sps2;
+    let corrected_schedule = args.phasecal_schedule_output.clone().unwrap_or_else(|| {
+        let stem = schedule
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("schedule");
+        base_output.join(format!("{}_{}_phasecal.xml", stem, args.gain_corrected_key))
+    });
+    xml::write_schedule_with_clock_polynomial(
+        schedule,
+        &corrected_schedule,
+        &args.gain_corrected_key,
+        &updated_clock,
+    )?;
+    let corrected_meta = parse_ifile_cached(&corrected_schedule)?;
+    if corrected_meta.processes.len() != schedule_meta.processes.len() {
+        return Err("generated phasecal XML process count changed unexpectedly".into());
+    }
+
+    let solution_path = gain_dir.join("gain_phasecal_solution.txt");
+    let mut solution = BufWriter::new(File::create(&solution_path)?);
+    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v1")?;
+    writeln!(solution, "gain_source={}", gain_source)?;
+    writeln!(
+        solution,
+        "baseline={}-{}",
+        args.gain_reference_key, args.gain_corrected_key
+    )?;
+    writeln!(solution, "reference_station={}", reference_name)?;
+    writeln!(solution, "corrected_station={}", corrected_name)?;
+    writeln!(solution, "fit_epoch_utc={}", fit_epoch)?;
+    writeln!(solution, "phase_reference_hz={:+.17e}", obsfreq_hz)?;
+    writeln!(solution, "gain_scans={}", gain_indices.len())?;
+    writeln!(solution, "merged_sectors={}", total_sectors)?;
+    writeln!(
+        solution,
+        "fringe_length_sectors={}",
+        args.gain_fringe_length
+    )?;
+    writeln!(solution, "fringe_windows={}", total_windows)?;
+    writeln!(solution, "phase_c0_rad={:+.17e}", fit.c0_rad)?;
+    writeln!(solution, "phase_c1_rad_s={:+.17e}", fit.c1_rad_s)?;
+    writeln!(solution, "phase_c2_rad_s2={:+.17e}", fit.c2_rad_s2)?;
+    writeln!(solution, "delta_delay_s={:+.17e}", delta_delay_s)?;
+    writeln!(solution, "delta_rate_sps={:+.17e}", delta_rate_sps)?;
+    writeln!(solution, "delta_accel_sps2={:+.17e}", delta_accel_sps2)?;
+    writeln!(solution, "old_delay_at_fit_s={:+.17e}", old_at_fit.delay_s)?;
+    writeln!(
+        solution,
+        "old_rate_at_fit_sps={:+.17e}",
+        old_at_fit.rate_sps
+    )?;
+    writeln!(
+        solution,
+        "old_accel_at_fit_sps2={:+.17e}",
+        old_at_fit.accel_sps2
+    )?;
+    writeln!(
+        solution,
+        "new_delay_at_fit_s={:+.17e}",
+        updated_clock.delay_s
+    )?;
+    writeln!(
+        solution,
+        "new_rate_at_fit_sps={:+.17e}",
+        updated_clock.rate_sps
+    )?;
+    writeln!(
+        solution,
+        "new_accel_at_fit_sps2={:+.17e}",
+        updated_clock.accel_sps2
+    )?;
+    writeln!(
+        solution,
+        "phase_delay_ambiguity_s={:+.17e}",
+        1.0 / obsfreq_hz
+    )?;
+    writeln!(solution, "input_schedule={}", schedule.display())?;
+    writeln!(
+        solution,
+        "corrected_schedule={}",
+        corrected_schedule.display()
+    )?;
+    writeln!(solution, "merged_cor={}", merged.display())?;
+    writeln!(solution, "frinz_fit={}", fit_path.display())?;
+    solution.flush()?;
+    println!(
+        "[phasecal] solution: c0={:+.6e} rad c1={:+.6e} rad/s c2={:+.6e} rad/s^2",
+        fit.c0_rad, fit.c1_rad_s, fit.c2_rad_s2
+    );
+    println!(
+        "[phasecal] add to {}: delay={:+.9e}s rate={:+.9e}s/s accel={:+.9e}s/s^2",
+        args.gain_corrected_key, delta_delay_s, delta_rate_sps, delta_accel_sps2
+    );
+    println!(
+        "[phasecal] corrected schedule: {}",
+        corrected_schedule.display()
+    );
+
+    println!("[phasecal] stage 3/5: phasecal-on gain correlations");
+    for (position, &index) in gain_indices.iter().enumerate() {
+        println!(
+            "[phasecal] corrected gain scan {}/{}",
+            position + 1,
+            gain_indices.len()
+        );
+        run_once(
+            automatic_gain_corr_args(
+                &args,
+                &corrected_schedule,
+                index,
+                &gain_dir,
+                "gain_phasecal_on",
+            ),
+            RunMode::Corr,
+            cpu_threads,
+            reader_core,
+        )?;
+    }
+
+    println!("[phasecal] stage 4/5: synthesize corrected target and gain scans");
+    for (position, &index) in phase_indices.iter().enumerate() {
+        let process = &corrected_meta.processes[index];
+        println!(
+            "[phasecal] phased scan {}/{} epoch={} object={}",
+            position + 1,
+            phase_indices.len(),
+            process.epoch,
+            process.object.as_deref().unwrap_or("-")
+        );
+        let mut phased_args = args.clone();
+        phased_args.schedule = Some(corrected_schedule.clone());
+        phased_args.process_index = Some(index);
+        phased_args.gain_phasecal = false;
+        phased_args.gain_source = None;
+        phased_args.phasecal_schedule_output = None;
+        phased_args.gain_uncalibrated_schedule = Some(schedule.clone());
+        phased_args.gain_correlation_directory = Some(gain_dir.clone());
+        phased_args.xcf_only = false;
+        phased_args.cor_label_override = None;
+        phased_args.compact_logs = position > 0;
+        run_once(phased_args, RunMode::PhasedArray, cpu_threads, reader_core)?;
+    }
+    println!("[phasecal] stage 5/5: complete");
+    println!("[phasecal] solution file: {}", solution_path.display());
+    println!("[phasecal] phasecal-off/on .cor: {}", gain_dir.display());
+    Ok(())
+}
+
+fn run_gain_correlation_pair(
+    args: &args::Args,
+    calibrated_meta: &ifile::IFileData,
+    cpu_threads: usize,
+    reader_core: Option<core_affinity::CoreId>,
+) -> Result<(), DynError> {
+    if args.ant1.is_some() || args.ant2.is_some() {
+        return Err(
+            "gain correlation comparison requires schedule/raw-directory auto-resolution; do not set --ant1/--ant2"
+                .into(),
+        );
+    }
+    let uncalibrated_schedule = args
+        .gain_uncalibrated_schedule
+        .as_ref()
+        .ok_or("internal error: missing uncalibrated gain schedule")?;
+    let calibrated_schedule = args
+        .schedule
+        .as_ref()
+        .ok_or("gain correlation comparison requires --schedule")?;
+    if uncalibrated_schedule == calibrated_schedule {
+        return Err("uncalibrated and calibrated gain schedule paths must differ".into());
+    }
+    let uncalibrated_meta = parse_ifile_cached(uncalibrated_schedule)?;
+    let indices = if let Some(index) = args.process_index {
+        vec![index]
+    } else {
+        (0..calibrated_meta.processes.len()).collect::<Vec<_>>()
+    };
+    if indices.is_empty() {
+        return Err("calibrated gain schedule contains no process entries".into());
+    }
+    if args.process_index.is_none()
+        && calibrated_meta.processes.len() != uncalibrated_meta.processes.len()
+    {
+        return Err("gain comparison XMLs contain different process counts".into());
+    }
+    for &index in &indices {
+        if index >= calibrated_meta.processes.len() || index >= uncalibrated_meta.processes.len() {
+            return Err(format!(
+                "gain process index {} is absent from one comparison XML",
+                index
+            )
+            .into());
+        }
+    }
+
+    let output_dir = if let Some(path) = args.gain_correlation_directory.clone() {
+        path
+    } else {
+        args.cor_directory
+            .clone()
+            .unwrap_or(std::env::current_dir()?)
+            .join("gain_correlation")
+    };
+    std::fs::create_dir_all(&output_dir)?;
+    println!("[gain-corr] phase-reference gain comparison enabled");
+    println!(
+        "[gain-corr] reference={} fixed; corrected={} receives delay calibration; scans={}",
+        args.gain_reference_key,
+        args.gain_corrected_key,
+        indices.len()
+    );
+    println!(
+        "[gain-corr] phasecal-off XML: {}",
+        uncalibrated_schedule.display()
+    );
+    println!(
+        "[gain-corr] phasecal-on  XML: {}",
+        calibrated_schedule.display()
+    );
+
+    for (position, &index) in indices.iter().enumerate() {
+        let uncal = ifile::parse_ifile_for_process(uncalibrated_schedule, Some(index))?;
+        let calibrated = ifile::parse_ifile_for_process(calibrated_schedule, Some(index))?;
+        let (reference_name, corrected_name, clock_off, clock_on) = validate_gain_comparison_scan(
+            &uncalibrated_meta.processes[index],
+            &calibrated_meta.processes[index],
+            &uncal,
+            &calibrated,
+            &args.gain_reference_key,
+            &args.gain_corrected_key,
+        )?;
+        println!(
+            "[gain-corr] scan {}/{} {}-{} epoch={} L-clock off={:?} on={:?}",
+            position + 1,
+            indices.len(),
+            reference_name,
+            corrected_name,
+            calibrated_meta.processes[index].epoch,
+            clock_off,
+            clock_on
+        );
+
+        for (schedule, label, state) in [
+            (
+                uncalibrated_schedule,
+                "gain_phasecal_off",
+                "without gain delay calibration",
+            ),
+            (
+                calibrated_schedule,
+                "gain_phasecal_on",
+                "with gain delay calibration",
+            ),
+        ] {
+            println!(
+                "[gain-corr] scan {}/{}: correlate {}",
+                position + 1,
+                indices.len(),
+                state
+            );
+            let mut corr_args = args.clone();
+            corr_args.schedule = Some(schedule.clone());
+            corr_args.process_index = Some(index);
+            corr_args.cor_directory = Some(output_dir.clone());
+            corr_args.ant1 = None;
+            corr_args.ant2 = None;
+            corr_args.ant1_name_override = None;
+            corr_args.ant2_name_override = None;
+            corr_args.phased_diagnostics = false;
+            corr_args.phased_validation = false;
+            corr_args.phased_validation_npz = None;
+            corr_args.gain_uncalibrated_schedule = None;
+            corr_args.gain_correlation_directory = None;
+            corr_args.xcf_only = true;
+            corr_args.cor_label_override = Some(label.to_string());
+            corr_args.model_diagnostics = false;
+            corr_args.model_sweep = false;
+            corr_args.fringe = None;
+            corr_args.compact_logs = true;
+            run_once(corr_args, RunMode::Corr, cpu_threads, reader_core)?;
+        }
+    }
+    println!(
+        "[gain-corr] complete: phasecal-off/on reference-corrected XCF products in {}",
+        output_dir.display()
+    );
+    Ok(())
 }
 
 fn run_phased_validation_workflow(
@@ -3109,7 +3997,8 @@ fn run_once(
     // the phasing result independently testable without re-correlating the
     // short baseline in a separate yi-corr run.
     let write_input_pair_cor = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
-    let write_acf_cor = matches!(run_mode, RunMode::Corr) || write_input_pair_cor;
+    let write_acf_cor =
+        (matches!(run_mode, RunMode::Corr) && !args.xcf_only) || write_input_pair_cor;
     let write_xcf_cor = matches!(run_mode, RunMode::Corr) || write_input_pair_cor;
     let write_phased_cor = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
     let plot_phased = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
@@ -4825,7 +5714,9 @@ fn run_once(
         .and_then(|p| p.object.clone())
         .or_else(|| if_d.as_ref().and_then(|d| d.source.clone()))
         .unwrap_or_else(|| "UNKNOWN".into());
-    let cor_label_raw = if matches!(run_mode, RunMode::PhasedArray) {
+    let cor_label_raw = if let Some(label) = args.cor_label_override.as_ref() {
+        label.clone()
+    } else if matches!(run_mode, RunMode::PhasedArray) {
         "phasedarray".to_string()
     } else {
         if_d.as_ref()
@@ -7521,6 +8412,18 @@ fn run_once(
             writeln!(meta, "weight_ant1={:.17e}", w1)?;
             writeln!(meta, "weight_ant2={:.17e}", w2)?;
             writeln!(meta, "voltage_scale={:.17e}", beam_voltage_scale)?;
+            if let Some(path) = args.gain_uncalibrated_schedule.as_ref() {
+                writeln!(meta, "gain_uncalibrated_schedule={}", path.display())?;
+                let comparison_dir = args
+                    .gain_correlation_directory
+                    .clone()
+                    .unwrap_or_else(|| o_dir.join("gain_correlation"));
+                writeln!(
+                    meta,
+                    "gain_correlation_directory={}",
+                    comparison_dir.display()
+                )?;
+            }
             meta.flush()?;
             println!(
                 "[info] Completed phased raw: {} ({} bytes), metadata: {}",
