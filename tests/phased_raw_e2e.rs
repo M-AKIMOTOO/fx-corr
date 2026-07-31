@@ -103,12 +103,26 @@ fn write_fake_frinz(path: &Path) {
 
     let script = r#"#!/bin/sh
 input=
+mode=
+loops=1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --input) input="$2"; shift 2 ;;
+    --loop) loops="$2"; shift 2 ;;
+    --search) mode="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+if [ "$mode" = peak ]; then
+  i=1
+  while [ "$i" -le "$loops" ]; do
+    delay=+0.250000
+    if [ "$i" -eq 7 ]; then delay=+99.000000; fi
+    printf '%s\n' "2000001000000 L GAIN 1.00 0.100000 20.0 +0.0 0.010000 $delay +0.000000 1 2 3 4 5 6 51544.0 - False False"
+    i=$((i + 1))
+  done
+  exit 0
+fi
 parent=$(dirname "$input")
 stem=$(basename "$input" .cor)
 out="$parent/frinZ/acel_search"
@@ -189,7 +203,7 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
-    assert!(meta.contains("software_version=3.5.0"));
+    assert!(meta.contains("software_version=3.5.1"));
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));
@@ -523,11 +537,13 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
         String::from_utf8_lossy(&phased.stderr)
     );
     let stdout = String::from_utf8_lossy(&phased.stdout);
-    assert!(stdout.contains("[phasecal] stage 1/5: phasecal-off gain correlations"));
-    assert!(stdout.contains("[phasecal] stage 2/5: merge gain scans and run frinZ"));
-    assert!(stdout.contains("[phasecal] stage 3/5: phasecal-on gain correlations"));
-    assert!(stdout.contains("[phasecal] stage 4/5: synthesize corrected target and gain scans"));
-    assert!(stdout.contains("[phasecal] stage 5/5: complete"));
+    assert!(stdout.contains("[phasecal] stage 1/7: phasecal-off gain correlations"));
+    assert!(stdout.contains("[phasecal] stage 2/7: merge gain scans and run frinZ --search peak"));
+    assert!(stdout.contains("[phasecal] stage 3/7: correlate gain scans with median group delay"));
+    assert!(stdout.contains("[phasecal] stage 4/7: run frinZ --search acel"));
+    assert!(stdout.contains("[phasecal] stage 5/7: final phasecal-on gain correlations"));
+    assert!(stdout.contains("[phasecal] stage 6/7: synthesize corrected target and gain scans"));
+    assert!(stdout.contains("[phasecal] stage 7/7: complete"));
 
     let corrected = output_dir.join("auto-phasecal_B_phasecal.xml");
     let corrected_xml = fs::read_to_string(&corrected).unwrap();
@@ -539,7 +555,7 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
 
     let gain_dir = output_dir.join("gain_correlation");
     for tag in [tags[0], tags[2], tags[4]] {
-        for label in ["gain_phasecal_off", "gain_phasecal_on"] {
+        for label in ["gain_phasecal_off", "gain_delay_on", "gain_phasecal_on"] {
             assert!(
                 fs::metadata(gain_dir.join(format!("YAMAGU32_YAMAGU34_{tag}_{label}.cor")))
                     .unwrap()
@@ -551,11 +567,20 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
     let solution = fs::read_to_string(gain_dir.join("gain_phasecal_solution.txt")).unwrap();
     assert!(solution.contains("gain_scans=3"));
     assert!(solution.contains("fringe_windows=24"));
+    assert!(solution.contains("format=yi-phasedarray-gain-phasecal-v2"));
+    assert!(solution.contains("peak_delay_count=24"));
+    assert!(solution.contains("peak_delay_samples_median=+2.50000000000000000e-1"));
+    assert!(solution.contains("peak_delay_samples_max=+9.90000000000000000e1"));
+    assert!(solution.contains("group_delay_s=+3.05175781250000000e-5"));
     assert!(solution.contains("phase_c0_rad=+2.00000000000000011e-1"));
     assert!(solution.contains("corrected_schedule="));
     assert!(gain_dir
         .join("YAMAGU32_YAMAGU34_gain_phasecal_merged.cor")
         .is_file());
+    assert!(gain_dir
+        .join("YAMAGU32_YAMAGU34_gain_delay_on_merged.cor")
+        .is_file());
+    assert!(gain_dir.join("auto-phasecal_B_group_delay.xml").is_file());
 
     for tag in tags {
         assert_eq!(

@@ -17,9 +17,9 @@ mod xml;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -468,6 +468,20 @@ mod correlation_hot_path_tests {
         )
         .unwrap();
         assert_eq!(decoded, samples[13..45]);
+    }
+
+    #[test]
+    fn peak_delay_median_rejects_a_large_outlier() {
+        let values = vec![0.25, 0.24, 99.0, 0.26, 0.25];
+        assert_eq!(finite_median(values).unwrap(), 0.25);
+        assert!((finite_median(vec![0.2, 0.4]).unwrap() - 0.3).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn peak_delay_parser_reads_only_frinz_result_rows() {
+        let row = "2025302070000 KL NRAO530 1.00 0.10 20.0 +1.0 0.01 -0.375 +0.002 1 2 3 4 5 6 51544.0 - False False";
+        assert_eq!(peak_delay_from_output_line(row), Some(-0.375));
+        assert_eq!(peak_delay_from_output_line("# header"), None);
     }
 }
 
@@ -2861,6 +2875,105 @@ fn validate_gain_comparison_scan(
     ))
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PeakDelaySummary {
+    samples: Vec<f64>,
+    median_samples: f64,
+    mad_samples: f64,
+    min_samples: f64,
+    max_samples: f64,
+}
+
+fn finite_median(mut values: Vec<f64>) -> Result<f64, DynError> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return Err("cannot calculate median of an empty/non-finite delay set".into());
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Ok(0.5 * (values[middle - 1] + values[middle]))
+    } else {
+        Ok(values[middle])
+    }
+}
+
+fn peak_delay_from_output_line(line: &str) -> Option<f64> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 12
+        || fields[0].len() != 13
+        || !fields[0].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    fields[8]
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn run_frinz_peak_delay(
+    frinz: &std::ffi::OsStr,
+    merged: &Path,
+    fringe_length: usize,
+    total_windows: usize,
+) -> Result<PeakDelaySummary, DynError> {
+    let mut child = Command::new(frinz)
+        .arg("--input")
+        .arg(merged)
+        .arg("--length")
+        .arg(fringe_length.to_string())
+        .arg("--loop")
+        .arg(total_windows.to_string())
+        .arg("--search")
+        .arg("peak")
+        .arg("--plot")
+        .arg("--output")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start frinZ {:?} peak search: {}", frinz, e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to capture frinZ peak stdout")?;
+    let mut samples = Vec::with_capacity(total_windows);
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        println!("{}", line);
+        if let Some(delay) = peak_delay_from_output_line(&line) {
+            samples.push(delay);
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("frinZ --search peak failed with status {}", status).into());
+    }
+    if samples.len() != total_windows {
+        return Err(format!(
+            "frinZ peak returned {} residual delays, expected {} windows",
+            samples.len(),
+            total_windows
+        )
+        .into());
+    }
+    let median_samples = finite_median(samples.clone())?;
+    let mad_samples = finite_median(
+        samples
+            .iter()
+            .map(|value| (value - median_samples).abs())
+            .collect(),
+    )?;
+    let min_samples = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_samples = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok(PeakDelaySummary {
+        samples,
+        median_samples,
+        mad_samples,
+        min_samples,
+        max_samples,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FrinzQuadratic {
     c0_rad: f64,
@@ -3202,7 +3315,7 @@ fn run_automatic_gain_phasecal_workflow(
         gain_indices.len(),
         phase_indices.len()
     );
-    println!("[phasecal] stage 1/5: phasecal-off gain correlations");
+    println!("[phasecal] stage 1/7: phasecal-off gain correlations");
     let mut off_products = Vec::with_capacity(gain_indices.len());
     for (position, &index) in gain_indices.iter().enumerate() {
         let process = &schedule_meta.processes[index];
@@ -3233,7 +3346,7 @@ fn run_automatic_gain_phasecal_workflow(
         off_products.push(product);
     }
 
-    println!("[phasecal] stage 2/5: merge gain scans and run frinZ --search acel --frequency");
+    println!("[phasecal] stage 2/7: merge gain scans and run frinZ --search peak");
     let merged = gain_dir.join(format!(
         "{}_{}_gain_phasecal_merged.cor",
         sanitize_file_token(&reference_name),
@@ -3241,21 +3354,121 @@ fn run_automatic_gain_phasecal_workflow(
     ));
     let (total_sectors, total_windows) =
         merge_gain_cor_files(&off_products, &merged, args.gain_fringe_length)?;
-    let merged_stem = merged
+    let sampling_hz = first_data
+        .sampling_hz
+        .ok_or("gain phasecal requires sampling frequency in schedule")?;
+    if !sampling_hz.is_finite() || sampling_hz <= 0.0 {
+        return Err("gain phasecal sampling frequency must be positive".into());
+    }
+    let frinz = std::env::var_os("YI_FRINZ").unwrap_or_else(|| "frinZ".into());
+    let peak_delay = run_frinz_peak_delay(&frinz, &merged, args.gain_fringe_length, total_windows)?;
+    let group_delay_s = peak_delay.median_samples / sampling_hz;
+    println!(
+        "[phasecal] peak residual delay: windows={} median={:+.9} sample MAD={:.9} min={:+.9} max={:+.9}",
+        peak_delay.samples.len(),
+        peak_delay.median_samples,
+        peak_delay.mad_samples,
+        peak_delay.min_samples,
+        peak_delay.max_samples
+    );
+
+    let corrected_schedule = args.phasecal_schedule_output.clone().unwrap_or_else(|| {
+        let stem = schedule
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("schedule");
+        base_output.join(format!("{}_{}_phasecal.xml", stem, args.gain_corrected_key))
+    });
+    let group_schedule = gain_dir.join(format!(
+        "{}_{}_group_delay.xml",
+        schedule
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("schedule"),
+        sanitize_file_token(&args.gain_corrected_key)
+    ));
+    if group_schedule == corrected_schedule {
+        return Err(
+            "final phasecal XML path must differ from the intermediate group-delay XML".into(),
+        );
+    }
+    let mut group_clock = propagate_clock_to_epoch(&old_corrected_clock, fit_epoch_unix)?;
+    let old_at_fit = group_clock.clone();
+    group_clock.epoch = fit_epoch.clone();
+    group_clock.delay_s += group_delay_s;
+    xml::write_schedule_with_clock_polynomial(
+        schedule,
+        &group_schedule,
+        &args.gain_corrected_key,
+        &group_clock,
+    )?;
+    let group_meta = parse_ifile_cached(&group_schedule)?;
+    if group_meta.processes.len() != schedule_meta.processes.len() {
+        return Err("generated group-delay XML process count changed unexpectedly".into());
+    }
+
+    println!("[phasecal] stage 3/7: correlate gain scans with median group delay");
+    let mut delay_on_products = Vec::with_capacity(gain_indices.len());
+    for (position, &index) in gain_indices.iter().enumerate() {
+        let (_, tag) = process_output_tag(&schedule_meta.processes[index])?;
+        println!(
+            "[phasecal] group-delay gain scan {}/{}",
+            position + 1,
+            gain_indices.len()
+        );
+        run_once(
+            automatic_gain_corr_args(&args, &group_schedule, index, &gain_dir, "gain_delay_on"),
+            RunMode::Corr,
+            cpu_threads,
+            reader_core,
+        )?;
+        let product = cor_product_path(
+            &gain_dir,
+            &reference_name,
+            &corrected_name,
+            &tag,
+            "gain_delay_on",
+        );
+        if !product.is_file() {
+            return Err(format!(
+                "expected group-delay-corrected gain XCF was not written: {}",
+                product.display()
+            )
+            .into());
+        }
+        delay_on_products.push(product);
+    }
+
+    println!(
+        "[phasecal] stage 4/7: run frinZ --search acel --frequency after group-delay correction"
+    );
+    let delay_on_merged = gain_dir.join(format!(
+        "{}_{}_gain_delay_on_merged.cor",
+        sanitize_file_token(&reference_name),
+        sanitize_file_token(&corrected_name)
+    ));
+    let (delay_on_sectors, delay_on_windows) = merge_gain_cor_files(
+        &delay_on_products,
+        &delay_on_merged,
+        args.gain_fringe_length,
+    )?;
+    if delay_on_sectors != total_sectors || delay_on_windows != total_windows {
+        return Err("group-delay-corrected gain merge changed the sector/window count".into());
+    }
+    let delay_on_stem = delay_on_merged
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or("merged gain .cor filename is not UTF-8")?;
+        .ok_or("group-delay-corrected merged .cor filename is not UTF-8")?;
     let fit_path = gain_dir
         .join("frinZ")
         .join("acel_search")
-        .join(format!("{}_step1_quadric.txt", merged_stem));
+        .join(format!("{}_step1_quadric.txt", delay_on_stem));
     if fit_path.exists() {
         std::fs::remove_file(&fit_path)?;
     }
-    let frinz = std::env::var_os("YI_FRINZ").unwrap_or_else(|| "frinZ".into());
     let status = Command::new(&frinz)
         .arg("--input")
-        .arg(&merged)
+        .arg(&delay_on_merged)
         .arg("--length")
         .arg(args.gain_fringe_length.to_string())
         .arg("--loop")
@@ -3272,23 +3485,15 @@ fn run_automatic_gain_phasecal_workflow(
     }
     let fit = parse_frinz_quadratic(&fit_path)?;
     let two_pi_f = 2.0 * std::f64::consts::PI * obsfreq_hz;
-    let delta_delay_s = fit.c0_rad / two_pi_f;
+    let phase_delay_s = fit.c0_rad / two_pi_f;
     let delta_rate_sps = fit.c1_rad_s / two_pi_f;
     let delta_accel_sps2 = fit.c2_rad_s2 / (std::f64::consts::PI * obsfreq_hz);
+    let total_delta_delay_s = group_delay_s + phase_delay_s;
 
-    let mut updated_clock = propagate_clock_to_epoch(&old_corrected_clock, fit_epoch_unix)?;
-    let old_at_fit = updated_clock.clone();
-    updated_clock.epoch = fit_epoch.clone();
-    updated_clock.delay_s += delta_delay_s;
+    let mut updated_clock = group_clock.clone();
+    updated_clock.delay_s += phase_delay_s;
     updated_clock.rate_sps += delta_rate_sps;
     updated_clock.accel_sps2 += delta_accel_sps2;
-    let corrected_schedule = args.phasecal_schedule_output.clone().unwrap_or_else(|| {
-        let stem = schedule
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("schedule");
-        base_output.join(format!("{}_{}_phasecal.xml", stem, args.gain_corrected_key))
-    });
     xml::write_schedule_with_clock_polynomial(
         schedule,
         &corrected_schedule,
@@ -3302,7 +3507,7 @@ fn run_automatic_gain_phasecal_workflow(
 
     let solution_path = gain_dir.join("gain_phasecal_solution.txt");
     let mut solution = BufWriter::new(File::create(&solution_path)?);
-    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v1")?;
+    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v2")?;
     writeln!(solution, "gain_source={}", gain_source)?;
     writeln!(
         solution,
@@ -3312,6 +3517,7 @@ fn run_automatic_gain_phasecal_workflow(
     writeln!(solution, "reference_station={}", reference_name)?;
     writeln!(solution, "corrected_station={}", corrected_name)?;
     writeln!(solution, "fit_epoch_utc={}", fit_epoch)?;
+    writeln!(solution, "sampling_hz={:+.17e}", sampling_hz)?;
     writeln!(solution, "phase_reference_hz={:+.17e}", obsfreq_hz)?;
     writeln!(solution, "gain_scans={}", gain_indices.len())?;
     writeln!(solution, "merged_sectors={}", total_sectors)?;
@@ -3321,10 +3527,47 @@ fn run_automatic_gain_phasecal_workflow(
         args.gain_fringe_length
     )?;
     writeln!(solution, "fringe_windows={}", total_windows)?;
+    writeln!(solution, "peak_delay_count={}", peak_delay.samples.len())?;
+    writeln!(
+        solution,
+        "peak_delay_samples_median={:+.17e}",
+        peak_delay.median_samples
+    )?;
+    writeln!(
+        solution,
+        "peak_delay_samples_mad={:+.17e}",
+        peak_delay.mad_samples
+    )?;
+    writeln!(
+        solution,
+        "peak_delay_samples_min={:+.17e}",
+        peak_delay.min_samples
+    )?;
+    writeln!(
+        solution,
+        "peak_delay_samples_max={:+.17e}",
+        peak_delay.max_samples
+    )?;
+    writeln!(
+        solution,
+        "peak_delay_samples_all={}",
+        peak_delay
+            .samples
+            .iter()
+            .map(|value| format!("{:+.9e}", value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
+    writeln!(solution, "group_delay_s={:+.17e}", group_delay_s)?;
     writeln!(solution, "phase_c0_rad={:+.17e}", fit.c0_rad)?;
     writeln!(solution, "phase_c1_rad_s={:+.17e}", fit.c1_rad_s)?;
     writeln!(solution, "phase_c2_rad_s2={:+.17e}", fit.c2_rad_s2)?;
-    writeln!(solution, "delta_delay_s={:+.17e}", delta_delay_s)?;
+    writeln!(solution, "phase_delay_s={:+.17e}", phase_delay_s)?;
+    writeln!(
+        solution,
+        "total_delta_delay_s={:+.17e}",
+        total_delta_delay_s
+    )?;
     writeln!(solution, "delta_rate_sps={:+.17e}", delta_rate_sps)?;
     writeln!(solution, "delta_accel_sps2={:+.17e}", delta_accel_sps2)?;
     writeln!(solution, "old_delay_at_fit_s={:+.17e}", old_at_fit.delay_s)?;
@@ -3337,6 +3580,11 @@ fn run_automatic_gain_phasecal_workflow(
         solution,
         "old_accel_at_fit_sps2={:+.17e}",
         old_at_fit.accel_sps2
+    )?;
+    writeln!(
+        solution,
+        "group_delay_clock_at_fit_s={:+.17e}",
+        group_clock.delay_s
     )?;
     writeln!(
         solution,
@@ -3361,26 +3609,41 @@ fn run_automatic_gain_phasecal_workflow(
     writeln!(solution, "input_schedule={}", schedule.display())?;
     writeln!(
         solution,
+        "group_delay_schedule={}",
+        group_schedule.display()
+    )?;
+    writeln!(
+        solution,
         "corrected_schedule={}",
         corrected_schedule.display()
     )?;
-    writeln!(solution, "merged_cor={}", merged.display())?;
+    writeln!(solution, "peak_merged_cor={}", merged.display())?;
+    writeln!(solution, "acel_merged_cor={}", delay_on_merged.display())?;
     writeln!(solution, "frinz_fit={}", fit_path.display())?;
     solution.flush()?;
     println!(
-        "[phasecal] solution: c0={:+.6e} rad c1={:+.6e} rad/s c2={:+.6e} rad/s^2",
+        "[phasecal] acel solution after group delay: c0={:+.6e} rad c1={:+.6e} rad/s c2={:+.6e} rad/s^2",
         fit.c0_rad, fit.c1_rad_s, fit.c2_rad_s2
     );
     println!(
-        "[phasecal] add to {}: delay={:+.9e}s rate={:+.9e}s/s accel={:+.9e}s/s^2",
-        args.gain_corrected_key, delta_delay_s, delta_rate_sps, delta_accel_sps2
+        "[phasecal] add to {}: group-delay={:+.9e}s phase-delay={:+.9e}s total-delay={:+.9e}s rate={:+.9e}s/s accel={:+.9e}s/s^2",
+        args.gain_corrected_key,
+        group_delay_s,
+        phase_delay_s,
+        total_delta_delay_s,
+        delta_rate_sps,
+        delta_accel_sps2
+    );
+    println!(
+        "[phasecal] intermediate schedule: {}",
+        group_schedule.display()
     );
     println!(
         "[phasecal] corrected schedule: {}",
         corrected_schedule.display()
     );
 
-    println!("[phasecal] stage 3/5: phasecal-on gain correlations");
+    println!("[phasecal] stage 5/7: final phasecal-on gain correlations");
     for (position, &index) in gain_indices.iter().enumerate() {
         println!(
             "[phasecal] corrected gain scan {}/{}",
@@ -3401,7 +3664,7 @@ fn run_automatic_gain_phasecal_workflow(
         )?;
     }
 
-    println!("[phasecal] stage 4/5: synthesize corrected target and gain scans");
+    println!("[phasecal] stage 6/7: synthesize corrected target and gain scans");
     for (position, &index) in phase_indices.iter().enumerate() {
         let process = &corrected_meta.processes[index];
         println!(
@@ -3424,7 +3687,7 @@ fn run_automatic_gain_phasecal_workflow(
         phased_args.compact_logs = position > 0;
         run_once(phased_args, RunMode::PhasedArray, cpu_threads, reader_core)?;
     }
-    println!("[phasecal] stage 5/5: complete");
+    println!("[phasecal] stage 7/7: complete");
     println!("[phasecal] solution file: {}", solution_path.display());
     println!("[phasecal] phasecal-off/on .cor: {}", gain_dir.display());
     Ok(())

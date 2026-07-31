@@ -92,7 +92,7 @@ pub struct Args {
     #[arg(
         long,
         default_value_t = false,
-        help = "Automatically solve gain-source Y32-Y34 phase with frinZ acel, update L clock, and synthesize all scans"
+        help = "Automatically solve gain-source Y32-Y34 group delay and phase with frinZ peak+acel, update L clock, and synthesize all scans"
     )]
     pub gain_phasecal: bool,
 
