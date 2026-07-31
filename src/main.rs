@@ -3496,14 +3496,46 @@ fn run_once(
     let avail_samples2 = total_samples2.saturating_sub(start_s2);
     let avail_samples = avail_samples1.min(avail_samples2);
     let available_sec = avail_samples as f64 / fs;
+    // A phased-array raw file represents a virtual station on the original
+    // scan time grid. Do not shorten that scan merely because coarse
+    // read-alignment starts one physical input a few samples later. The input
+    // readers already pad EOF with zeroes, so only the unavailable boundary
+    // samples are affected. Correlation products retain the stricter
+    // common-overlap rule.
+    let nominal_samples1 = total_samples1.saturating_sub(total_skip_samples);
+    let nominal_samples2 = total_samples2.saturating_sub(total_skip_samples);
+    let nominal_available_sec = nominal_samples1.min(nominal_samples2) as f64 / fs;
     let requested_sec = if let Some(window_sec) = process_window_sec {
         (window_sec - total_skip_sec).max(0.0)
     } else {
-        available_sec
+        if matches!(run_mode, RunMode::PhasedArray) {
+            nominal_available_sec
+        } else {
+            available_sec
+        }
     };
-    let total_sec = requested_sec.min(available_sec);
+    let total_sec = if matches!(run_mode, RunMode::PhasedArray) {
+        requested_sec.min(nominal_available_sec)
+    } else {
+        requested_sec.min(available_sec)
+    };
     // Keep only complete FFT frames.
     let total_f = complete_fft_frame_count(total_sec, fs, fft_len);
+    if matches!(run_mode, RunMode::PhasedArray) && total_sec > available_sec {
+        let output_samples = (total_f as u64).saturating_mul(fft_len as u64);
+        let eof_pad1 = start_s1
+            .saturating_add(output_samples)
+            .saturating_sub(total_samples1);
+        let eof_pad2 = start_s2
+            .saturating_add(output_samples)
+            .saturating_sub(total_samples2);
+        println!(
+            "[info] Phased scan-length preservation: {:.9}s output; EOF boundary padding ant1={} sample, ant2={} sample",
+            total_f as f64 * fft_len as f64 / fs,
+            eof_pad1,
+            eof_pad2
+        );
+    }
 
     let (weight1_raw, _, _, _) = resolve_weight(
         tsys1,
