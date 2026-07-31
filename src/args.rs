@@ -71,9 +71,23 @@ pub struct Args {
     #[arg(
         long,
         default_value_t = false,
-        help = "Also write phased autocorrelation .cor and diagnostic plots"
+        help = "Also write phased/input ACFs, input-pair XCF, and diagnostic plots"
     )]
     pub phased_diagnostics: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run unattended three-station phased validation and write a complete NPZ"
+    )]
+    pub phased_validation: bool,
+
+    #[arg(
+        long,
+        value_name = "NPZ",
+        help = "Output NPZ path for --phased-validation"
+    )]
+    pub phased_validation_npz: Option<PathBuf>,
 
     // Correlation processing parameters
     #[arg(
@@ -350,6 +364,12 @@ pub struct Args {
     #[arg(long, hide = true, value_name = "N")]
     pub process_index: Option<usize>,
 
+    #[arg(long, hide = true)]
+    pub ant1_name_override: Option<String>,
+
+    #[arg(long, hide = true)]
+    pub ant2_name_override: Option<String>,
+
     #[arg(long, hide = true, default_value = "ant2", value_parser = clap::builder::PossibleValuesParser::new(["ant1", "ant2"]))]
     pub delay_reference: String,
 
@@ -493,6 +513,7 @@ pub fn resolve_weight(
 mod tests {
     use super::{resolve_weight, Args};
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn usb_storage_flag_parses_with_mkxml_and_defaults_off() {
@@ -537,6 +558,8 @@ mod tests {
         let args = Args::try_parse_from(["yi-phasedarray", "--mkxml"]).unwrap();
         assert_eq!(args.phased_name, "YAMAGU66");
         assert!(!args.phased_diagnostics);
+        assert!(!args.phased_validation);
+        assert!(args.phased_validation_npz.is_none());
 
         let args = Args::try_parse_from([
             "yi-phasedarray",
@@ -548,6 +571,20 @@ mod tests {
         .unwrap();
         assert_eq!(args.phased_name, "ARRAY1");
         assert!(args.phased_diagnostics);
+
+        let args = Args::try_parse_from([
+            "yi-phasedarray",
+            "--mkxml",
+            "--phased-validation",
+            "--phased-validation-npz",
+            "validation.npz",
+        ])
+        .unwrap();
+        assert!(args.phased_validation);
+        assert_eq!(
+            args.phased_validation_npz,
+            Some(PathBuf::from("validation.npz"))
+        );
     }
 
     #[test]

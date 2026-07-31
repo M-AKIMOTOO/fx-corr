@@ -230,12 +230,85 @@ quantizer occupancy.
 Optional `--phased-diagnostics` also writes:
 
 - `YAMAGU66_YAMAGU66_<TAG>_phasedarray.cor`
+- `<ANT1>_<ANT1>_<TAG>_phasedarray.cor`
+- `<ANT1>_<ANT2>_<TAG>_phasedarray.cor`
+- `<ANT2>_<ANT2>_<TAG>_phasedarray.cor`
 - `YAMAGU66_<TAG>_phased_auto_spectrum.png`
 - `YAMAGU66_<TAG>_phased_spectrum_amplitude.png`
 - `YAMAGU66_<TAG>_phased_autocorrelation.png`
 
 `--output DIR` selects the destination directory. If omitted,
 yi-phasedarray writes to the current directory.
+
+#### Three-station phased visibility validation
+
+`tools/phased_visibility_validation.py` combines the complete correlation set
+for a two-antenna phased station and an independent reference station into one
+compressed NumPy archive. For YAMAGU32 + YAMAGU34 phased as YAMAGU66 against
+HITACH32, the required products are:
+
+- YAMAGU32--YAMAGU34, YAMAGU32--HITACH32, and
+  YAMAGU34--HITACH32 XCFs;
+- YAMAGU66--HITACH32 XCF;
+- YAMAGU32, YAMAGU34, HITACH32, and YAMAGU66 ACFs.
+
+The unattended path is a single yi-phasedarray command:
+
+```bash
+yi-phasedarray \
+  --sc S25302A_2_KLH.xml \
+  --raw ../raw \
+  --output phased_array \
+  --phased-name YAMAGU66 \
+  --phased-validation
+```
+
+The selected XML scan must contain exactly three closure baselines for three
+stations. Unless the hidden diagnostic `--process-index` is supplied,
+yi-phasedarray selects the geometrically shortest baseline as the phased pair;
+with YAMAGU32, YAMAGU34, and HITACH32 this selects the approximately 110 m
+YAMAGU32--YAMAGU34 baseline and leaves HITACH32 as the independent station.
+The command then runs without further input:
+
+1. synthesize YAMAGU66 and write the short-baseline diagnostics;
+2. correlate YAMAGU32--HITACH32 and YAMAGU34--HITACH32;
+3. correlate the requantized YAMAGU66 raw against HITACH32;
+4. write `YAMAGU66_<TAG>_visibility_validation.npz`.
+
+Long-baseline `.cor` products are retained below
+`<output>/phased_validation/`. `--phased-validation-npz FILE` overrides the
+NPZ destination. The NPZ step uses `python3` and NumPy; set `YI_PYTHON` to
+another Python executable if needed. Explicit XML/CLI process lengths are
+preserved for every baseline so all visibility arrays have identical sector
+timestamps and integration boundaries.
+
+Run yi-phasedarray with `--phased-diagnostics` on the YAMAGU32--YAMAGU34
+process. That single pass now writes the two input ACFs, the short-baseline XCF,
+and the phased ACF from exactly the FFTs used for synthesis. Use yi-corr for
+the three independent long-baseline products. All `.cor` files must use the
+same FFT, integration boundaries, observing frequency, and process window.
+
+```bash
+python3 tools/phased_visibility_validation.py \
+  --y32-y34 YAMAGU32_YAMAGU34_TAG_phasedarray.cor \
+  --y32-h YAMAGU32_HITACH32_TAG_yi-corr6.cor \
+  --y34-h YAMAGU34_HITACH32_TAG_yi-corr6.cor \
+  --y66-h YAMAGU66_HITACH32_TAG_yi-corr6.cor \
+  --y32-acf YAMAGU32_YAMAGU32_TAG_phasedarray.cor \
+  --y34-acf YAMAGU34_YAMAGU34_TAG_phasedarray.cor \
+  --h-acf HITACH32_HITACH32_TAG_yi-corr6.cor \
+  --y66-acf phased_validation/YAMAGU66_YAMAGU66_TAG_yi-corr6.cor \
+  --y66-prequant-acf YAMAGU66_YAMAGU66_TAG_phasedarray.cor \
+  --output YAMAGU66_TAG_visibility_validation.npz
+```
+
+Optional `--freq-min` and `--freq-max` select the IF-frequency range used for
+summary coefficients without removing any stored channel. The NPZ retains the
+raw complex XCFs and ACFs, normalized complex visibility coefficients,
+amplitude and phase arrays, per-time and per-frequency Pearson coefficients,
+YAMAGU32--YAMAGU34--HITACH32 closure phase, the weighted prediction for
+YAMAGU66--HITACH32, its fitted complex scale, coherence, and normalized
+residual. Reversed `.cor` baseline order is conjugated automatically.
 
 ### In-band `.cor` splitting
 
@@ -2107,6 +2180,8 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.3.0` | Added unattended three-station phased validation. yi-phasedarray selects the shortest closure baseline as the phased pair, preserves its input ACFs/XCF and pre-quantization phased ACF, correlates both component stations and the requantized virtual station against the independent station, and writes all raw/normalized complex visibilities, amplitudes, phases, Pearson coefficients, closure phase, prediction coherence, and residuals to one NPZ. Explicit process lengths now retain identical boundary-padded time grids in yi-corr and yi-phasedarray. |
+| `3.2.4` | Preserved the nominal phased raw scan duration across a nonzero delay seek, padding only the unavailable EOF boundary instead of dropping complete FFT frames. |
 | `3.2.3` | Preserved the original physical 32-bit VSREC word boundary during non-word-aligned delay seeks. The reader now starts at a preceding native word and leaves the remaining samples to FX integer/fractional delay correction, preventing the four spectral images caused by shuffle-after-bit-repack. |
 | `3.2.2` | Fixed `yi-phasedarray` to restore the native sideband and the complete packed-data format bundle of the selected output-grid antenna. In particular, LSB input is converted back from the internal USB processing domain before requantization. |
 | `3.2.1` | Fixed `yi-phasedarray` raw output to inherit antenna 1 physical shuffle ordering, so VSREC readers receive the same packed bit layout as the input instead of canonical internal ordering. |

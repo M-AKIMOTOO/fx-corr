@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -2536,6 +2537,24 @@ fn main() -> Result<(), DynError> {
     } else {
         None
     };
+    if args.phased_validation {
+        if !matches!(run_mode, RunMode::PhasedArray) {
+            return Err("--phased-validation is supported only by yi-phasedarray".into());
+        }
+        if args.ant1.is_some() || args.ant2.is_some() {
+            return Err(
+                "--phased-validation requires schedule/raw-directory auto-resolution; do not set --ant1/--ant2"
+                    .into(),
+            );
+        }
+        let meta = if_d
+            .as_ref()
+            .ok_or("--phased-validation requires a three-station schedule XML")?;
+        return run_phased_validation_workflow(args, meta, cpu_threads, reader_core);
+    }
+    if args.phased_validation_npz.is_some() {
+        return Err("--phased-validation-npz requires --phased-validation".into());
+    }
     if let Some(meta) = if_d.as_ref() {
         let run_all_processes = meta.processes.len() > 1
             && args.process_index.is_none()
@@ -2592,6 +2611,481 @@ fn main() -> Result<(), DynError> {
     run_once(args, run_mode, cpu_threads, reader_core)
 }
 
+fn same_validation_scan(a: &ifile::ProcessEntry, b: &ifile::ProcessEntry) -> bool {
+    a.epoch == b.epoch
+        && a.skip_sec.to_bits() == b.skip_sec.to_bits()
+        && a.length_sec.map(f64::to_bits) == b.length_sec.map(f64::to_bits)
+        && a.object == b.object
+}
+
+fn process_keys(process: &ifile::ProcessEntry) -> Result<(&str, &str), DynError> {
+    Ok((
+        process
+            .ant1_station_key
+            .as_deref()
+            .ok_or("validation process is missing ant1 station key")?,
+        process
+            .ant2_station_key
+            .as_deref()
+            .ok_or("validation process is missing ant2 station key")?,
+    ))
+}
+
+fn find_process_pair(
+    processes: &[ifile::ProcessEntry],
+    scan_indices: &[usize],
+    key1: &str,
+    key2: &str,
+) -> Result<usize, DynError> {
+    scan_indices
+        .iter()
+        .copied()
+        .find(|&index| {
+            process_keys(&processes[index])
+                .is_ok_and(|(a, b)| (a == key1 && b == key2) || (a == key2 && b == key1))
+        })
+        .ok_or_else(|| format!("validation scan is missing baseline {key1}-{key2}").into())
+}
+
+fn station_name_for_key<'a>(data: &'a ifile::IFileData, key: &str) -> Result<&'a str, DynError> {
+    if data.ant1_station_key.as_deref() == Some(key) {
+        data.ant1_station_name
+            .as_deref()
+            .ok_or_else(|| format!("station key {key} has no name").into())
+    } else if data.ant2_station_key.as_deref() == Some(key) {
+        data.ant2_station_name
+            .as_deref()
+            .ok_or_else(|| format!("station key {key} has no name").into())
+    } else {
+        Err(format!("station key {key} is not present in selected process").into())
+    }
+}
+
+fn meta_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        .map(str::trim)
+}
+
+fn cor_product_path(
+    dir: &std::path::Path,
+    left: &str,
+    right: &str,
+    tag: &str,
+    label: &str,
+) -> PathBuf {
+    dir.join(format!(
+        "{}_{}_{}_{}.cor",
+        sanitize_file_token(left),
+        sanitize_file_token(right),
+        tag,
+        sanitize_file_token(label)
+    ))
+}
+
+fn run_phased_validation_workflow(
+    args: args::Args,
+    schedule_meta: &ifile::IFileData,
+    cpu_threads: usize,
+    reader_core: Option<core_affinity::CoreId>,
+) -> Result<(), DynError> {
+    let schedule = args
+        .schedule
+        .as_ref()
+        .ok_or("--phased-validation requires --schedule")?;
+    if schedule_meta.processes.len() < 3 {
+        return Err("--phased-validation requires a three-baseline closure process".into());
+    }
+
+    let phase_index = if let Some(index) = args.process_index {
+        if index >= schedule_meta.processes.len() {
+            return Err(format!(
+                "--process-index {} out of range (0..{})",
+                index,
+                schedule_meta.processes.len().saturating_sub(1)
+            )
+            .into());
+        }
+        index
+    } else {
+        let mut shortest = None::<(usize, f64)>;
+        for index in 0..schedule_meta.processes.len() {
+            let data = ifile::parse_ifile_for_process(schedule, Some(index))?;
+            let xyz1 = data
+                .ant1_ecef_m
+                .ok_or("validation station 1 is missing ECEF coordinates")?;
+            let xyz2 = data
+                .ant2_ecef_m
+                .ok_or("validation station 2 is missing ECEF coordinates")?;
+            let length = ((xyz2[0] - xyz1[0]).powi(2)
+                + (xyz2[1] - xyz1[1]).powi(2)
+                + (xyz2[2] - xyz1[2]).powi(2))
+            .sqrt();
+            if shortest.is_none_or(|(_, best)| length < best) {
+                shortest = Some((index, length));
+            }
+        }
+        shortest
+            .map(|(index, _)| index)
+            .ok_or("no validation baseline found")?
+    };
+
+    let phase_process = &schedule_meta.processes[phase_index];
+    let scan_indices = schedule_meta
+        .processes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, process)| {
+            same_validation_scan(phase_process, process).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if scan_indices.len() != 3 {
+        return Err(format!(
+            "--phased-validation requires exactly three closure baselines in one scan; found {}",
+            scan_indices.len()
+        )
+        .into());
+    }
+    let mut station_keys = HashSet::new();
+    for &index in &scan_indices {
+        let (a, b) = process_keys(&schedule_meta.processes[index])?;
+        station_keys.insert(a.to_string());
+        station_keys.insert(b.to_string());
+    }
+    if station_keys.len() != 3 {
+        return Err(format!(
+            "--phased-validation requires exactly three stations; found {}",
+            station_keys.len()
+        )
+        .into());
+    }
+
+    let (phase_key1, phase_key2) = process_keys(phase_process)?;
+    let validation_key = station_keys
+        .iter()
+        .find(|key| key.as_str() != phase_key1 && key.as_str() != phase_key2)
+        .cloned()
+        .ok_or("could not identify independent validation station")?;
+    let long1_index = find_process_pair(
+        &schedule_meta.processes,
+        &scan_indices,
+        phase_key1,
+        &validation_key,
+    )?;
+    let long2_index = find_process_pair(
+        &schedule_meta.processes,
+        &scan_indices,
+        phase_key2,
+        &validation_key,
+    )?;
+
+    let phase_data = ifile::parse_ifile_for_process(schedule, Some(phase_index))?;
+    if phase_data.inband.unwrap_or(1) != 1 {
+        return Err("--phased-validation currently requires stream/inband=1".into());
+    }
+    let phase_name1 = station_name_for_key(&phase_data, phase_key1)?.to_string();
+    let phase_name2 = station_name_for_key(&phase_data, phase_key2)?.to_string();
+    let validation_data = ifile::parse_ifile_for_process(schedule, Some(long1_index))?;
+    let validation_name = station_name_for_key(&validation_data, &validation_key)?.to_string();
+
+    let xyz1 = phase_data
+        .ant1_ecef_m
+        .ok_or("phased station 1 is missing ECEF coordinates")?;
+    let xyz2 = phase_data
+        .ant2_ecef_m
+        .ok_or("phased station 2 is missing ECEF coordinates")?;
+    let short_length_m =
+        ((xyz2[0] - xyz1[0]).powi(2) + (xyz2[1] - xyz1[1]).powi(2) + (xyz2[2] - xyz1[2]).powi(2))
+            .sqrt();
+    println!("[validation] unattended three-station workflow enabled");
+    println!(
+        "[validation] phased pair: {}-{} (keys {}{}, {:.3} m); independent station: {} ({})",
+        phase_name1,
+        phase_name2,
+        phase_key1,
+        phase_key2,
+        short_length_m,
+        validation_name,
+        validation_key
+    );
+    let python = std::env::var("YI_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let numpy_status = Command::new(&python)
+        .args(["-c", "import numpy"])
+        .status()
+        .map_err(|e| format!("failed to start NPZ Python executable '{python}': {e}"))?;
+    if !numpy_status.success() {
+        return Err(format!(
+            "--phased-validation requires NumPy in {} (set YI_PYTHON to another executable)",
+            python
+        )
+        .into());
+    }
+    println!("[validation] NPZ preflight: {} + NumPy available", python);
+
+    let (_, raw_tag) = epoch_to_yyyydddhhmmss(&phase_process.epoch)?;
+    let (epoch_unix, _) = epoch_to_yyyydddhhmmss(&phase_process.epoch)?;
+    let total_skip_s = phase_process.skip_sec + args.skip;
+    let output_tag = unix_seconds_to_yyyydddhhmmss(epoch_unix + total_skip_s.round() as i64)?;
+    let output_dir = args
+        .cor_directory
+        .clone()
+        .unwrap_or(std::env::current_dir()?);
+    std::fs::create_dir_all(&output_dir)?;
+    let phased_name = sanitize_file_token(&args.phased_name);
+    let phased_raw = output_dir.join(format!("{phased_name}_{output_tag}.raw"));
+
+    println!("[validation] stage 1/4: synthesize phased raw and short-baseline diagnostics");
+    let mut synth_args = args.clone();
+    synth_args.process_index = Some(phase_index);
+    synth_args.phased_validation = false;
+    synth_args.phased_validation_npz = None;
+    synth_args.phased_diagnostics = true;
+    synth_args.compact_logs = false;
+    run_once(synth_args, RunMode::PhasedArray, cpu_threads, reader_core)?;
+
+    let phased_meta_path = phased_raw.with_extension("raw.meta");
+    let phased_meta = read_to_string(&phased_meta_path)?;
+    let reference_name = meta_value(&phased_meta, "reference_station")
+        .ok_or("phased metadata is missing reference_station")?;
+    let reference_key = if reference_name == phase_name1 {
+        phase_key1
+    } else if reference_name == phase_name2 {
+        phase_key2
+    } else {
+        return Err(format!(
+            "phased reference station '{}' does not match {} or {}",
+            reference_name, phase_name1, phase_name2
+        )
+        .into());
+    };
+    let weight1 = meta_value(&phased_meta, "weight_ant1")
+        .ok_or("phased metadata is missing weight_ant1")?
+        .parse::<f64>()?;
+    let weight2 = meta_value(&phased_meta, "weight_ant2")
+        .ok_or("phased metadata is missing weight_ant2")?
+        .parse::<f64>()?;
+
+    let validation_dir = output_dir.join("phased_validation");
+    std::fs::create_dir_all(&validation_dir)?;
+    println!(
+        "[validation] stage 2/4: correlate both component stations with {}",
+        validation_name
+    );
+    for &index in &[long1_index, long2_index] {
+        let mut corr_args = args.clone();
+        corr_args.process_index = Some(index);
+        corr_args.phased_validation = false;
+        corr_args.phased_validation_npz = None;
+        corr_args.phased_diagnostics = false;
+        corr_args.cor_directory = Some(validation_dir.clone());
+        corr_args.ant1 = None;
+        corr_args.ant2 = None;
+        corr_args.ant1_name_override = None;
+        corr_args.ant2_name_override = None;
+        corr_args.compact_logs = true;
+        run_once(corr_args, RunMode::Corr, cpu_threads, reader_core)?;
+    }
+
+    println!(
+        "[validation] stage 3/4: correlate {} with {}",
+        phased_name, validation_name
+    );
+    let reference_long_index = find_process_pair(
+        &schedule_meta.processes,
+        &scan_indices,
+        reference_key,
+        &validation_key,
+    )?;
+    let reference_long_data = ifile::parse_ifile_for_process(schedule, Some(reference_long_index))?;
+    let raw_dir = args
+        .raw_directory
+        .as_ref()
+        .ok_or("--phased-validation requires --raw-directory")?;
+    let validation_raw = raw_dir.join(format!("{}_{}.raw", validation_name, raw_tag));
+    if !validation_raw.is_file() {
+        return Err(format!(
+            "validation-station raw file not found: {}",
+            validation_raw.display()
+        )
+        .into());
+    }
+    let reference_is_ant1 = reference_long_data.ant1_station_key.as_deref() == Some(reference_key);
+    let mut phased_corr_args = args.clone();
+    phased_corr_args.process_index = Some(reference_long_index);
+    phased_corr_args.phased_validation = false;
+    phased_corr_args.phased_validation_npz = None;
+    phased_corr_args.phased_diagnostics = false;
+    phased_corr_args.cor_directory = Some(validation_dir.clone());
+    phased_corr_args.compact_logs = true;
+    if reference_is_ant1 {
+        phased_corr_args.ant1 = Some(phased_raw.clone());
+        phased_corr_args.ant2 = Some(validation_raw);
+        phased_corr_args.ant1_name_override = Some(phased_name.clone());
+        phased_corr_args.ant2_name_override = None;
+    } else {
+        phased_corr_args.ant1 = Some(validation_raw);
+        phased_corr_args.ant2 = Some(phased_raw.clone());
+        phased_corr_args.ant1_name_override = None;
+        phased_corr_args.ant2_name_override = Some(phased_name.clone());
+    }
+    run_once(phased_corr_args, RunMode::Corr, cpu_threads, reader_core)?;
+
+    let stream_label = phase_data.stream_label.as_deref().unwrap_or("phasedarray");
+    let long1_data = ifile::parse_ifile_for_process(schedule, Some(long1_index))?;
+    let long2_data = ifile::parse_ifile_for_process(schedule, Some(long2_index))?;
+    let long1_left = long1_data
+        .ant1_station_name
+        .as_deref()
+        .ok_or("long baseline 1 missing ant1 name")?;
+    let long1_right = long1_data
+        .ant2_station_name
+        .as_deref()
+        .ok_or("long baseline 1 missing ant2 name")?;
+    let long2_left = long2_data
+        .ant1_station_name
+        .as_deref()
+        .ok_or("long baseline 2 missing ant1 name")?;
+    let long2_right = long2_data
+        .ant2_station_name
+        .as_deref()
+        .ok_or("long baseline 2 missing ant2 name")?;
+    let beam_left = if reference_is_ant1 {
+        phased_name.as_str()
+    } else {
+        validation_name.as_str()
+    };
+    let beam_right = if reference_is_ant1 {
+        validation_name.as_str()
+    } else {
+        phased_name.as_str()
+    };
+    let short_xcf = cor_product_path(
+        &output_dir,
+        &phase_name1,
+        &phase_name2,
+        &output_tag,
+        "phasedarray",
+    );
+    let short_acf1 = cor_product_path(
+        &output_dir,
+        &phase_name1,
+        &phase_name1,
+        &output_tag,
+        "phasedarray",
+    );
+    let short_acf2 = cor_product_path(
+        &output_dir,
+        &phase_name2,
+        &phase_name2,
+        &output_tag,
+        "phasedarray",
+    );
+    let beam_prequant_acf = cor_product_path(
+        &output_dir,
+        &phased_name,
+        &phased_name,
+        &output_tag,
+        "phasedarray",
+    );
+    let long1_xcf = cor_product_path(
+        &validation_dir,
+        long1_left,
+        long1_right,
+        &output_tag,
+        stream_label,
+    );
+    let long2_xcf = cor_product_path(
+        &validation_dir,
+        long2_left,
+        long2_right,
+        &output_tag,
+        stream_label,
+    );
+    let h_acf = cor_product_path(
+        &validation_dir,
+        &validation_name,
+        &validation_name,
+        &output_tag,
+        stream_label,
+    );
+    let beam_xcf = cor_product_path(
+        &validation_dir,
+        beam_left,
+        beam_right,
+        &output_tag,
+        stream_label,
+    );
+    let beam_acf = cor_product_path(
+        &validation_dir,
+        &phased_name,
+        &phased_name,
+        &output_tag,
+        stream_label,
+    );
+
+    println!("[validation] stage 4/4: build complete visibility NPZ");
+    let npz_path = args.phased_validation_npz.clone().unwrap_or_else(|| {
+        output_dir.join(format!(
+            "{}_{}_visibility_validation.npz",
+            phased_name, output_tag
+        ))
+    });
+    if let Some(parent) = npz_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let validator_path = validation_dir.join(".phased_visibility_validation.py");
+    std::fs::write(
+        &validator_path,
+        include_str!("../tools/phased_visibility_validation.py"),
+    )?;
+    let status = Command::new(&python)
+        .arg(&validator_path)
+        .arg("--y32-y34")
+        .arg(&short_xcf)
+        .arg("--y32-h")
+        .arg(&long1_xcf)
+        .arg("--y34-h")
+        .arg(&long2_xcf)
+        .arg("--y66-h")
+        .arg(&beam_xcf)
+        .arg("--y32-acf")
+        .arg(&short_acf1)
+        .arg("--y34-acf")
+        .arg(&short_acf2)
+        .arg("--h-acf")
+        .arg(&h_acf)
+        .arg("--y66-acf")
+        .arg(&beam_acf)
+        .arg("--y66-prequant-acf")
+        .arg(&beam_prequant_acf)
+        .arg("--output")
+        .arg(&npz_path)
+        .arg("--y32-name")
+        .arg(&phase_name1)
+        .arg("--y34-name")
+        .arg(&phase_name2)
+        .arg("--h-name")
+        .arg(&validation_name)
+        .arg("--y66-name")
+        .arg(&phased_name)
+        .arg("--weight-y32")
+        .arg(weight1.to_string())
+        .arg("--weight-y34")
+        .arg(weight2.to_string())
+        .status()?;
+    let _ = std::fs::remove_file(&validator_path);
+    if !status.success() {
+        return Err(format!("NPZ validator exited with status {status}").into());
+    }
+    println!(
+        "[validation] complete: raw={} cor-dir={} npz={}",
+        phased_raw.display(),
+        validation_dir.display(),
+        npz_path.display()
+    );
+    Ok(())
+}
+
 fn run_once(
     args: args::Args,
     run_mode: RunMode,
@@ -2610,8 +3104,13 @@ fn run_once(
     let do_xcf = false;
     let do_synth = true;
     let write_raw = matches!(run_mode, RunMode::PhasedArray);
-    let write_acf_cor = matches!(run_mode, RunMode::Corr);
-    let write_xcf_cor = matches!(run_mode, RunMode::Corr);
+    // Phased diagnostics preserve the complete input-pair visibility set from
+    // the very same aligned FFTs used to form the virtual station. This makes
+    // the phasing result independently testable without re-correlating the
+    // short baseline in a separate yi-corr run.
+    let write_input_pair_cor = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
+    let write_acf_cor = matches!(run_mode, RunMode::Corr) || write_input_pair_cor;
+    let write_xcf_cor = matches!(run_mode, RunMode::Corr) || write_input_pair_cor;
     let write_phased_cor = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
     let plot_phased = matches!(run_mode, RunMode::PhasedArray) && args.phased_diagnostics;
     let if_d = if let Some(p) = &args.schedule {
@@ -3496,12 +3995,12 @@ fn run_once(
     let avail_samples2 = total_samples2.saturating_sub(start_s2);
     let avail_samples = avail_samples1.min(avail_samples2);
     let available_sec = avail_samples as f64 / fs;
-    // A phased-array raw file represents a virtual station on the original
-    // scan time grid. Do not shorten that scan merely because coarse
-    // read-alignment starts one physical input a few samples later. The input
-    // readers already pad EOF with zeroes, so only the unavailable boundary
-    // samples are affected. Correlation products retain the stricter
-    // common-overlap rule.
+    // An explicitly requested process window remains on the original scan time
+    // grid. Do not shorten it merely because coarse read-alignment starts one
+    // physical input a few samples later. The readers already pad EOF, so only
+    // the unavailable boundary samples are affected. With no explicit process
+    // window, yi-corr retains the conservative common-overlap duration while a
+    // phased raw keeps the nominal virtual-station scan duration.
     let nominal_samples1 = total_samples1.saturating_sub(total_skip_samples);
     let nominal_samples2 = total_samples2.saturating_sub(total_skip_samples);
     let nominal_available_sec = nominal_samples1.min(nominal_samples2) as f64 / fs;
@@ -3514,14 +4013,16 @@ fn run_once(
             available_sec
         }
     };
-    let total_sec = if matches!(run_mode, RunMode::PhasedArray) {
+    let preserve_requested_window =
+        process_window_sec.is_some() || matches!(run_mode, RunMode::PhasedArray);
+    let total_sec = if preserve_requested_window {
         requested_sec.min(nominal_available_sec)
     } else {
         requested_sec.min(available_sec)
     };
     // Keep only complete FFT frames.
     let total_f = complete_fft_frame_count(total_sec, fs, fft_len);
-    if matches!(run_mode, RunMode::PhasedArray) && total_sec > available_sec {
+    if total_sec > available_sec {
         let output_samples = (total_f as u64).saturating_mul(fft_len as u64);
         let eof_pad1 = start_s1
             .saturating_add(output_samples)
@@ -3530,7 +4031,8 @@ fn run_once(
             .saturating_add(output_samples)
             .saturating_sub(total_samples2);
         println!(
-            "[info] Phased scan-length preservation: {:.9}s output; EOF boundary padding ant1={} sample, ant2={} sample",
+            "[info] Requested scan-length preservation: mode={} {:.9}s output; EOF boundary padding ant1={} sample, ant2={} sample",
+            run_mode.label(),
             total_f as f64 * fft_len as f64 / fs,
             eof_pad1,
             eof_pad2
@@ -3563,14 +4065,18 @@ fn run_once(
         level_power2,
         level_power_out,
     )?;
-    let a1_name = if_d
-        .as_ref()
-        .and_then(|d| d.ant1_station_name.as_deref())
-        .unwrap_or("YAMAGU32");
-    let a2_name = if_d
-        .as_ref()
-        .and_then(|d| d.ant2_station_name.as_deref())
-        .unwrap_or("YAMAGU34");
+    let a1_name_owned = args
+        .ant1_name_override
+        .clone()
+        .or_else(|| if_d.as_ref().and_then(|d| d.ant1_station_name.clone()))
+        .unwrap_or_else(|| "YAMAGU32".to_string());
+    let a2_name_owned = args
+        .ant2_name_override
+        .clone()
+        .or_else(|| if_d.as_ref().and_then(|d| d.ant2_station_name.clone()))
+        .unwrap_or_else(|| "YAMAGU34".to_string());
+    let a1_name = a1_name_owned.as_str();
+    let a2_name = a2_name_owned.as_str();
     let output_format_name = match out_grid {
         OutputGrid::Ant1 => a1_name,
         OutputGrid::Ant2 => a2_name,
