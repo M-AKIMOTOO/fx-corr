@@ -488,6 +488,19 @@ mod correlation_hot_path_tests {
         );
         assert_eq!(peak_delay_from_output_line("# header"), None);
     }
+
+    #[test]
+    fn frinz_degree_coefficients_convert_to_clock_polynomial() {
+        let fit = FrinzQuadratic {
+            c0_deg: 36.0,
+            c1_deg_s: 0.36,
+            c2_deg_s2: 0.18,
+        };
+        let (delay, rate, accel) = frinz_degree_fit_to_clock(fit, 100.0e6).unwrap();
+        assert!((delay - 1.0e-9).abs() < 1.0e-24);
+        assert!((rate - 1.0e-11).abs() < 1.0e-26);
+        assert!((accel - 1.0e-11).abs() < 1.0e-26);
+    }
 }
 
 #[inline]
@@ -2999,9 +3012,9 @@ fn run_frinz_peak_delay(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FrinzQuadratic {
-    c0_rad: f64,
-    c1_rad_s: f64,
-    c2_rad_s2: f64,
+    c0_deg: f64,
+    c1_deg_s: f64,
+    c2_deg_s2: f64,
 }
 
 fn parse_frinz_quadratic(path: &Path) -> Result<FrinzQuadratic, DynError> {
@@ -3017,13 +3030,13 @@ fn parse_frinz_quadratic(path: &Path) -> Result<FrinzQuadratic, DynError> {
             continue;
         };
         let result = FrinzQuadratic {
-            c0_rad: c0.trim().parse()?,
-            c1_rad_s: c1.trim().parse()?,
-            c2_rad_s2: c2.trim().parse()?,
+            c0_deg: c0.trim().parse()?,
+            c1_deg_s: c1.trim().parse()?,
+            c2_deg_s2: c2.trim().parse()?,
         };
-        if !result.c0_rad.is_finite()
-            || !result.c1_rad_s.is_finite()
-            || !result.c2_rad_s2.is_finite()
+        if !result.c0_deg.is_finite()
+            || !result.c1_deg_s.is_finite()
+            || !result.c2_deg_s2.is_finite()
         {
             return Err(format!("non-finite frinZ quadratic in {}", path.display()).into());
         }
@@ -3034,6 +3047,24 @@ fn parse_frinz_quadratic(path: &Path) -> Result<FrinzQuadratic, DynError> {
         path.display()
     )
     .into())
+}
+
+fn frinz_degree_fit_to_clock(
+    fit: FrinzQuadratic,
+    frequency_hz: f64,
+) -> Result<(f64, f64, f64), DynError> {
+    if !frequency_hz.is_finite() || frequency_hz <= 0.0 {
+        return Err("frinZ phase-reference frequency must be positive".into());
+    }
+    // frinZ fits phase in degrees:
+    //   phase_deg = c2*t^2 + c1*t + c0
+    // while a clock polynomial produces:
+    //   phase_deg = 360*f*(delay + rate*t + accel*t^2/2).
+    Ok((
+        fit.c0_deg / (360.0 * frequency_hz),
+        fit.c1_deg_s / (360.0 * frequency_hz),
+        fit.c2_deg_s2 / (180.0 * frequency_hz),
+    ))
 }
 
 fn cor_sector_count(path: &Path) -> Result<usize, DynError> {
@@ -3788,17 +3819,15 @@ fn run_automatic_gain_phasecal_workflow(
         return Err(format!("frinZ --search acel failed with status {}", status).into());
     }
     let fit = parse_frinz_quadratic(&fit_path)?;
-    let two_pi_f = 2.0 * std::f64::consts::PI * obsfreq_hz;
-    let phase_delay_s = fit.c0_rad / two_pi_f;
-    let delta_rate_sps = fit.c1_rad_s / two_pi_f;
-    let delta_accel_sps2 = fit.c2_rad_s2 / (std::f64::consts::PI * obsfreq_hz);
+    let (phase_delay_s, delta_rate_sps, delta_accel_sps2) =
+        frinz_degree_fit_to_clock(fit, obsfreq_hz)?;
     let total_delta_delay_s = group_delay_s + phase_delay_s;
     let final_solution = format!(
-        "{:016x}:{:016x}:{:016x}:{:016x}",
+        "phase-deg-v1:{:016x}:{:016x}:{:016x}:{:016x}",
         group_delay_bits,
-        fit.c0_rad.to_bits(),
-        fit.c1_rad_s.to_bits(),
-        fit.c2_rad_s2.to_bits()
+        fit.c0_deg.to_bits(),
+        fit.c1_deg_s.to_bits(),
+        fit.c2_deg_s2.to_bits()
     );
     if resume.final_solution.as_deref() != Some(final_solution.as_str()) {
         if resume.final_solution.is_some() {
@@ -3828,7 +3857,7 @@ fn run_automatic_gain_phasecal_workflow(
 
     let solution_path = gain_dir.join("gain_phasecal_solution.txt");
     let mut solution = BufWriter::new(File::create(&solution_path)?);
-    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v2")?;
+    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v3")?;
     writeln!(solution, "gain_source={}", gain_source)?;
     writeln!(
         solution,
@@ -3880,9 +3909,10 @@ fn run_automatic_gain_phasecal_workflow(
             .join(",")
     )?;
     writeln!(solution, "group_delay_s={:+.17e}", group_delay_s)?;
-    writeln!(solution, "phase_c0_rad={:+.17e}", fit.c0_rad)?;
-    writeln!(solution, "phase_c1_rad_s={:+.17e}", fit.c1_rad_s)?;
-    writeln!(solution, "phase_c2_rad_s2={:+.17e}", fit.c2_rad_s2)?;
+    writeln!(solution, "phase_unit=degree")?;
+    writeln!(solution, "phase_c0_deg={:+.17e}", fit.c0_deg)?;
+    writeln!(solution, "phase_c1_deg_s={:+.17e}", fit.c1_deg_s)?;
+    writeln!(solution, "phase_c2_deg_s2={:+.17e}", fit.c2_deg_s2)?;
     writeln!(solution, "phase_delay_s={:+.17e}", phase_delay_s)?;
     writeln!(
         solution,
@@ -3944,8 +3974,8 @@ fn run_automatic_gain_phasecal_workflow(
     writeln!(solution, "resume_file={}", resume_path.display())?;
     solution.flush()?;
     println!(
-        "[phasecal] acel solution after group delay: c0={:+.6e} rad c1={:+.6e} rad/s c2={:+.6e} rad/s^2",
-        fit.c0_rad, fit.c1_rad_s, fit.c2_rad_s2
+        "[phasecal] acel solution after group delay: c0={:+.6e} deg c1={:+.6e} deg/s c2={:+.6e} deg/s^2",
+        fit.c0_deg, fit.c1_deg_s, fit.c2_deg_s2
     );
     println!(
         "[phasecal] add to {}: group-delay={:+.9e}s phase-delay={:+.9e}s total-delay={:+.9e}s rate={:+.9e}s/s accel={:+.9e}s/s^2",

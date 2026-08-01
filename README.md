@@ -273,9 +273,7 @@ uses only ordered `K-L` processes for the solution and leaves K unchanged. It:
    every gain scan as `gain_delay_on.cor`;
 5. merges the group-delay-corrected products and runs
    `frinZ --search acel --frequency` on them;
-6. converts the residual fitted phase `c2*t^2 + c1*t + c0` into additional L
-   clock terms: `phase-delay=c0/(2*pi*f)`, `rate=c1/(2*pi*f)`, and
-   `accel=c2/(pi*f)`;
+6. treats the residual fitted phase `c2*t^2 + c1*t + c0` as degrees, matching frinZ output, and converts it into additional L clock terms: `phase-delay=c0/(360*f)`, `rate=c1/(360*f)`, and `accel=c2/(180*f)`;
 7. writes the final XML with
    `delay=median-peak-delay/sampling-rate + phase-delay`, correlates all gain
    scans as `gain_phasecal_on.cor`, and synthesizes every K-L target and gain
@@ -2283,6 +2281,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.5.4` | Corrected automatic `frinZ --search acel` interpretation from radians to degrees. For the fitted degree polynomial `c2*t^2+c1*t+c0`, L clock increments are now `delay=c0/(360*f)`, `rate=c1/(360*f)`, and `accel=c2/(180*f)`. The resume final-solution signature is unit-tagged so v3.5.3 phasecal-on and phased products are invalidated while valid phasecal-off and group-delay products remain reusable. |
 | `3.5.3` | Added atomic scan-level automatic gain-calibration resume state in `gain_correlation/gain_phasecal.resume`. Complete phasecal-off, group-delay, phasecal-on, and phased-raw scans are validated and reused; complete pre-resume phasecal-off products can be adopted. Changed XML or command conditions are rejected by a workflow fingerprint, and changed delay/phase solutions invalidate only dependent stages. |
 | `3.5.2` | Fixed parsing of real frinZ peak tables whose epoch is split into `YYYY/DDD` and `HH:MM:SS` columns. The parser now selects the explicit residual-delay column for both split and compact epoch formats, preventing valid delay windows from being reported as zero. |
 | `3.5.1` | Fixed automatic gain phase calibration to solve group delay explicitly before acceleration. All `--length`/`--loop --search peak` residual delays are collected; their outlier-resistant median is applied to L in an intermediate XML and verified by a new gain correlation pass. `--search acel --frequency` then runs on the group-delay-corrected products, and the final XML combines median group delay with residual phase-delay, rate, and acceleration. The solution audit records every peak delay plus median, MAD, min, and max. |
