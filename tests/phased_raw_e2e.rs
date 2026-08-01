@@ -118,7 +118,7 @@ if [ "$mode" = peak ]; then
   while [ "$i" -le "$loops" ]; do
     delay=+0.250000
     if [ "$i" -eq 7 ]; then delay=+99.000000; fi
-    printf '%s\n' "2000001000000 L GAIN 1.00 0.100000 20.0 +0.0 0.010000 $delay +0.000000 1 2 3 4 5 6 51544.0 - False False"
+    printf '%s\n' "2000/001 00:00:00 L GAIN 1.00 0.100000 20.0 +0.0 0.010000 $delay +0.000000 1 2 3 4 5 6 51544.0 - False False"
     i=$((i + 1))
   done
   exit 0
@@ -203,7 +203,7 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
-    assert!(meta.contains("software_version=3.5.1"));
+    assert!(meta.contains("software_version=3.5.2"));
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));

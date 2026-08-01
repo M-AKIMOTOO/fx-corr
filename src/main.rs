@@ -481,6 +481,11 @@ mod correlation_hot_path_tests {
     fn peak_delay_parser_reads_only_frinz_result_rows() {
         let row = "2025302070000 KL NRAO530 1.00 0.10 20.0 +1.0 0.01 -0.375 +0.002 1 2 3 4 5 6 51544.0 - False False";
         assert_eq!(peak_delay_from_output_line(row), Some(-0.375));
+        let real_frinz_row = "2025/302 08:15:00 phasecal_merged NRAO530 10.00 1.10 735.7 -36.975 0.001506 -13.31266975 +0.000916 216.3 34.7 165.7 216.3 34.7 166.6 60977.3 - False False";
+        assert_eq!(
+            peak_delay_from_output_line(real_frinz_row),
+            Some(-13.31266975)
+        );
         assert_eq!(peak_delay_from_output_line("# header"), None);
     }
 }
@@ -2900,13 +2905,31 @@ fn finite_median(mut values: Vec<f64>) -> Result<f64, DynError> {
 
 fn peak_delay_from_output_line(line: &str) -> Option<f64> {
     let fields = line.split_whitespace().collect::<Vec<_>>();
-    if fields.len() < 12
-        || fields[0].len() != 13
-        || !fields[0].bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if fields.len() < 12 {
         return None;
     }
-    fields[8]
+    let compact_epoch =
+        fields[0].len() == 13 && fields[0].bytes().all(|byte| byte.is_ascii_digit());
+    let split_epoch = fields.get(1).is_some_and(|time| {
+        let Some((year, doy)) = fields[0].split_once('/') else {
+            return false;
+        };
+        let date_ok = year.len() == 4
+            && doy.len() == 3
+            && year.bytes().all(|byte| byte.is_ascii_digit())
+            && doy.bytes().all(|byte| byte.is_ascii_digit());
+        let time_fields = time.split(':').collect::<Vec<_>>();
+        let time_ok = time_fields.len() == 3
+            && time_fields
+                .iter()
+                .all(|field| field.len() == 2 && field.bytes().all(|byte| byte.is_ascii_digit()));
+        date_ok && time_ok
+    });
+    if !compact_epoch && !split_epoch {
+        return None;
+    }
+    let delay_index = if split_epoch { 9 } else { 8 };
+    fields[delay_index]
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
