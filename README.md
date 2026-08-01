@@ -294,6 +294,8 @@ The input XML is never overwritten. By default the corrected schedule is
 - `gain_phasecal_solution.txt`, including fit coefficients, exact clock
   increments, old/new L polynomial values, paths, and the phase-delay ambiguity.
 
+The workflow writes `<output>/gain_correlation/gain_phasecal.resume` atomically through a `.tmp` file after every completed scan. Re-running the identical command validates and reuses complete stage 1, 3, 5, and 6 products instead of repeating their correlation or phased synthesis. A pre-resume `gain_phasecal_off.cor` is also adopted when its header, sector count, FFT size, and exact file length prove that it is complete. The resume fingerprint includes the input XML contents and command conditions; if either changes, yi-phasedarray stops instead of mixing incompatible products. Move or delete `gain_phasecal.resume` only when intentionally starting a new calibration.
+
 Each gain scan sector count must be divisible by `--gain-fringe-length`, which
 prevents a frinZ integration window from crossing a target/gain scan boundary.
 At least three windows are required for the quadratic fit. Set `YI_FRINZ` when
@@ -2281,6 +2283,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.5.3` | Added atomic scan-level automatic gain-calibration resume state in `gain_correlation/gain_phasecal.resume`. Complete phasecal-off, group-delay, phasecal-on, and phased-raw scans are validated and reused; complete pre-resume phasecal-off products can be adopted. Changed XML or command conditions are rejected by a workflow fingerprint, and changed delay/phase solutions invalidate only dependent stages. |
 | `3.5.2` | Fixed parsing of real frinZ peak tables whose epoch is split into `YYYY/DDD` and `HH:MM:SS` columns. The parser now selects the explicit residual-delay column for both split and compact epoch formats, preventing valid delay windows from being reported as zero. |
 | `3.5.1` | Fixed automatic gain phase calibration to solve group delay explicitly before acceleration. All `--length`/`--loop --search peak` residual delays are collected; their outlier-resistant median is applied to L in an intermediate XML and verified by a new gain correlation pass. `--search acel --frequency` then runs on the group-delay-corrected products, and the final XML combines median group delay with residual phase-delay, rate, and acceleration. The solution audit records every peak delay plus median, MAD, min, and max. |
 | `3.5.0` | Added a fully unattended yi-phasedarray gain phase-reference workflow. `--gain-phasecal --gain-source NAME` correlates and timestamp-preserving merges all K-L gain scans, runs `frinZ --search acel --frequency`, absorbs the quadratic phase into the L delay/rate/acceleration polynomial at an absolute epoch, writes a corrected schedule without overwriting the input, produces phasecal-off/on XCF verification files and a solution audit file, then synthesizes every target and gain scan. |

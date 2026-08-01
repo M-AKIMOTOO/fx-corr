@@ -203,7 +203,7 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
-    assert!(meta.contains("software_version=3.5.2"));
+    assert!(meta.contains("software_version=3.5.3"));
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));
@@ -590,5 +590,111 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
             raw.len() as u64
         );
     }
+
+    let resume_path = gain_dir.join("gain_phasecal.resume");
+    let resume = fs::read_to_string(&resume_path).unwrap();
+    assert!(resume.contains("format=yi-phasedarray-gain-phasecal-resume-v1"));
+    assert!(resume.contains("completed=off:2000001000000"));
+    assert!(resume.contains("completed=workflow:complete"));
+
+    // Simulate upgrading from a pre-resume release: complete phasecal-off .cor
+    // files exist but no state file does. They must be adopted, not recomputed.
+    fs::remove_file(&resume_path).unwrap();
+    let legacy_resume = Command::new(env!("CARGO_BIN_EXE_yi-phasedarray"))
+        .env("YI_FRINZ", &fake_frinz)
+        .args([
+            "--sc",
+            schedule.to_str().unwrap(),
+            "--raw",
+            raw_dir.to_str().unwrap(),
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--phased-name",
+            "YAMAGU66",
+            "--gain-phasecal",
+            "--gain-source",
+            "GAIN",
+            "--gain-reference-key",
+            "A",
+            "--gain-corrected-key",
+            "B",
+            "--gain-fringe-length",
+            "1",
+            "--cpu",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(legacy_resume.status.success());
+    let legacy_stdout = String::from_utf8_lossy(&legacy_resume.stdout);
+    assert!(legacy_stdout.contains("[resume] adopted complete legacy phasecal-off scan"));
+
+    // A subsequent identical run must reuse every expensive scan stage.
+    let resumed = Command::new(env!("CARGO_BIN_EXE_yi-phasedarray"))
+        .env("YI_FRINZ", &fake_frinz)
+        .args([
+            "--sc",
+            schedule.to_str().unwrap(),
+            "--raw",
+            raw_dir.to_str().unwrap(),
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--phased-name",
+            "YAMAGU66",
+            "--gain-phasecal",
+            "--gain-source",
+            "GAIN",
+            "--gain-reference-key",
+            "A",
+            "--gain-corrected-key",
+            "B",
+            "--gain-fringe-length",
+            "1",
+            "--cpu",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "resume run failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed_stdout = String::from_utf8_lossy(&resumed.stdout);
+    assert!(resumed_stdout.contains("[resume] reuse phasecal-off scan"));
+    assert!(resumed_stdout.contains("[resume] reuse group-delay scan"));
+    assert!(resumed_stdout.contains("[resume] reuse phasecal-on scan"));
+    assert!(resumed_stdout.contains("[resume] reuse phased scan"));
+
+    let changed_conditions = Command::new(env!("CARGO_BIN_EXE_yi-phasedarray"))
+        .env("YI_FRINZ", &fake_frinz)
+        .args([
+            "--sc",
+            schedule.to_str().unwrap(),
+            "--raw",
+            raw_dir.to_str().unwrap(),
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--phased-name",
+            "YAMAGU66",
+            "--gain-phasecal",
+            "--gain-source",
+            "GAIN",
+            "--gain-reference-key",
+            "A",
+            "--gain-corrected-key",
+            "B",
+            "--gain-fringe-length",
+            "2",
+            "--cpu",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!changed_conditions.status.success());
+    assert!(String::from_utf8_lossy(&changed_conditions.stderr)
+        .contains("gain resume conditions changed"));
+
     let _ = fs::remove_dir_all(root);
 }

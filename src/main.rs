@@ -3056,6 +3056,219 @@ fn cor_sector_count(path: &Path) -> Result<usize, DynError> {
     Ok(count as usize)
 }
 
+const GAIN_PHASECAL_RESUME_FORMAT: &str = "yi-phasedarray-gain-phasecal-resume-v1";
+
+#[derive(Clone, Debug)]
+struct GainPhasecalResume {
+    fingerprint: String,
+    group_delay_bits: Option<u64>,
+    final_solution: Option<String>,
+    completed: HashSet<String>,
+}
+
+fn fnv1a64(bytes: &[u8], mut hash: u64) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn gain_phasecal_resume_fingerprint(
+    schedule: &Path,
+    args: &args::Args,
+) -> Result<String, DynError> {
+    let schedule_bytes = std::fs::read(schedule)?;
+    let command_identity = format!("{:?}", args);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    hash = fnv1a64(GAIN_PHASECAL_RESUME_FORMAT.as_bytes(), hash);
+    hash = fnv1a64(&schedule_bytes, hash);
+    hash = fnv1a64(command_identity.as_bytes(), hash);
+    Ok(format!("{hash:016x}"))
+}
+
+fn load_gain_phasecal_resume(
+    path: &Path,
+    fingerprint: &str,
+) -> Result<(GainPhasecalResume, bool), DynError> {
+    if !path.exists() {
+        return Ok((
+            GainPhasecalResume {
+                fingerprint: fingerprint.to_string(),
+                group_delay_bits: None,
+                final_solution: None,
+                completed: HashSet::new(),
+            },
+            true,
+        ));
+    }
+    let text = read_to_string(path)?;
+    if meta_value(&text, "format") != Some(GAIN_PHASECAL_RESUME_FORMAT) {
+        return Err(format!(
+            "unsupported/corrupt gain resume file {}; move or delete it to restart",
+            path.display()
+        )
+        .into());
+    }
+    let stored_fingerprint = meta_value(&text, "fingerprint")
+        .ok_or_else(|| format!("gain resume file has no fingerprint: {}", path.display()))?;
+    if stored_fingerprint != fingerprint {
+        return Err(format!(
+            "gain resume conditions changed (stored {}, current {}); move or delete {} to restart safely",
+            stored_fingerprint,
+            fingerprint,
+            path.display()
+        )
+        .into());
+    }
+    let group_delay_bits = meta_value(&text, "group_delay_bits")
+        .filter(|value| *value != "-")
+        .map(|value| u64::from_str_radix(value, 16))
+        .transpose()?;
+    let final_solution = meta_value(&text, "final_solution")
+        .filter(|value| *value != "-")
+        .map(str::to_string);
+    let completed = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("completed="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok((
+        GainPhasecalResume {
+            fingerprint: fingerprint.to_string(),
+            group_delay_bits,
+            final_solution,
+            completed,
+        },
+        false,
+    ))
+}
+
+fn write_gain_phasecal_resume(path: &Path, state: &GainPhasecalResume) -> Result<(), DynError> {
+    let partial = PathBuf::from(format!("{}.tmp", path.display()));
+    let mut completed = state.completed.iter().collect::<Vec<_>>();
+    completed.sort();
+    let mut writer = BufWriter::new(File::create(&partial)?);
+    writeln!(writer, "format={}", GAIN_PHASECAL_RESUME_FORMAT)?;
+    writeln!(writer, "fingerprint={}", state.fingerprint)?;
+    writeln!(
+        writer,
+        "group_delay_bits={}",
+        state
+            .group_delay_bits
+            .map(|bits| format!("{bits:016x}"))
+            .unwrap_or_else(|| "-".to_string())
+    )?;
+    writeln!(
+        writer,
+        "final_solution={}",
+        state.final_solution.as_deref().unwrap_or("-")
+    )?;
+    for token in completed {
+        writeln!(writer, "completed={token}")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    std::fs::rename(&partial, path)?;
+    Ok(())
+}
+
+fn fixed_header_ascii(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
+}
+
+fn product_not_older_than(product: &Path, input: &Path) -> Result<bool, DynError> {
+    let product_time = std::fs::metadata(product)?.modified()?;
+    let input_time = std::fs::metadata(input)?.modified()?;
+    Ok(product_time >= input_time)
+}
+
+fn complete_cor_product(
+    path: &Path,
+    expected_station1: &str,
+    expected_station2: &str,
+    expected_source: &str,
+) -> Result<bool, DynError> {
+    let mut input = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let size = input.metadata()?.len();
+    if size < 256 {
+        return Ok(false);
+    }
+    let mut header = [0_u8; 144];
+    input.read_exact(&mut header)?;
+    if header[0..4] != [0x83, 0xF9, 0xA2, 0x3E]
+        || fixed_header_ascii(&header[32..48]) != expected_station1
+        || fixed_header_ascii(&header[80..96]) != expected_station2
+        || fixed_header_ascii(&header[128..144]) != expected_source
+    {
+        return Ok(false);
+    }
+    let fft = i32::from_le_bytes(header[24..28].try_into()?);
+    let sectors = i32::from_le_bytes(header[28..32].try_into()?);
+    if fft <= 0 || fft % 2 != 0 || sectors <= 0 {
+        return Ok(false);
+    }
+    let sector_bytes = 128_u64
+        .checked_add(
+            (fft as u64)
+                .checked_mul(4)
+                .ok_or(".cor FFT size overflow")?,
+        )
+        .ok_or(".cor sector size overflow")?;
+    let expected = 256_u64
+        .checked_add(
+            (sectors as u64)
+                .checked_mul(sector_bytes)
+                .ok_or(".cor file size overflow")?,
+        )
+        .ok_or(".cor file size overflow")?;
+    Ok(size == expected)
+}
+
+fn complete_phased_raw_product(
+    output_dir: &Path,
+    phased_name: &str,
+    tag: &str,
+) -> Result<bool, DynError> {
+    let raw = output_dir.join(format!("{phased_name}_{tag}.raw"));
+    let meta = raw.with_extension("raw.meta");
+    if !raw.is_file() || !meta.is_file() {
+        return Ok(false);
+    }
+    let text = read_to_string(&meta)?;
+    if meta_value(&text, "format") != Some("yi-phasedarray-raw-v1")
+        || meta_value(&text, "output_tag") != Some(tag)
+        || meta_value(&text, "virtual_station") != Some(phased_name)
+    {
+        return Ok(false);
+    }
+    let frames = meta_value(&text, "frames")
+        .ok_or("phased metadata has no frames")?
+        .parse::<u64>()?;
+    let fft = meta_value(&text, "fft")
+        .ok_or("phased metadata has no fft")?
+        .parse::<u64>()?;
+    let bit = meta_value(&text, "bit")
+        .ok_or("phased metadata has no bit")?
+        .parse::<u64>()?;
+    let expected_bits = frames
+        .checked_mul(fft)
+        .and_then(|value| value.checked_mul(bit))
+        .ok_or("phased raw size overflow")?;
+    Ok(expected_bits % 8 == 0 && std::fs::metadata(raw)?.len() == expected_bits / 8)
+}
+
 fn merge_gain_cor_files(
     inputs: &[PathBuf],
     output: &Path,
@@ -3314,6 +3527,16 @@ fn run_automatic_gain_phasecal_workflow(
         .clone()
         .unwrap_or_else(|| base_output.join("gain_correlation"));
     std::fs::create_dir_all(&gain_dir)?;
+    let resume_path = gain_dir.join("gain_phasecal.resume");
+    let resume_fingerprint = gain_phasecal_resume_fingerprint(schedule, &args)?;
+    let (mut resume, resume_created) =
+        load_gain_phasecal_resume(&resume_path, &resume_fingerprint)?;
+    if resume_created {
+        write_gain_phasecal_resume(&resume_path, &resume)?;
+        println!("[resume] created {}", resume_path.display());
+    } else {
+        println!("[resume] loaded {}", resume_path.display());
+    }
     let first_index = gain_indices[0];
     let first_data = ifile::parse_ifile_for_process(schedule, Some(first_index))?;
     let reference_name = station_name_for_key(&first_data, &args.gain_reference_key)?.to_string();
@@ -3343,6 +3566,42 @@ fn run_automatic_gain_phasecal_workflow(
     for (position, &index) in gain_indices.iter().enumerate() {
         let process = &schedule_meta.processes[index];
         let (_, tag) = process_output_tag(process)?;
+        let product = cor_product_path(
+            &gain_dir,
+            &reference_name,
+            &corrected_name,
+            &tag,
+            "gain_phasecal_off",
+        );
+        let token = format!("off:{tag}");
+        let product_complete =
+            complete_cor_product(&product, &reference_name, &corrected_name, gain_source)?;
+        let recorded = resume.completed.contains(&token);
+        let adopt_legacy = resume_created
+            && !recorded
+            && product_complete
+            && product_not_older_than(&product, schedule)?;
+        if product_complete && (recorded || adopt_legacy) {
+            if resume.completed.insert(token.clone()) {
+                println!(
+                    "[resume] adopted complete legacy phasecal-off scan {}: {}",
+                    tag,
+                    product.display()
+                );
+                write_gain_phasecal_resume(&resume_path, &resume)?;
+            } else {
+                println!("[resume] reuse phasecal-off scan {}", tag);
+            }
+            off_products.push(product);
+            continue;
+        }
+        if resume.completed.remove(&token) {
+            println!(
+                "[resume] phasecal-off scan {} is incomplete; recomputing",
+                tag
+            );
+            write_gain_phasecal_resume(&resume_path, &resume)?;
+        }
         println!(
             "[phasecal] gain scan {}/{} epoch={} object={}",
             position + 1,
@@ -3356,16 +3615,11 @@ fn run_automatic_gain_phasecal_workflow(
             cpu_threads,
             reader_core,
         )?;
-        let product = cor_product_path(
-            &gain_dir,
-            &reference_name,
-            &corrected_name,
-            &tag,
-            "gain_phasecal_off",
-        );
-        if !product.is_file() {
-            return Err(format!("expected gain XCF was not written: {}", product.display()).into());
+        if !complete_cor_product(&product, &reference_name, &corrected_name, gain_source)? {
+            return Err(format!("gain XCF is missing/incomplete: {}", product.display()).into());
         }
+        resume.completed.insert(token);
+        write_gain_phasecal_resume(&resume_path, &resume)?;
         off_products.push(product);
     }
 
@@ -3394,6 +3648,16 @@ fn run_automatic_gain_phasecal_workflow(
         peak_delay.min_samples,
         peak_delay.max_samples
     );
+    let group_delay_bits = peak_delay.median_samples.to_bits();
+    if resume.group_delay_bits != Some(group_delay_bits) {
+        if resume.group_delay_bits.is_some() {
+            println!("[resume] group-delay solution changed; invalidating stages 3-7");
+        }
+        resume.completed.retain(|token| token.starts_with("off:"));
+        resume.group_delay_bits = Some(group_delay_bits);
+        resume.final_solution = None;
+        write_gain_phasecal_resume(&resume_path, &resume)?;
+    }
 
     let corrected_schedule = args.phasecal_schedule_output.clone().unwrap_or_else(|| {
         let stem = schedule
@@ -3434,6 +3698,28 @@ fn run_automatic_gain_phasecal_workflow(
     let mut delay_on_products = Vec::with_capacity(gain_indices.len());
     for (position, &index) in gain_indices.iter().enumerate() {
         let (_, tag) = process_output_tag(&schedule_meta.processes[index])?;
+        let product = cor_product_path(
+            &gain_dir,
+            &reference_name,
+            &corrected_name,
+            &tag,
+            "gain_delay_on",
+        );
+        let token = format!("delay:{tag}");
+        if resume.completed.contains(&token)
+            && complete_cor_product(&product, &reference_name, &corrected_name, gain_source)?
+        {
+            println!("[resume] reuse group-delay scan {}", tag);
+            delay_on_products.push(product);
+            continue;
+        }
+        if resume.completed.remove(&token) {
+            println!(
+                "[resume] group-delay scan {} is incomplete; recomputing",
+                tag
+            );
+            write_gain_phasecal_resume(&resume_path, &resume)?;
+        }
         println!(
             "[phasecal] group-delay gain scan {}/{}",
             position + 1,
@@ -3445,20 +3731,15 @@ fn run_automatic_gain_phasecal_workflow(
             cpu_threads,
             reader_core,
         )?;
-        let product = cor_product_path(
-            &gain_dir,
-            &reference_name,
-            &corrected_name,
-            &tag,
-            "gain_delay_on",
-        );
-        if !product.is_file() {
+        if !complete_cor_product(&product, &reference_name, &corrected_name, gain_source)? {
             return Err(format!(
-                "expected group-delay-corrected gain XCF was not written: {}",
+                "group-delay-corrected gain XCF is missing/incomplete: {}",
                 product.display()
             )
             .into());
         }
+        resume.completed.insert(token);
+        write_gain_phasecal_resume(&resume_path, &resume)?;
         delay_on_products.push(product);
     }
 
@@ -3512,6 +3793,23 @@ fn run_automatic_gain_phasecal_workflow(
     let delta_rate_sps = fit.c1_rad_s / two_pi_f;
     let delta_accel_sps2 = fit.c2_rad_s2 / (std::f64::consts::PI * obsfreq_hz);
     let total_delta_delay_s = group_delay_s + phase_delay_s;
+    let final_solution = format!(
+        "{:016x}:{:016x}:{:016x}:{:016x}",
+        group_delay_bits,
+        fit.c0_rad.to_bits(),
+        fit.c1_rad_s.to_bits(),
+        fit.c2_rad_s2.to_bits()
+    );
+    if resume.final_solution.as_deref() != Some(final_solution.as_str()) {
+        if resume.final_solution.is_some() {
+            println!("[resume] final phase solution changed; invalidating stages 5-7");
+        }
+        resume
+            .completed
+            .retain(|token| token.starts_with("off:") || token.starts_with("delay:"));
+        resume.final_solution = Some(final_solution);
+        write_gain_phasecal_resume(&resume_path, &resume)?;
+    }
 
     let mut updated_clock = group_clock.clone();
     updated_clock.delay_s += phase_delay_s;
@@ -3643,6 +3941,7 @@ fn run_automatic_gain_phasecal_workflow(
     writeln!(solution, "peak_merged_cor={}", merged.display())?;
     writeln!(solution, "acel_merged_cor={}", delay_on_merged.display())?;
     writeln!(solution, "frinz_fit={}", fit_path.display())?;
+    writeln!(solution, "resume_file={}", resume_path.display())?;
     solution.flush()?;
     println!(
         "[phasecal] acel solution after group delay: c0={:+.6e} rad c1={:+.6e} rad/s c2={:+.6e} rad/s^2",
@@ -3668,6 +3967,28 @@ fn run_automatic_gain_phasecal_workflow(
 
     println!("[phasecal] stage 5/7: final phasecal-on gain correlations");
     for (position, &index) in gain_indices.iter().enumerate() {
+        let (_, tag) = process_output_tag(&schedule_meta.processes[index])?;
+        let product = cor_product_path(
+            &gain_dir,
+            &reference_name,
+            &corrected_name,
+            &tag,
+            "gain_phasecal_on",
+        );
+        let token = format!("on:{tag}");
+        if resume.completed.contains(&token)
+            && complete_cor_product(&product, &reference_name, &corrected_name, gain_source)?
+        {
+            println!("[resume] reuse phasecal-on scan {}", tag);
+            continue;
+        }
+        if resume.completed.remove(&token) {
+            println!(
+                "[resume] phasecal-on scan {} is incomplete; recomputing",
+                tag
+            );
+            write_gain_phasecal_resume(&resume_path, &resume)?;
+        }
         println!(
             "[phasecal] corrected gain scan {}/{}",
             position + 1,
@@ -3685,11 +4006,32 @@ fn run_automatic_gain_phasecal_workflow(
             cpu_threads,
             reader_core,
         )?;
+        if !complete_cor_product(&product, &reference_name, &corrected_name, gain_source)? {
+            return Err(format!(
+                "phasecal-on gain XCF is missing/incomplete: {}",
+                product.display()
+            )
+            .into());
+        }
+        resume.completed.insert(token);
+        write_gain_phasecal_resume(&resume_path, &resume)?;
     }
 
     println!("[phasecal] stage 6/7: synthesize corrected target and gain scans");
     for (position, &index) in phase_indices.iter().enumerate() {
         let process = &corrected_meta.processes[index];
+        let (_, tag) = process_output_tag(process)?;
+        let token = format!("phased:{tag}");
+        if resume.completed.contains(&token)
+            && complete_phased_raw_product(&base_output, &args.phased_name, &tag)?
+        {
+            println!("[resume] reuse phased scan {}", tag);
+            continue;
+        }
+        if resume.completed.remove(&token) {
+            println!("[resume] phased scan {} is incomplete; recomputing", tag);
+            write_gain_phasecal_resume(&resume_path, &resume)?;
+        }
         println!(
             "[phasecal] phased scan {}/{} epoch={} object={}",
             position + 1,
@@ -3709,10 +4051,18 @@ fn run_automatic_gain_phasecal_workflow(
         phased_args.cor_label_override = None;
         phased_args.compact_logs = position > 0;
         run_once(phased_args, RunMode::PhasedArray, cpu_threads, reader_core)?;
+        if !complete_phased_raw_product(&base_output, &args.phased_name, &tag)? {
+            return Err(format!("phased raw is missing/incomplete for scan {}", tag).into());
+        }
+        resume.completed.insert(token);
+        write_gain_phasecal_resume(&resume_path, &resume)?;
     }
+    resume.completed.insert("workflow:complete".to_string());
+    write_gain_phasecal_resume(&resume_path, &resume)?;
     println!("[phasecal] stage 7/7: complete");
     println!("[phasecal] solution file: {}", solution_path.display());
     println!("[phasecal] phasecal-off/on .cor: {}", gain_dir.display());
+    println!("[phasecal] resume file: {}", resume_path.display());
     Ok(())
 }
 
