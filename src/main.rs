@@ -490,16 +490,17 @@ mod correlation_hot_path_tests {
     }
 
     #[test]
-    fn frinz_degree_coefficients_convert_to_clock_polynomial() {
-        let fit = FrinzQuadratic {
-            c0_deg: 36.0,
-            c1_deg_s: 0.36,
-            c2_deg_s2: 0.18,
+    fn frinz_outputs_convert_to_clock_polynomial_in_radians() {
+        let fit = FrinzPhaseSolution {
+            model: PhaseModel::Acceleration,
+            c0_rad: std::f64::consts::TAU * 0.1,
+            corrected_rate_hz: 1.0e-3,
+            corrected_accel_hz_s: 2.0e-6,
         };
-        let (delay, rate, accel) = frinz_degree_fit_to_clock(fit, 100.0e6).unwrap();
+        let (delay, rate, accel) = frinz_phase_solution_to_clock(fit, 100.0e6).unwrap();
         assert!((delay - 1.0e-9).abs() < 1.0e-24);
         assert!((rate - 1.0e-11).abs() < 1.0e-26);
-        assert!((accel - 1.0e-11).abs() < 1.0e-26);
+        assert!((accel - 2.0e-14).abs() < 1.0e-29);
     }
 }
 
@@ -3010,61 +3011,299 @@ fn run_frinz_peak_delay(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FrinzQuadratic {
-    c0_deg: f64,
-    c1_deg_s: f64,
-    c2_deg_s2: f64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhaseModel {
+    Rate,
+    Acceleration,
 }
 
-fn parse_frinz_quadratic(path: &Path) -> Result<FrinzQuadratic, DynError> {
-    let text = read_to_string(path)?;
-    for line in text.lines() {
-        let Some(rhs) = line.trim().strip_prefix("# Fitted: y = ") else {
-            continue;
-        };
-        let Some((c2, remainder)) = rhs.split_once(" * x^2 + ") else {
-            continue;
-        };
-        let Some((c1, c0)) = remainder.split_once(" * x + ") else {
-            continue;
-        };
-        let result = FrinzQuadratic {
-            c0_deg: c0.trim().parse()?,
-            c1_deg_s: c1.trim().parse()?,
-            c2_deg_s2: c2.trim().parse()?,
-        };
-        if !result.c0_deg.is_finite()
-            || !result.c1_deg_s.is_finite()
-            || !result.c2_deg_s2.is_finite()
-        {
-            return Err(format!("non-finite frinZ quadratic in {}", path.display()).into());
+impl PhaseModel {
+    fn search_name(self) -> &'static str {
+        match self {
+            Self::Rate => "rate",
+            Self::Acceleration => "acel",
         }
-        return Ok(result);
     }
-    Err(format!(
-        "frinZ quadratic line '# Fitted: y = c2 * x^2 + c1 * x + c0' not found in {}",
-        path.display()
-    )
-    .into())
+
+    fn parameter_count(self) -> usize {
+        match self {
+            Self::Rate => 2,
+            Self::Acceleration => 3,
+        }
+    }
 }
 
-fn frinz_degree_fit_to_clock(
-    fit: FrinzQuadratic,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrinzPhaseSolution {
+    model: PhaseModel,
+    c0_rad: f64,
+    corrected_rate_hz: f64,
+    corrected_accel_hz_s: f64,
+}
+
+fn parse_value_after_prefix(line: &str, prefix: &str) -> Option<f64> {
+    line.trim()
+        .strip_prefix(prefix)?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn parse_frinz_phase_solution(
+    path: &Path,
+    model: PhaseModel,
+) -> Result<FrinzPhaseSolution, DynError> {
+    let text = read_to_string(path)?;
+    let mut c0_rad = None;
+    let mut corrected_rate_hz = None;
+    let mut corrected_accel_hz_s = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rhs) = trimmed.strip_prefix("# Fitted: y = ") {
+            c0_rad = match model {
+                PhaseModel::Rate => rhs
+                    .split_once(" * x + ")
+                    .and_then(|(_, value)| value.trim().parse::<f64>().ok()),
+                PhaseModel::Acceleration => rhs
+                    .split_once(" * x^2 + ")
+                    .and_then(|(_, rest)| rest.split_once(" * x + "))
+                    .and_then(|(_, value)| value.trim().parse::<f64>().ok()),
+            };
+        }
+        corrected_rate_hz = corrected_rate_hz
+            .or_else(|| parse_value_after_prefix(trimmed, "# Corrected Rate (Hz): "))
+            .or_else(|| parse_value_after_prefix(trimmed, "# Corrected Rate: "));
+        corrected_accel_hz_s = corrected_accel_hz_s
+            .or_else(|| parse_value_after_prefix(trimmed, "# Corrected Acel (Hz/s): "));
+    }
+    let result = FrinzPhaseSolution {
+        model,
+        c0_rad: c0_rad.ok_or_else(|| {
+            format!(
+                "frinZ fitted phase intercept not found in {}",
+                path.display()
+            )
+        })?,
+        corrected_rate_hz: corrected_rate_hz
+            .ok_or_else(|| format!("frinZ corrected rate not found in {}", path.display()))?,
+        corrected_accel_hz_s: match model {
+            PhaseModel::Rate => 0.0,
+            PhaseModel::Acceleration => corrected_accel_hz_s.ok_or_else(|| {
+                format!(
+                    "frinZ corrected acceleration not found in {}",
+                    path.display()
+                )
+            })?,
+        },
+    };
+    if !result.c0_rad.is_finite()
+        || !result.corrected_rate_hz.is_finite()
+        || !result.corrected_accel_hz_s.is_finite()
+    {
+        return Err(format!("non-finite frinZ phase solution in {}", path.display()).into());
+    }
+    Ok(result)
+}
+
+fn run_frinz_phase_solution(
+    frinz: &std::ffi::OsStr,
+    merged: &Path,
+    fringe_length: usize,
+    total_windows: usize,
+    model: PhaseModel,
+) -> Result<(FrinzPhaseSolution, PathBuf), DynError> {
+    let stem = merged
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("merged .cor filename is not UTF-8")?;
+    let (directory, suffix) = match model {
+        PhaseModel::Rate => ("acel_search", "step1_linear.txt"),
+        PhaseModel::Acceleration => ("acel_search", "step1_quadric.txt"),
+    };
+    let fit_path = merged
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("frinZ")
+        .join(directory)
+        .join(format!("{stem}_{suffix}"));
+    if fit_path.exists() {
+        std::fs::remove_file(&fit_path)?;
+    }
+    let status = Command::new(frinz)
+        .arg("--input")
+        .arg(merged)
+        .arg("--length")
+        .arg(fringe_length.to_string())
+        .arg("--loop")
+        .arg(total_windows.to_string())
+        .arg("--search")
+        .arg(model.search_name())
+        .arg("--plot")
+        .arg("--output")
+        .status()
+        .map_err(|e| {
+            format!(
+                "failed to start frinZ --search {}: {e}",
+                model.search_name()
+            )
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "frinZ --search {} failed with status {status}",
+            model.search_name()
+        )
+        .into());
+    }
+    Ok((parse_frinz_phase_solution(&fit_path, model)?, fit_path))
+}
+
+fn frinz_phase_solution_to_clock(
+    solution: FrinzPhaseSolution,
     frequency_hz: f64,
 ) -> Result<(f64, f64, f64), DynError> {
     if !frequency_hz.is_finite() || frequency_hz <= 0.0 {
         return Err("frinZ phase-reference frequency must be positive".into());
     }
-    // frinZ fits phase in degrees:
-    //   phase_deg = c2*t^2 + c1*t + c0
-    // while a clock polynomial produces:
-    //   phase_deg = 360*f*(delay + rate*t + accel*t^2/2).
     Ok((
-        fit.c0_deg / (360.0 * frequency_hz),
-        fit.c1_deg_s / (360.0 * frequency_hz),
-        fit.c2_deg_s2 / (180.0 * frequency_hz),
+        solution.c0_rad / (std::f64::consts::TAU * frequency_hz),
+        solution.corrected_rate_hz / frequency_hz,
+        solution.corrected_accel_hz_s / frequency_hz,
     ))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResidualPhaseStats {
+    count: usize,
+    phase_std_rad: f64,
+    phase_rms_rad: f64,
+    bic: f64,
+    delay_mad_samples: f64,
+    rate_rms_hz: f64,
+    median_snr: f64,
+}
+
+fn frinz_result_values(line: &str) -> Option<(f64, f64, f64, f64)> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let split_epoch = fields.get(1).is_some_and(|time| time.contains(":"))
+        && fields.first().is_some_and(|date| date.contains("/"));
+    let compact_epoch = fields
+        .first()
+        .is_some_and(|epoch| epoch.len() == 13 && epoch.bytes().all(|b| b.is_ascii_digit()));
+    if !split_epoch && !compact_epoch {
+        return None;
+    }
+    let offset = usize::from(split_epoch);
+    let values = (
+        fields.get(5 + offset)?.parse::<f64>().ok()?,
+        fields.get(6 + offset)?.parse::<f64>().ok()?,
+        fields.get(8 + offset)?.parse::<f64>().ok()?,
+        fields.get(9 + offset)?.parse::<f64>().ok()?,
+    );
+    [values.0, values.1, values.2, values.3]
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(values)
+}
+
+fn residual_phase_stats(
+    rows: &[(f64, f64, f64, f64)],
+    parameter_count: usize,
+) -> Result<ResidualPhaseStats, DynError> {
+    if rows.len() <= parameter_count {
+        return Err(format!(
+            "need more than {parameter_count} residual windows, got {}",
+            rows.len()
+        )
+        .into());
+    }
+    let mut unwrapped: Vec<f64> = Vec::with_capacity(rows.len());
+    for &(_, phase_deg, _, _) in rows {
+        let phase = phase_deg.to_radians();
+        let value = if let Some(&previous) = unwrapped.last() {
+            let delta = (phase - previous + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+                - std::f64::consts::PI;
+            previous + delta
+        } else {
+            phase
+        };
+        unwrapped.push(value);
+    }
+    let n = rows.len() as f64;
+    let mean = unwrapped.iter().sum::<f64>() / n;
+    let rss = unwrapped
+        .iter()
+        .map(|phase| (phase - mean).powi(2))
+        .sum::<f64>();
+    let phase_std_rad = (rss / (n - 1.0)).sqrt();
+    let phase_rms_rad = (unwrapped.iter().map(|phase| phase * phase).sum::<f64>() / n).sqrt();
+    let bic = n * (rss / n).max(f64::EPSILON.powi(2)).ln() + (parameter_count as f64) * n.ln();
+    let delays = rows.iter().map(|row| row.2).collect::<Vec<_>>();
+    let delay_median = finite_median(delays.clone())?;
+    let delay_mad_samples = finite_median(
+        delays
+            .iter()
+            .map(|value| (value - delay_median).abs())
+            .collect(),
+    )?;
+    let rate_rms_hz = (rows.iter().map(|row| row.3.powi(2)).sum::<f64>() / n).sqrt();
+    let median_snr = finite_median(rows.iter().map(|row| row.0).collect())?;
+    Ok(ResidualPhaseStats {
+        count: rows.len(),
+        phase_std_rad,
+        phase_rms_rad,
+        bic,
+        delay_mad_samples,
+        rate_rms_hz,
+        median_snr,
+    })
+}
+
+fn run_frinz_residual_stats(
+    frinz: &std::ffi::OsStr,
+    merged: &Path,
+    fringe_length: usize,
+    total_windows: usize,
+    model: PhaseModel,
+) -> Result<ResidualPhaseStats, DynError> {
+    let mut child = Command::new(frinz)
+        .arg("--input")
+        .arg(merged)
+        .arg("--length")
+        .arg(fringe_length.to_string())
+        .arg("--loop")
+        .arg(total_windows.to_string())
+        .arg("--search")
+        .arg("peak")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start frinZ residual peak search: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to capture frinZ residual peak stdout")?;
+    let mut rows = Vec::with_capacity(total_windows);
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        println!("{}", line);
+        if let Some(values) = frinz_result_values(&line) {
+            rows.push(values);
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("frinZ residual --search peak failed with status {status}").into());
+    }
+    if rows.len() != total_windows {
+        return Err(format!(
+            "frinZ residual peak returned {} rows, expected {}",
+            rows.len(),
+            total_windows
+        )
+        .into());
+    }
+    residual_phase_stats(&rows, model.parameter_count())
 }
 
 fn cor_sector_count(path: &Path) -> Result<usize, DynError> {
@@ -3093,6 +3332,7 @@ const GAIN_PHASECAL_RESUME_FORMAT: &str = "yi-phasedarray-gain-phasecal-resume-v
 struct GainPhasecalResume {
     fingerprint: String,
     group_delay_bits: Option<u64>,
+    candidate_solution: Option<String>,
     final_solution: Option<String>,
     completed: HashSet<String>,
 }
@@ -3127,6 +3367,7 @@ fn load_gain_phasecal_resume(
             GainPhasecalResume {
                 fingerprint: fingerprint.to_string(),
                 group_delay_bits: None,
+                candidate_solution: None,
                 final_solution: None,
                 completed: HashSet::new(),
             },
@@ -3156,6 +3397,9 @@ fn load_gain_phasecal_resume(
         .filter(|value| *value != "-")
         .map(|value| u64::from_str_radix(value, 16))
         .transpose()?;
+    let candidate_solution = meta_value(&text, "candidate_solution")
+        .filter(|value| *value != "-")
+        .map(str::to_string);
     let final_solution = meta_value(&text, "final_solution")
         .filter(|value| *value != "-")
         .map(str::to_string);
@@ -3170,6 +3414,7 @@ fn load_gain_phasecal_resume(
         GainPhasecalResume {
             fingerprint: fingerprint.to_string(),
             group_delay_bits,
+            candidate_solution,
             final_solution,
             completed,
         },
@@ -3191,6 +3436,11 @@ fn write_gain_phasecal_resume(path: &Path, state: &GainPhasecalResume) -> Result
             .group_delay_bits
             .map(|bits| format!("{bits:016x}"))
             .unwrap_or_else(|| "-".to_string())
+    )?;
+    writeln!(
+        writer,
+        "candidate_solution={}",
+        state.candidate_solution.as_deref().unwrap_or("-")
     )?;
     writeln!(
         writer,
@@ -3339,9 +3589,9 @@ fn merge_gain_cor_files(
         .iter()
         .map(|count| count / fringe_length)
         .sum::<usize>();
-    if total_windows < 3 {
+    if total_windows < 4 {
         return Err(format!(
-            "frinZ acel needs at least 3 gain windows; got {} (length={} sectors)",
+            "statistical rate/acel comparison needs at least 4 gain windows; got {} (length={} sectors)",
             total_windows, fringe_length
         )
         .into());
@@ -3686,6 +3936,7 @@ fn run_automatic_gain_phasecal_workflow(
         }
         resume.completed.retain(|token| token.starts_with("off:"));
         resume.group_delay_bits = Some(group_delay_bits);
+        resume.candidate_solution = None;
         resume.final_solution = None;
         write_gain_phasecal_resume(&resume_path, &resume)?;
     }
@@ -3775,7 +4026,7 @@ fn run_automatic_gain_phasecal_workflow(
     }
 
     println!(
-        "[phasecal] stage 4/7: run frinZ --search acel --frequency after group-delay correction"
+        "[phasecal] stage 4/7: solve rate and acceleration candidates, re-correlate, and compare residual statistics"
     );
     let delay_on_merged = gain_dir.join(format!(
         "{}_{}_gain_delay_on_merged.cor",
@@ -3790,60 +4041,252 @@ fn run_automatic_gain_phasecal_workflow(
     if delay_on_sectors != total_sectors || delay_on_windows != total_windows {
         return Err("group-delay-corrected gain merge changed the sector/window count".into());
     }
-    let delay_on_stem = delay_on_merged
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or("group-delay-corrected merged .cor filename is not UTF-8")?;
-    let fit_path = gain_dir
-        .join("frinZ")
-        .join("acel_search")
-        .join(format!("{}_step1_quadric.txt", delay_on_stem));
-    if fit_path.exists() {
-        std::fs::remove_file(&fit_path)?;
-    }
-    let status = Command::new(&frinz)
-        .arg("--input")
-        .arg(&delay_on_merged)
-        .arg("--length")
-        .arg(args.gain_fringe_length.to_string())
-        .arg("--loop")
-        .arg(total_windows.to_string())
-        .arg("--search")
-        .arg("acel")
-        .arg("--frequency")
-        .arg("--plot")
-        .arg("--output")
-        .status()
-        .map_err(|e| format!("failed to start frinZ {:?}: {}", frinz, e))?;
-    if !status.success() {
-        return Err(format!("frinZ --search acel failed with status {}", status).into());
-    }
-    let fit = parse_frinz_quadratic(&fit_path)?;
-    let (phase_delay_s, delta_rate_sps, delta_accel_sps2) =
-        frinz_degree_fit_to_clock(fit, obsfreq_hz)?;
-    let total_delta_delay_s = group_delay_s + phase_delay_s;
-    let final_solution = format!(
-        "phase-deg-v1:{:016x}:{:016x}:{:016x}:{:016x}",
+
+    println!("[phasecal] frinZ candidate 1/2: --search rate");
+    let (rate_fit, rate_fit_path) = run_frinz_phase_solution(
+        &frinz,
+        &delay_on_merged,
+        args.gain_fringe_length,
+        total_windows,
+        PhaseModel::Rate,
+    )?;
+    println!("[phasecal] frinZ candidate 2/2: --search acel");
+    let (acel_fit, acel_fit_path) = run_frinz_phase_solution(
+        &frinz,
+        &delay_on_merged,
+        args.gain_fringe_length,
+        total_windows,
+        PhaseModel::Acceleration,
+    )?;
+    let (rate_phase_delay_s, rate_delta_rate_sps, rate_delta_accel_sps2) =
+        frinz_phase_solution_to_clock(rate_fit, obsfreq_hz)?;
+    let (acel_phase_delay_s, acel_delta_rate_sps, acel_delta_accel_sps2) =
+        frinz_phase_solution_to_clock(acel_fit, obsfreq_hz)?;
+
+    let candidate_solution = format!(
+        "frinz-rad-output-v1:{:016x}:{:016x}:{:016x}:{:016x}:{:016x}:{:016x}:{:016x}",
         group_delay_bits,
-        fit.c0_deg.to_bits(),
-        fit.c1_deg_s.to_bits(),
-        fit.c2_deg_s2.to_bits()
+        rate_fit.c0_rad.to_bits(),
+        rate_fit.corrected_rate_hz.to_bits(),
+        acel_fit.c0_rad.to_bits(),
+        acel_fit.corrected_rate_hz.to_bits(),
+        acel_fit.corrected_accel_hz_s.to_bits(),
+        obsfreq_hz.to_bits()
     );
-    if resume.final_solution.as_deref() != Some(final_solution.as_str()) {
-        if resume.final_solution.is_some() {
-            println!("[resume] final phase solution changed; invalidating stages 5-7");
+    if resume.candidate_solution.as_deref() != Some(candidate_solution.as_str()) {
+        if resume.candidate_solution.is_some() {
+            println!(
+                "[resume] candidate solutions changed; invalidating candidate and final stages"
+            );
         }
         resume
             .completed
             .retain(|token| token.starts_with("off:") || token.starts_with("delay:"));
+        resume.candidate_solution = Some(candidate_solution.clone());
+        resume.final_solution = None;
+        write_gain_phasecal_resume(&resume_path, &resume)?;
+    }
+
+    let schedule_stem = schedule
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("schedule");
+    let rate_schedule = gain_dir.join(format!(
+        "{}_{}_rate_candidate.xml",
+        schedule_stem,
+        sanitize_file_token(&args.gain_corrected_key)
+    ));
+    let acel_schedule = gain_dir.join(format!(
+        "{}_{}_acel_candidate.xml",
+        schedule_stem,
+        sanitize_file_token(&args.gain_corrected_key)
+    ));
+    let mut rate_clock = group_clock.clone();
+    rate_clock.delay_s += rate_phase_delay_s;
+    rate_clock.rate_sps += rate_delta_rate_sps;
+    rate_clock.accel_sps2 += rate_delta_accel_sps2;
+    let mut acel_clock = group_clock.clone();
+    acel_clock.delay_s += acel_phase_delay_s;
+    acel_clock.rate_sps += acel_delta_rate_sps;
+    acel_clock.accel_sps2 += acel_delta_accel_sps2;
+    xml::write_schedule_with_clock_polynomial(
+        schedule,
+        &rate_schedule,
+        &args.gain_corrected_key,
+        &rate_clock,
+    )?;
+    xml::write_schedule_with_clock_polynomial(
+        schedule,
+        &acel_schedule,
+        &args.gain_corrected_key,
+        &acel_clock,
+    )?;
+
+    let mut correlate_candidate = |model: PhaseModel,
+                                   candidate_schedule: &Path,
+                                   label: &str|
+     -> Result<Vec<PathBuf>, DynError> {
+        let mut products = Vec::with_capacity(gain_indices.len());
+        for (position, &index) in gain_indices.iter().enumerate() {
+            let (_, tag) = process_output_tag(&schedule_meta.processes[index])?;
+            let product =
+                cor_product_path(&gain_dir, &reference_name, &corrected_name, &tag, label);
+            let token = format!("candidate:{}:{tag}", model.search_name());
+            if resume.completed.contains(&token)
+                && complete_cor_product(&product, &reference_name, &corrected_name, gain_source)?
+            {
+                println!(
+                    "[resume] reuse {} candidate scan {}",
+                    model.search_name(),
+                    tag
+                );
+                products.push(product);
+                continue;
+            }
+            if resume.completed.remove(&token) {
+                write_gain_phasecal_resume(&resume_path, &resume)?;
+            }
+            println!(
+                "[phasecal] {} candidate scan {}/{}",
+                model.search_name(),
+                position + 1,
+                gain_indices.len()
+            );
+            run_once(
+                automatic_gain_corr_args(&args, candidate_schedule, index, &gain_dir, label),
+                RunMode::Corr,
+                cpu_threads,
+                reader_core,
+            )?;
+            if !complete_cor_product(&product, &reference_name, &corrected_name, gain_source)? {
+                return Err(format!(
+                    "{} candidate XCF is missing/incomplete: {}",
+                    model.search_name(),
+                    product.display()
+                )
+                .into());
+            }
+            resume.completed.insert(token);
+            write_gain_phasecal_resume(&resume_path, &resume)?;
+            products.push(product);
+        }
+        Ok(products)
+    };
+
+    let rate_products =
+        correlate_candidate(PhaseModel::Rate, &rate_schedule, "gain_rate_candidate")?;
+    let acel_products = correlate_candidate(
+        PhaseModel::Acceleration,
+        &acel_schedule,
+        "gain_acel_candidate",
+    )?;
+    let rate_merged = gain_dir.join(format!(
+        "{}_{}_gain_rate_candidate_merged.cor",
+        sanitize_file_token(&reference_name),
+        sanitize_file_token(&corrected_name)
+    ));
+    let acel_merged = gain_dir.join(format!(
+        "{}_{}_gain_acel_candidate_merged.cor",
+        sanitize_file_token(&reference_name),
+        sanitize_file_token(&corrected_name)
+    ));
+    let rate_counts = merge_gain_cor_files(&rate_products, &rate_merged, args.gain_fringe_length)?;
+    let acel_counts = merge_gain_cor_files(&acel_products, &acel_merged, args.gain_fringe_length)?;
+    if rate_counts != (total_sectors, total_windows)
+        || acel_counts != (total_sectors, total_windows)
+    {
+        return Err("candidate gain merge changed the sector/window count".into());
+    }
+
+    println!("[phasecal] residual verification 1/2: rate candidate");
+    let rate_stats = run_frinz_residual_stats(
+        &frinz,
+        &rate_merged,
+        args.gain_fringe_length,
+        total_windows,
+        PhaseModel::Rate,
+    )?;
+    println!("[phasecal] residual verification 2/2: acceleration candidate");
+    let acel_stats = run_frinz_residual_stats(
+        &frinz,
+        &acel_merged,
+        args.gain_fringe_length,
+        total_windows,
+        PhaseModel::Acceleration,
+    )?;
+    println!(
+        "[phasecal] rate residual: phase-std={:.6e} rad BIC={:.6e} rate-rms={:.6e} Hz delay-MAD={:.6e} sample median-SNR={:.3}",
+        rate_stats.phase_std_rad, rate_stats.bic, rate_stats.rate_rms_hz,
+        rate_stats.delay_mad_samples, rate_stats.median_snr
+    );
+    println!(
+        "[phasecal] acel residual: phase-std={:.6e} rad BIC={:.6e} rate-rms={:.6e} Hz delay-MAD={:.6e} sample median-SNR={:.3}",
+        acel_stats.phase_std_rad, acel_stats.bic, acel_stats.rate_rms_hz,
+        acel_stats.delay_mad_samples, acel_stats.median_snr
+    );
+
+    let selected_model = if acel_stats.bic < rate_stats.bic {
+        PhaseModel::Acceleration
+    } else {
+        PhaseModel::Rate
+    };
+    let (
+        fit,
+        phase_delay_s,
+        delta_rate_sps,
+        delta_accel_sps2,
+        selected_clock,
+        selected_products,
+        selected_fit_path,
+        selected_stats,
+    ) = match selected_model {
+        PhaseModel::Rate => (
+            rate_fit,
+            rate_phase_delay_s,
+            rate_delta_rate_sps,
+            rate_delta_accel_sps2,
+            rate_clock,
+            &rate_products,
+            &rate_fit_path,
+            &rate_stats,
+        ),
+        PhaseModel::Acceleration => (
+            acel_fit,
+            acel_phase_delay_s,
+            acel_delta_rate_sps,
+            acel_delta_accel_sps2,
+            acel_clock,
+            &acel_products,
+            &acel_fit_path,
+            &acel_stats,
+        ),
+    };
+    println!(
+        "[phasecal] selected {} model by minimum BIC ({:.6e}); phase-std={:.6e} rad",
+        selected_model.search_name(),
+        selected_stats.bic,
+        selected_stats.phase_std_rad
+    );
+
+    let total_delta_delay_s = group_delay_s + phase_delay_s;
+    let final_solution = format!(
+        "stat-select-v1:{}:{candidate_solution}",
+        selected_model.search_name()
+    );
+    if resume.final_solution.as_deref() != Some(final_solution.as_str()) {
+        if resume.final_solution.is_some() {
+            println!("[resume] selected final solution changed; invalidating stages 5-7");
+        }
+        resume.completed.retain(|token| {
+            token.starts_with("off:")
+                || token.starts_with("delay:")
+                || token.starts_with("candidate:")
+        });
         resume.final_solution = Some(final_solution);
         write_gain_phasecal_resume(&resume_path, &resume)?;
     }
 
-    let mut updated_clock = group_clock.clone();
-    updated_clock.delay_s += phase_delay_s;
-    updated_clock.rate_sps += delta_rate_sps;
-    updated_clock.accel_sps2 += delta_accel_sps2;
+    let updated_clock = selected_clock;
     xml::write_schedule_with_clock_polynomial(
         schedule,
         &corrected_schedule,
@@ -3857,7 +4300,7 @@ fn run_automatic_gain_phasecal_workflow(
 
     let solution_path = gain_dir.join("gain_phasecal_solution.txt");
     let mut solution = BufWriter::new(File::create(&solution_path)?);
-    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v3")?;
+    writeln!(solution, "format=yi-phasedarray-gain-phasecal-v4")?;
     writeln!(solution, "gain_source={}", gain_source)?;
     writeln!(
         solution,
@@ -3909,10 +4352,19 @@ fn run_automatic_gain_phasecal_workflow(
             .join(",")
     )?;
     writeln!(solution, "group_delay_s={:+.17e}", group_delay_s)?;
-    writeln!(solution, "phase_unit=degree")?;
-    writeln!(solution, "phase_c0_deg={:+.17e}", fit.c0_deg)?;
-    writeln!(solution, "phase_c1_deg_s={:+.17e}", fit.c1_deg_s)?;
-    writeln!(solution, "phase_c2_deg_s2={:+.17e}", fit.c2_deg_s2)?;
+    writeln!(solution, "phase_unit=radian")?;
+    writeln!(solution, "selected_model={}", selected_model.search_name())?;
+    writeln!(solution, "phase_c0_rad={:+.17e}", fit.c0_rad)?;
+    writeln!(
+        solution,
+        "frinz_corrected_rate_hz={:+.17e}",
+        fit.corrected_rate_hz
+    )?;
+    writeln!(
+        solution,
+        "frinz_corrected_accel_hz_s={:+.17e}",
+        fit.corrected_accel_hz_s
+    )?;
     writeln!(solution, "phase_delay_s={:+.17e}", phase_delay_s)?;
     writeln!(
         solution,
@@ -3970,12 +4422,50 @@ fn run_automatic_gain_phasecal_workflow(
     )?;
     writeln!(solution, "peak_merged_cor={}", merged.display())?;
     writeln!(solution, "acel_merged_cor={}", delay_on_merged.display())?;
-    writeln!(solution, "frinz_fit={}", fit_path.display())?;
+    writeln!(solution, "rate_frinz_fit={}", rate_fit_path.display())?;
+    writeln!(solution, "acel_frinz_fit={}", acel_fit_path.display())?;
+    writeln!(
+        solution,
+        "selected_frinz_fit={}",
+        selected_fit_path.display()
+    )?;
+    writeln!(
+        solution,
+        "rate_candidate_merged_cor={}",
+        rate_merged.display()
+    )?;
+    writeln!(
+        solution,
+        "acel_candidate_merged_cor={}",
+        acel_merged.display()
+    )?;
+    for (name, stats) in [("rate", &rate_stats), ("acel", &acel_stats)] {
+        writeln!(solution, "{name}_residual_count={}", stats.count)?;
+        writeln!(
+            solution,
+            "{name}_phase_std_rad={:+.17e}",
+            stats.phase_std_rad
+        )?;
+        writeln!(
+            solution,
+            "{name}_phase_rms_rad={:+.17e}",
+            stats.phase_rms_rad
+        )?;
+        writeln!(solution, "{name}_bic={:+.17e}", stats.bic)?;
+        writeln!(
+            solution,
+            "{name}_delay_mad_samples={:+.17e}",
+            stats.delay_mad_samples
+        )?;
+        writeln!(solution, "{name}_rate_rms_hz={:+.17e}", stats.rate_rms_hz)?;
+        writeln!(solution, "{name}_median_snr={:+.17e}", stats.median_snr)?;
+    }
     writeln!(solution, "resume_file={}", resume_path.display())?;
     solution.flush()?;
     println!(
-        "[phasecal] acel solution after group delay: c0={:+.6e} deg c1={:+.6e} deg/s c2={:+.6e} deg/s^2",
-        fit.c0_deg, fit.c1_deg_s, fit.c2_deg_s2
+        "[phasecal] selected {} frinZ output: c0={:+.6e} rad corrected-rate={:+.6e} Hz corrected-acel={:+.6e} Hz/s",
+        selected_model.search_name(), fit.c0_rad, fit.corrected_rate_hz,
+        fit.corrected_accel_hz_s
     );
     println!(
         "[phasecal] add to {}: group-delay={:+.9e}s phase-delay={:+.9e}s total-delay={:+.9e}s rate={:+.9e}s/s accel={:+.9e}s/s^2",
@@ -4020,22 +4510,12 @@ fn run_automatic_gain_phasecal_workflow(
             write_gain_phasecal_resume(&resume_path, &resume)?;
         }
         println!(
-            "[phasecal] corrected gain scan {}/{}",
+            "[phasecal] publish selected {} candidate as phasecal-on scan {}/{}",
+            selected_model.search_name(),
             position + 1,
             gain_indices.len()
         );
-        run_once(
-            automatic_gain_corr_args(
-                &args,
-                &corrected_schedule,
-                index,
-                &gain_dir,
-                "gain_phasecal_on",
-            ),
-            RunMode::Corr,
-            cpu_threads,
-            reader_core,
-        )?;
+        std::fs::copy(&selected_products[position], &product)?;
         if !complete_cor_product(&product, &reference_name, &corrected_name, gain_source)? {
             return Err(format!(
                 "phasecal-on gain XCF is missing/incomplete: {}",

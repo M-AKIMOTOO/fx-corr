@@ -271,32 +271,41 @@ uses only ordered `K-L` processes for the solution and leaves K unchanged. It:
    median (also recording all values, MAD, minimum, and maximum);
 4. adds that median group delay to L in an intermediate XML and re-correlates
    every gain scan as `gain_delay_on.cor`;
-5. merges the group-delay-corrected products and runs
-   `frinZ --search acel --frequency` on them;
-6. treats the residual fitted phase `c2*t^2 + c1*t + c0` as degrees, matching frinZ output, and converts it into additional L clock terms: `phase-delay=c0/(360*f)`, `rate=c1/(360*f)`, and `accel=c2/(180*f)`;
-7. writes the final XML with
-   `delay=median-peak-delay/sampling-rate + phase-delay`, correlates all gain
-   scans as `gain_phasecal_on.cor`, and synthesizes every K-L target and gain
-   process with the final clock polynomial.
+5. merges the group-delay-corrected products and independently runs
+   both `frinZ --search rate` and `frinZ --search acel` (without guessing from
+   observation duration);
+6. uses the `Corrected Rate` and `Corrected Acel` values emitted by frinZ directly.
+   The fitted constant phase is radians and supplies the phase-delay term
+   `c0/(2*pi*f)`. Each candidate clock is applied to L and every gain scan is
+   re-correlated;
+7. runs a fresh `frinZ --search peak` on both candidate data sets, unwraps the
+   residual phase sequence, and records phase standard deviation/RMS, residual
+   rate RMS, delay MAD, median S/N, and BIC. The minimum-BIC model is selected,
+   so acceleration must improve the residual variance enough to justify its
+   extra parameter;
+8. writes the selected XML, publishes the already computed selected candidate
+   as `gain_phasecal_on.cor`, and synthesizes every K-L target and gain process
+   with that clock polynomial.
 
 The input XML is never overwritten. By default the corrected schedule is
 `<output>/<schedule-stem>_L_phasecal.xml`; select another path with
 `--phasecal-schedule-output`. Intermediate and verification products are in
 `<output>/gain_correlation/`:
 
-- per-scan `gain_phasecal_off.cor`, `gain_delay_on.cor`, and `gain_phasecal_on.cor` files;
+- per-scan `gain_phasecal_off.cor`, `gain_delay_on.cor`, rate/acel candidate, and selected `gain_phasecal_on.cor` files;
 - `<Y32>_<Y34>_gain_phasecal_merged.cor` for peak search;
-- `<Y32>_<Y34>_gain_delay_on_merged.cor` for acceleration search;
+- `<Y32>_<Y34>_gain_delay_on_merged.cor` for both rate and acceleration searches;
+- merged rate/acel candidate `.cor` files used for the residual comparison;
 - the intermediate median-group-delay XML;
-- `frinZ/acel_search/*_step1_quadric.txt` and its plot;
+- `frinZ/acel_search/*_step1_linear.txt` and `*_step1_quadric.txt` plus their plots;
 - `gain_phasecal_solution.txt`, including fit coefficients, exact clock
   increments, old/new L polynomial values, paths, and the phase-delay ambiguity.
 
-The workflow writes `<output>/gain_correlation/gain_phasecal.resume` atomically through a `.tmp` file after every completed scan. Re-running the identical command validates and reuses complete stage 1, 3, 5, and 6 products instead of repeating their correlation or phased synthesis. A pre-resume `gain_phasecal_off.cor` is also adopted when its header, sector count, FFT size, and exact file length prove that it is complete. The resume fingerprint includes the input XML contents and command conditions; if either changes, yi-phasedarray stops instead of mixing incompatible products. Move or delete `gain_phasecal.resume` only when intentionally starting a new calibration.
+The workflow writes `<output>/gain_correlation/gain_phasecal.resume` atomically through a `.tmp` file after every completed scan. Re-running the identical command validates and reuses complete phasecal-off, group-delay, rate candidate, acceleration candidate, selected, and phased products instead of repeating their correlation or phased synthesis. A pre-resume `gain_phasecal_off.cor` is also adopted when its header, sector count, FFT size, and exact file length prove that it is complete. The resume fingerprint includes the input XML contents and command conditions; if either changes, yi-phasedarray stops instead of mixing incompatible products. Move or delete `gain_phasecal.resume` only when intentionally starting a new calibration.
 
 Each gain scan sector count must be divisible by `--gain-fringe-length`, which
 prevents a frinZ integration window from crossing a target/gain scan boundary.
-At least three windows are required for the quadratic fit. Set `YI_FRINZ` when
+At least four windows are required for the quadratic fit and statistical comparison. Set `YI_FRINZ` when
 the desired frinZ executable is not on `PATH`. The `c0` term remains a phase delay ambiguous by one observing-frequency cycle (`1/f`), while the median peak result supplies the measured group-delay branch. The median is deliberately used instead of the mean so that isolated low-S/N or wrong-peak windows do not move the applied delay. The generated
 XML uses an absolute clock epoch, so leave `YI_CLOCK_EPOCH_MODE` unset (the
 default is `clock`).
@@ -2281,6 +2290,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.5.5` | Runs both frinZ rate and acceleration phase solutions, uses the emitted corrected Rate/Acel values, re-correlates both candidates, and selects the statistically supported model by residual-phase BIC. The audit records residual phase standard deviation/RMS, rate RMS, delay MAD, and median S/N; candidate scans are resumable. |
 | `3.5.4` | Corrected automatic `frinZ --search acel` interpretation from radians to degrees. For the fitted degree polynomial `c2*t^2+c1*t+c0`, L clock increments are now `delay=c0/(360*f)`, `rate=c1/(360*f)`, and `accel=c2/(180*f)`. The resume final-solution signature is unit-tagged so v3.5.3 phasecal-on and phased products are invalidated while valid phasecal-off and group-delay products remain reusable. |
 | `3.5.3` | Added atomic scan-level automatic gain-calibration resume state in `gain_correlation/gain_phasecal.resume`. Complete phasecal-off, group-delay, phasecal-on, and phased-raw scans are validated and reused; complete pre-resume phasecal-off products can be adopted. Changed XML or command conditions are rejected by a workflow fingerprint, and changed delay/phase solutions invalidate only dependent stages. |
 | `3.5.2` | Fixed parsing of real frinZ peak tables whose epoch is split into `YYYY/DDD` and `HH:MM:SS` columns. The parser now selects the explicit residual-delay column for both split and compact epoch formats, preventing valid delay windows from being reported as zero. |

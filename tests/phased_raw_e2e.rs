@@ -101,7 +101,7 @@ fn write_phasecal_schedule(path: &Path) {
 fn write_fake_frinz(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
-    let script = r#"#!/bin/sh
+    let script = r##"#!/bin/sh
 input=
 mode=
 loops=1
@@ -113,24 +113,50 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+stem=$(basename "$input" .cor)
 if [ "$mode" = peak ]; then
   i=1
   while [ "$i" -le "$loops" ]; do
-    delay=+0.250000
-    if [ "$i" -eq 7 ]; then delay=+99.000000; fi
-    printf '%s\n' "2000/001 00:00:00 L GAIN 1.00 0.100000 20.0 +0.0 0.010000 $delay +0.000000 1 2 3 4 5 6 51544.0 - False False"
+    delay=+0.000000
+    phase=+0.000000
+    rate=+0.000000
+    case "$stem" in
+      *gain_phasecal_merged*)
+        delay=+0.250000
+        if [ "$i" -eq 7 ]; then delay=+99.000000; fi
+        ;;
+      *gain_rate_candidate_merged*)
+        phase=+0.100000
+        rate=+0.000010
+        ;;
+      *gain_acel_candidate_merged*)
+        phase=+0.100000
+        rate=+0.000010
+        ;;
+    esac
+    printf "%s\n" "2000/001 00:00:00 L GAIN 1.00 0.100000 20.0 $phase 0.010000 $delay $rate 1 2 3 4 5 6 51544.0 - False False"
     i=$((i + 1))
   done
   exit 0
 fi
 parent=$(dirname "$input")
-stem=$(basename "$input" .cor)
-out="$parent/frinZ/acel_search"
-mkdir -p "$out"
-printf '%s\n' '# Fitted: y = 1.000000e-6 * x^2 + 2.000000e-3 * x + 2.000000e-1' > "$out/${stem}_step1_quadric.txt"
-printf '%s\n' '# Corrected Acel (Hz/s): 5.555556e-9 (degree c2 / 180)' >> "$out/${stem}_step1_quadric.txt"
-printf '%s\n' '# Corrected Rate (Hz): 5.555556e-6 (degree c1 / 360)' >> "$out/${stem}_step1_quadric.txt"
-"#;
+if [ "$mode" = rate ]; then
+  out="$parent/frinZ/acel_search"
+  mkdir -p "$out"
+  printf "%s\n" "# Fitted: y = 1.256637061e-3 * x + 2.000000000e-1" > "$out/"$stem"_step1_linear.txt"
+  printf "%s\n" "# Corrected Rate: 2.000000000e-4 (from x / (2 * PI))" >> "$out/"$stem"_step1_linear.txt"
+  exit 0
+fi
+if [ "$mode" = acel ]; then
+  out="$parent/frinZ/acel_search"
+  mkdir -p "$out"
+  printf "%s\n" "# Fitted: y = 3.141592654e-6 * x^2 + 1.256637061e-3 * x + 2.000000000e-1" > "$out/"$stem"_step1_quadric.txt"
+  printf "%s\n" "# Corrected Acel (Hz/s): 1.000000000e-6 (from x^2 / PI)" >> "$out/"$stem"_step1_quadric.txt"
+  printf "%s\n" "# Corrected Rate (Hz): 2.000000000e-4 (from x / (2 * PI))" >> "$out/"$stem"_step1_quadric.txt"
+  exit 0
+fi
+exit 1
+"##;
     fs::write(path, script).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
@@ -203,7 +229,7 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
-    assert!(meta.contains("software_version=3.5.4"));
+    assert!(meta.contains("software_version=3.5.5"));
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));
@@ -540,7 +566,10 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
     assert!(stdout.contains("[phasecal] stage 1/7: phasecal-off gain correlations"));
     assert!(stdout.contains("[phasecal] stage 2/7: merge gain scans and run frinZ --search peak"));
     assert!(stdout.contains("[phasecal] stage 3/7: correlate gain scans with median group delay"));
-    assert!(stdout.contains("[phasecal] stage 4/7: run frinZ --search acel"));
+    assert!(stdout.contains("[phasecal] stage 4/7: solve rate and acceleration candidates"));
+    assert!(stdout.contains("[phasecal] frinZ candidate 1/2: --search rate"));
+    assert!(stdout.contains("[phasecal] frinZ candidate 2/2: --search acel"));
+    assert!(stdout.contains("[phasecal] selected rate model by minimum BIC"));
     assert!(stdout.contains("[phasecal] stage 5/7: final phasecal-on gain correlations"));
     assert!(stdout.contains("[phasecal] stage 6/7: synthesize corrected target and gain scans"));
     assert!(stdout.contains("[phasecal] stage 7/7: complete"));
@@ -567,12 +596,17 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
     let solution = fs::read_to_string(gain_dir.join("gain_phasecal_solution.txt")).unwrap();
     assert!(solution.contains("gain_scans=3"));
     assert!(solution.contains("fringe_windows=24"));
-    assert!(solution.contains("format=yi-phasedarray-gain-phasecal-v3"));
+    assert!(solution.contains("format=yi-phasedarray-gain-phasecal-v4"));
     assert!(solution.contains("peak_delay_count=24"));
     assert!(solution.contains("peak_delay_samples_median=+2.50000000000000000e-1"));
     assert!(solution.contains("peak_delay_samples_max=+9.90000000000000000e1"));
     assert!(solution.contains("group_delay_s=+3.05175781250000000e-5"));
-    assert!(solution.contains("phase_c0_deg=+2.00000000000000011e-1"));
+    assert!(solution.contains("phase_unit=radian"));
+    assert!(solution.contains("selected_model=rate"));
+    assert!(solution.contains("rate_phase_std_rad="));
+    assert!(solution.contains("acel_phase_std_rad="));
+    assert!(solution.contains("rate_bic="));
+    assert!(solution.contains("acel_bic="));
     assert!(solution.contains("corrected_schedule="));
     assert!(gain_dir
         .join("YAMAGU32_YAMAGU34_gain_phasecal_merged.cor")
@@ -664,6 +698,8 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
     let resumed_stdout = String::from_utf8_lossy(&resumed.stdout);
     assert!(resumed_stdout.contains("[resume] reuse phasecal-off scan"));
     assert!(resumed_stdout.contains("[resume] reuse group-delay scan"));
+    assert!(resumed_stdout.contains("[resume] reuse rate candidate scan"));
+    assert!(resumed_stdout.contains("[resume] reuse acel candidate scan"));
     assert!(resumed_stdout.contains("[resume] reuse phasecal-on scan"));
     assert!(resumed_stdout.contains("[resume] reuse phased scan"));
 

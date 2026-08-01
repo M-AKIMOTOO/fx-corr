@@ -92,7 +92,7 @@ pub struct Args {
     #[arg(
         long,
         default_value_t = false,
-        help = "Automatically solve gain-source Y32-Y34 group delay and phase with frinZ peak+acel, update L clock, and synthesize all scans"
+        help = "Solve gain-source delay, compare frinZ rate and acceleration candidates by residual statistics, update L clock, and synthesize all scans"
     )]
     pub gain_phasecal: bool,
 
@@ -107,7 +107,7 @@ pub struct Args {
         long,
         value_name = "SECTORS",
         default_value_t = 1,
-        help = "frinZ acel fitting window in correlator sectors; each gain scan must be divisible by it"
+        help = "frinZ fitting and residual-test window in correlator sectors; each gain scan must be divisible by it"
     )]
     pub gain_fringe_length: usize,
 
