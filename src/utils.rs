@@ -182,9 +182,83 @@ pub struct DecodePlan {
     input_shifts: [u32; 32],
     fast_kind: DecodeFastKind,
     levels_f32: Vec<f32>,
-    packed2_lut16_usb: Option<Box<[[f32; 8]]>>,
-    packed2_lut16_lsb_flip: Option<Box<[[f32; 8]]>>,
+    packed2_bytes: Option<Box<Packed2Bytes>>,
 }
+// Common recorder layouts permute bytes and use the same bit permutation in
+// each byte. Three 4 KiB tables cover USB and both absolute LSB parities.
+struct Packed2Bytes {
+    source_bytes: [usize; 4],
+    tables: [[[f32; 4]; 256]; 3],
+}
+
+impl Packed2Bytes {
+    fn new(shifts: &[u32; 32], levels: &[f32]) -> Option<Box<Self>> {
+        let source_bytes = std::array::from_fn(|i| shifts[8 * i] as usize / 8);
+        for byte in 0..4 {
+            for bit in 0..8 {
+                if shifts[8 * byte + bit] as usize / 8 != source_bytes[byte]
+                    || shifts[8 * byte + bit] % 8 != shifts[bit] % 8
+                {
+                    return None;
+                }
+            }
+        }
+        let mut plan = Box::new(Self {
+            source_bytes,
+            tables: [[[0.0; 4]; 256]; 3],
+        });
+        for byte in 0..256 {
+            for sample in 0..4 {
+                let code = ((byte >> (shifts[2 * sample] % 8)) & 1)
+                    | (((byte >> (shifts[2 * sample + 1] % 8)) & 1) << 1);
+                let value = levels[code];
+                plan.tables[0][byte][sample] = value;
+                plan.tables[1][byte][sample] = if sample % 2 == 1 { -value } else { value };
+                plan.tables[2][byte][sample] = if sample % 2 == 0 { -value } else { value };
+            }
+        }
+        Some(plan)
+    }
+
+    fn decode(
+        &self,
+        raw: &[u8],
+        samples: usize,
+        output: &mut [f32],
+        lsb: bool,
+        first_odd: bool,
+        identity: bool,
+    ) -> usize {
+        let table = &self.tables[if lsb { 1 + usize::from(first_odd) } else { 0 }];
+        let [b0, b1, b2, b3] = self.source_bytes;
+        let words = (samples / 16).min(raw.len() / 4);
+        for (src, dst) in raw[..words * 4]
+            .chunks_exact(4)
+            .zip(output[..words * 16].chunks_exact_mut(16))
+        {
+            dst[0..4].copy_from_slice(&table[src[b0] as usize]);
+            dst[4..8].copy_from_slice(&table[src[b1] as usize]);
+            dst[8..12].copy_from_slice(&table[src[b2] as usize]);
+            dst[12..16].copy_from_slice(&table[src[b3] as usize]);
+        }
+        let mut written = words * 16;
+        let rest = &raw[words * 4..];
+        // Nonidentity shuffle must always see a complete physical 32-bit word.
+        if rest.len() >= 4 || identity {
+            for &source in &self.source_bytes {
+                if written == samples || source >= rest.len() {
+                    break;
+                }
+                let count = (samples - written).min(4);
+                output[written..written + count]
+                    .copy_from_slice(&table[rest[source] as usize][..count]);
+                written += count;
+            }
+        }
+        written
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShuffleKind {
     Identity,
@@ -240,23 +314,10 @@ pub fn build_decode_plan(
         _ => DecodeFastKind::Generic,
     };
     let levels_f32 = levels.iter().map(|&v| v as f32).collect::<Vec<_>>();
-    let (packed2_lut16_usb, packed2_lut16_lsb_flip) = if bits == 2 && kind == ShuffleKind::Identity
-    {
-        let mut lut_usb = vec![[0.0_f32; 8]; 1 << 16].into_boxed_slice();
-        let mut lut_lsb_flip = vec![[0.0_f32; 8]; 1 << 16].into_boxed_slice();
-        for word in 0u32..(1u32 << 16) {
-            let w = word as usize;
-            for i in 0..8 {
-                let code = (w >> (2 * i)) & 0x3;
-                let val = levels_f32[code];
-                lut_usb[w][i] = val;
-                // LSB->USB normalization flips odd-indexed time samples.
-                lut_lsb_flip[w][i] = if (i & 1) == 1 { -val } else { val };
-            }
-        }
-        (Some(lut_usb), Some(lut_lsb_flip))
+    let packed2_bytes = if bits == 2 {
+        Packed2Bytes::new(&input_shifts, &levels_f32)
     } else {
-        (None, None)
+        None
     };
     Ok(DecodePlan {
         bits,
@@ -264,8 +325,7 @@ pub fn build_decode_plan(
         input_shifts,
         fast_kind,
         levels_f32,
-        packed2_lut16_usb,
-        packed2_lut16_lsb_flip,
+        packed2_bytes,
     })
 }
 
@@ -307,58 +367,15 @@ pub fn decode_block_into_with_plan(
             }
         }
         DecodeFastKind::Packed2 => {
-            if plan.shuffle_kind == ShuffleKind::Identity && !(lsb_to_usb && first_sample_odd) {
-                let lut = if lsb_to_usb {
-                    plan.packed2_lut16_lsb_flip
-                        .as_ref()
-                        .ok_or("internal error: missing packed2(16b) LSB lookup table")?
-                } else {
-                    plan.packed2_lut16_usb
-                        .as_ref()
-                        .ok_or("internal error: missing packed2(16b) lookup table")?
-                };
-                let mut pairs = raw.chunks_exact(2);
-                for pair in &mut pairs {
-                    if out_idx + 8 <= samples {
-                        let word = u16::from_le_bytes([pair[0], pair[1]]) as usize;
-                        output[out_idx..out_idx + 8].copy_from_slice(&lut[word]);
-                        out_idx += 8;
-                    } else {
-                        // Rare tail path when sample count is not aligned by 8 samples.
-                        let mut word = u16::from_le_bytes([pair[0], pair[1]]) as usize;
-                        for _ in 0..8 {
-                            if out_idx >= samples {
-                                break;
-                            }
-                            let code = word & 0x3;
-                            let mut val = level_map[code];
-                            if lsb_to_usb && odd {
-                                val = -val;
-                            }
-                            output[out_idx] = val;
-                            out_idx += 1;
-                            odd = !odd;
-                            word >>= 2;
-                        }
-                    }
-                }
-                for &byte in pairs.remainder() {
-                    let mut packed = byte as usize;
-                    for _ in 0..4 {
-                        if out_idx >= samples {
-                            break;
-                        }
-                        let code = packed & 0x3;
-                        let mut val = level_map[code];
-                        if lsb_to_usb && odd {
-                            val = -val;
-                        }
-                        output[out_idx] = val;
-                        out_idx += 1;
-                        odd = !odd;
-                        packed >>= 2;
-                    }
-                }
+            if let Some(bytes) = plan.packed2_bytes.as_ref() {
+                out_idx = bytes.decode(
+                    raw,
+                    samples,
+                    output,
+                    lsb_to_usb,
+                    first_sample_odd,
+                    plan.shuffle_kind == ShuffleKind::Identity,
+                );
             } else {
                 for chunk in raw.chunks_exact(4) {
                     let mut word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -522,5 +539,103 @@ pub fn safe_arg(z: &Complex<f64>) -> f64 {
         0.0
     } else {
         z.arg()
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    #[test]
+    fn packed2_byte_tables_match_independent_bit_permutation() {
+        let maps: Vec<Vec<usize>> = vec![
+            (0..32).collect(),
+            (0..32).map(|i| i ^ 7).collect(), // native VSREC
+            (0..32).map(|i| i ^ 1).collect(),
+            (0..32).rev().collect(),
+            (0..32).map(|i| ((i / 8 + 1) % 4) * 8 + i % 8).collect(),
+            (0..32).map(|i| (5 * i + 7) % 32).collect(), // generic fallback
+        ];
+        let levels = [-2.25, 0.0, -0.5, 1.25];
+        let raw: Vec<u8> = (0..=255u8)
+            .flat_map(|v| [v, v.rotate_left(1), v.wrapping_mul(37), v ^ 0xaa])
+            .collect();
+        for (m, map) in maps.iter().enumerate() {
+            let plan = build_decode_plan(2, map, &levels).unwrap();
+            assert_eq!(plan.packed2_bytes.is_some(), m != 5);
+            for lsb in [false, true] {
+                for first_odd in [false, true] {
+                    let mut reference = Vec::new();
+                    for bytes in raw.chunks_exact(4) {
+                        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+                        for sample in 0..16 {
+                            let code = ((word >> map[2 * sample]) & 1)
+                                | (((word >> map[2 * sample + 1]) & 1) << 1);
+                            let value = levels[code as usize] as f32;
+                            reference.push(if lsb && (first_odd ^ (sample % 2 == 1)) {
+                                -value
+                            } else {
+                                value
+                            });
+                        }
+                    }
+                    for samples in [0, 1, 3, 4, 7, 8, 15, 16, 17, 31, 4093, 4096] {
+                        let mut actual = vec![123.0; samples + 3];
+                        decode_block_into_with_plan(
+                            &raw,
+                            samples,
+                            &plan,
+                            &mut actual,
+                            lsb,
+                            first_odd,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual[..samples]
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            reference[..samples]
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            "map={m} samples={samples} lsb={lsb} odd={first_odd}"
+                        );
+                        assert_eq!(&actual[samples..], &[123.0; 3]);
+                    }
+                    // The identity decoder also accepts incomplete raw words.
+                    for raw_len in 1..8 {
+                        let samples = if m == 0 {
+                            raw_len * 4
+                        } else {
+                            raw_len / 4 * 16
+                        };
+                        let mut actual = vec![0.0; samples];
+                        decode_block_into_with_plan(
+                            &raw[..raw_len],
+                            samples,
+                            &plan,
+                            &mut actual,
+                            lsb,
+                            first_odd,
+                        )
+                        .unwrap();
+                        assert_eq!(actual, reference[..samples]);
+                        if m != 0 && raw_len % 4 != 0 {
+                            let mut short = vec![0.0; raw_len * 4];
+                            assert!(decode_block_into_with_plan(
+                                &raw[..raw_len],
+                                raw_len * 4,
+                                &plan,
+                                &mut short,
+                                lsb,
+                                first_odd
+                            )
+                            .is_err());
+                        }
+                    }
+                }
+            }
+        }
     }
 }

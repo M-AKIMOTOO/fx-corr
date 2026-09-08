@@ -198,7 +198,7 @@ fn geometric_delay_at(ctx: GeometryContext, variant: ModelVariant, elapsed_proce
             (ctx.ra_j2000_rad, ctx.dec_j2000_rad)
         }
     };
-    geom::calculate_geometric_delay_and_derivatives_full_with_eop(
+    geom::calculate_geometric_delay_full_with_eop(
         ctx.ant1_ecef_m,
         ctx.ant2_ecef_m,
         ra,
@@ -209,7 +209,6 @@ fn geometric_delay_at(ctx: GeometryContext, variant: ModelVariant, elapsed_proce
         variant.delay_mode,
         variant.source_mode,
     )
-    .2
 }
 
 fn solve_5x5(mut a: [[f64; 5]; 5], mut b: [f64; 5]) -> Option<[f64; 5]> {

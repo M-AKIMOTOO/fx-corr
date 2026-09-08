@@ -838,6 +838,89 @@ pub fn calculate_geometric_delay_and_derivatives_mode_with_eop(
     )
 }
 
+/// Evaluate only the baseline delay. Grid builders derive their own rate and
+/// higher derivatives, so evaluating antenna delays and t +/- 1 s here would
+/// repeat expensive precession/nutation and Earth-ephemeris calculations.
+pub fn calculate_geometric_delay_full_with_eop(
+    ant1_xyz: [f64; 3],
+    ant2_xyz: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    reference_mjd: f64,
+    eop: EarthOrientation,
+    mode: GeometricDelayMode,
+    source_mode: SourceVectorMode,
+) -> f64 {
+    match mode {
+        GeometricDelayMode::Anchored => {
+            let bary_ref = calculate_baseline_delay_barycentric_with_eop_mode(
+                ant1_xyz,
+                ant2_xyz,
+                ra,
+                dec,
+                reference_mjd,
+                eop,
+                source_mode,
+            );
+            let geo_ref = calculate_baseline_delay_with_eop_mode(
+                ant1_xyz,
+                ant2_xyz,
+                ra,
+                dec,
+                reference_mjd,
+                eop,
+                source_mode,
+            );
+            let bary_t = calculate_baseline_delay_barycentric_with_eop_mode(
+                ant1_xyz,
+                ant2_xyz,
+                ra,
+                dec,
+                mjd,
+                eop,
+                source_mode,
+            );
+            geo_ref + (bary_t - bary_ref)
+        }
+        GeometricDelayMode::Barycentric => calculate_baseline_delay_barycentric_with_eop_mode(
+            ant1_xyz,
+            ant2_xyz,
+            ra,
+            dec,
+            mjd,
+            eop,
+            source_mode,
+        ),
+        GeometricDelayMode::VlbiMinus | GeometricDelayMode::VlbiPlus => {
+            let sign = if mode == GeometricDelayMode::VlbiMinus {
+                -1.0
+            } else {
+                1.0
+            };
+            calculate_baseline_delay_vlbi_first_order_with_eop_mode(
+                ant1_xyz,
+                ant2_xyz,
+                ra,
+                dec,
+                mjd,
+                eop,
+                source_mode,
+                sign,
+            )
+        }
+        GeometricDelayMode::Geocentric => calculate_baseline_delay_with_eop_mode(
+            ant1_xyz,
+            ant2_xyz,
+            ra,
+            dec,
+            mjd,
+            eop,
+            source_mode,
+        ),
+    }
+}
+
 pub fn calculate_geometric_delay_and_derivatives_full_with_eop(
     ant1_xyz: [f64; 3],
     ant2_xyz: [f64; 3],
@@ -1050,7 +1133,72 @@ fn calculate_geometric_delay_and_derivatives_anchored_full_with_eop(
 
 #[cfg(test)]
 mod tests {
-    use super::{mjd_to_gmst, parse_dec, parse_epoch_to_mjd, parse_ra};
+    use super::*;
+
+    #[test]
+    fn delay_only_matches_full_model_for_all_modes_and_baselines() {
+        let epoch = 60977.34375;
+        let hitachi = [-3961788.974, 3243597.492, 3790597.692];
+        let eop = EarthOrientation {
+            dut1_s: 0.12,
+            xp_arcsec: 0.15,
+            yp_arcsec: 0.3,
+            ..EarthOrientation::default()
+        };
+        for (a1, a2) in [
+            (YAMAGU32_ECEF, hitachi),
+            (hitachi, YAMAGU32_ECEF),
+            (YAMAGU32_ECEF, YAMAGU34_ECEF),
+            (YAMAGU32_ECEF, YAMAGU32_ECEF),
+        ] {
+            for source_mode in [
+                SourceVectorMode::MeanGast,
+                SourceVectorMode::PnmGast,
+                SourceVectorMode::PnmEra,
+            ] {
+                for mode in [
+                    GeometricDelayMode::Anchored,
+                    GeometricDelayMode::Barycentric,
+                    GeometricDelayMode::VlbiMinus,
+                    GeometricDelayMode::VlbiPlus,
+                    GeometricDelayMode::Geocentric,
+                ] {
+                    for dt_s in [-10.0, 0.0, 0.25, 1800.0, 3600.0] {
+                        let t = epoch + dt_s / 86400.0;
+                        let args = (4.594776025749384, -0.2282965720462692);
+                        let expected = calculate_geometric_delay_and_derivatives_full_with_eop(
+                            a1,
+                            a2,
+                            args.0,
+                            args.1,
+                            t,
+                            epoch,
+                            eop,
+                            mode,
+                            source_mode,
+                        )
+                        .2;
+                        let actual = calculate_geometric_delay_full_with_eop(
+                            a1,
+                            a2,
+                            args.0,
+                            args.1,
+                            t,
+                            epoch,
+                            eop,
+                            mode,
+                            source_mode,
+                        );
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "{source_mode:?} {mode:?} {dt_s}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_ra_supports_hhmmss_and_hms() {

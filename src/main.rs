@@ -2,6 +2,7 @@ mod acf;
 mod affinity;
 mod args;
 mod cor;
+mod corr_kernel;
 mod eop;
 mod fringe;
 mod geom;
@@ -37,6 +38,7 @@ use args::{
 use cor::{
     epoch_to_yyyydddhhmmss, unix_seconds_to_yyyydddhhmmss, CorHeaderConfig, CorStation, CorWriter,
 };
+use corr_kernel::{accumulate_direct_acf_xcf, phase_to_f32};
 use plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE, GREEN, RED};
 use pulsar::{FoldAccum, FoldProduct, PulsarRuntime};
 use utils::{
@@ -280,36 +282,75 @@ fn contiguous_real_fft_src_start(
     }
 }
 
-#[inline(always)]
-fn accumulate_direct_acf_xcf(
-    spectrum1: &[Complex<f32>],
-    spectrum2: &[Complex<f32>],
-    acc11: &mut [f64],
-    acc12: &mut [Complex<f64>],
-    acc22: &mut [f64],
-    fr_mix: Complex<f32>,
-    mut phase_corr: Complex<f32>,
-    phase_step: Complex<f32>,
-) {
-    debug_assert_eq!(spectrum1.len(), spectrum2.len());
-    debug_assert_eq!(spectrum1.len(), acc11.len());
-    debug_assert_eq!(spectrum1.len(), acc12.len());
-    debug_assert_eq!(spectrum1.len(), acc22.len());
-    for k in 0..spectrum1.len() {
-        let z1 = spectrum1[k];
-        let z2 = spectrum2[k];
-        acc11[k] += z1.norm_sqr() as f64;
-        acc22[k] += z2.norm_sqr() as f64;
-        let raw_xcf = z1 * z2.conj();
-        let value = raw_xcf * fr_mix * phase_corr;
-        acc12[k] += Complex::new(value.re as f64, value.im as f64);
-        phase_corr *= phase_step;
-    }
-}
-
 #[cfg(test)]
 mod correlation_hot_path_tests {
     use super::*;
+
+    #[test]
+    fn decoded_windows_match_full_decode_with_boundary_padding() {
+        let maps: Vec<Vec<usize>> = vec![
+            (0..32).collect(),
+            (0..32).map(|i| i ^ 7).collect(),
+            (0..32).map(|i| (5 * i + 7) % 32).collect(),
+        ];
+        for bits in [1, 2, 4, 8] {
+            let levels: Vec<f64> = (0..1usize << bits).map(|i| i as f64 - 1.5).collect();
+            for map in &maps {
+                let plan = build_decode_plan(bits, map, &levels).unwrap();
+                for raw_len in [0, 1, 3, 4, 19, 20, 40] {
+                    let raw: Vec<u8> = (0..raw_len).map(|i| (i * 37 + 91) as u8).collect();
+                    let mut padded = raw.clone();
+                    padded.resize((raw_len + 3) / 4 * 4, 0);
+                    for lsb in [false, true] {
+                        for abs_start in [0, 1] {
+                            let mut reference = vec![0.0; padded.len() * 8 / bits];
+                            let n = reference.len();
+                            decode_block_into_with_plan(
+                                &padded,
+                                n,
+                                &plan,
+                                &mut reference,
+                                lsb,
+                                abs_start % 2 != 0,
+                            )
+                            .unwrap();
+                            let available = raw.len() * 8 / bits;
+                            let mut scratch = DecodeWindowScratch::new();
+                            let mut actual = vec![123.0; 32];
+                            for frame in 0..4 {
+                                for shift in [-40, -17, -1, 0, 1, 17, 40, 80] {
+                                    decode_shifted_frame_from_chunk(
+                                        &raw,
+                                        abs_start,
+                                        frame,
+                                        32,
+                                        bits,
+                                        32 / bits as u64,
+                                        &plan,
+                                        lsb,
+                                        shift,
+                                        &mut actual,
+                                        &mut scratch,
+                                    )
+                                    .unwrap();
+                                    for k in 0..32 {
+                                        let index = (frame * 32 + k) as i64 - shift;
+                                        let expected = if index >= 0 && index < available as i64 {
+                                            reference[index as usize]
+                                        } else {
+                                            0.0
+                                        };
+                                        assert_eq!(actual[k].to_bits(), expected.to_bits(),
+                                            "bits={bits} raw={raw_len} frame={frame} shift={shift} k={k}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn contiguous_grid_map_detects_direct_and_wrapped_ranges() {
@@ -342,8 +383,8 @@ mod correlation_hot_path_tests {
             })
             .collect::<Vec<_>>();
         let fr_mix = Complex::from_polar(1.0_f32, 0.37);
-        let phase0 = Complex::from_polar(1.0_f32, -0.21);
-        let phase_step = Complex::from_polar(1.0_f32, 0.013);
+        let phase0 = Complex::from_polar(1.0_f64, -0.21);
+        let phase_step = Complex::from_polar(1.0_f64, 0.013);
 
         let mut direct11 = vec![0.0; spectrum1.len()];
         let mut direct12 = vec![Complex::new(0.0, 0.0); spectrum1.len()];
@@ -369,7 +410,7 @@ mod correlation_hot_path_tests {
             mapped11[k] += z1.norm_sqr() as f64;
             mapped22[k] += z2.norm_sqr() as f64;
             let raw_xcf = z1 * z2.conj();
-            let value = raw_xcf * fr_mix * phase_corr;
+            let value = raw_xcf * fr_mix * phase_to_f32(phase_corr);
             mapped12[k] += Complex::new(value.re as f64, value.im as f64);
             phase_corr *= phase_step;
         }
@@ -935,7 +976,7 @@ fn xcf_phase_start_and_step(
     phase_delay2_s: f64,
     start_bin1: isize,
     start_bin2: isize,
-) -> (Complex<f32>, Complex<f32>) {
+) -> (Complex<f64>, Complex<f64>) {
     // Equivalent to rotating s1/s2 spectra independently and then forming
     // s1 * conj(s2).
     //
@@ -947,8 +988,8 @@ fn xcf_phase_start_and_step(
     let step2 = two_pi_df * phase_delay2_s;
     let phase_start_angle = step1 * start_bin1 as f64 - step2 * start_bin2 as f64;
     let phase_step_angle = step1 - step2;
-    let phase_start = Complex::from_polar(1.0_f32, phase_start_angle as f32);
-    let phase_step = Complex::from_polar(1.0_f32, phase_step_angle as f32);
+    let phase_start = Complex::from_polar(1.0_f64, phase_start_angle);
+    let phase_step = Complex::from_polar(1.0_f64, phase_step_angle);
     (phase_start, phase_step)
 }
 
@@ -956,10 +997,10 @@ fn antenna_phase_start_and_step(
     df_hz: f64,
     phase_delay_s: f64,
     start_bin: isize,
-) -> (Complex<f32>, Complex<f32>) {
+) -> (Complex<f64>, Complex<f64>) {
     let step_angle = -2.0_f64 * std::f64::consts::PI * df_hz * phase_delay_s;
-    let phase_start = Complex::from_polar(1.0_f32, (step_angle * start_bin as f64) as f32);
-    let phase_step = Complex::from_polar(1.0_f32, step_angle as f32);
+    let phase_start = Complex::from_polar(1.0_f64, step_angle * start_bin as f64);
+    let phase_step = Complex::from_polar(1.0_f64, step_angle);
     (phase_start, phase_step)
 }
 
@@ -1644,7 +1685,6 @@ fn decode_shifted_frame_from_chunk(
     if out.len() != fft_len {
         return Err("decode output length does not match fft length".into());
     }
-    out.fill(0.0);
     let chunk_samples = (raw_chunk.len() * 8 / bit) as i128;
     let frame_start = frame_in_chunk as i128 * fft_len as i128;
     let needed_start = frame_start - int_shift as i128;
@@ -1652,6 +1692,7 @@ fn decode_shifted_frame_from_chunk(
     let copy_start = needed_start.max(0);
     let copy_end = needed_end.min(chunk_samples);
     if copy_end <= copy_start {
+        out.fill(0.0);
         return Ok(());
     }
 
@@ -1666,29 +1707,67 @@ fn decode_shifted_frame_from_chunk(
     let raw_byte_start = (aligned_start as usize * bit) / 8;
     let raw_bytes_needed = (decode_samples * bit + 7) / 8;
 
-    scratch.raw.resize(raw_bytes_needed, 0);
-    if raw_byte_start < raw_chunk.len() {
-        let available = (raw_chunk.len() - raw_byte_start).min(raw_bytes_needed);
+    // Interior windows can borrow the reader's packed data directly.
+    let raw = if raw_byte_start + raw_bytes_needed <= raw_chunk.len() {
+        &raw_chunk[raw_byte_start..raw_byte_start + raw_bytes_needed]
+    } else {
+        scratch.raw.resize(raw_bytes_needed, 0);
+        let available = raw_chunk
+            .len()
+            .saturating_sub(raw_byte_start)
+            .min(raw_bytes_needed);
         scratch.raw[..available]
             .copy_from_slice(&raw_chunk[raw_byte_start..raw_byte_start + available]);
         scratch.raw[available..].fill(0);
-    } else {
-        scratch.raw.fill(0);
-    }
-
-    scratch.samples.resize(decode_samples, 0.0);
+        &scratch.raw
+    };
     let aligned_abs = chunk_abs_start_sample as u128 + aligned_start as u128;
     let first_sample_odd = (aligned_abs & 1) != 0;
-    decode_block_into_with_plan(
-        &scratch.raw,
-        decode_samples,
-        plan,
-        &mut scratch.samples,
-        lsb_to_usb,
-        first_sample_odd,
-    )?;
-    out[out_start..out_start + copy_len]
-        .copy_from_slice(&scratch.samples[offset_in_decoded..offset_in_decoded + copy_len]);
+    if offset_in_decoded == 0 && out_start == 0 && decode_samples == fft_len && copy_len == fft_len
+    {
+        return decode_block_into_with_plan(raw, fft_len, plan, out, lsb_to_usb, first_sample_odd);
+    }
+    // Only unavailable boundary samples need clearing.
+    out[..out_start].fill(0.0);
+    out[out_start + copy_len..].fill(0.0);
+
+    // Decode full physical words straight into the FFT input, even when the
+    // integer delay starts inside a word. Only the two edge words need scratch.
+    let word_samples = samples_per_word as usize;
+    scratch.samples.resize(word_samples, 0.0);
+    let dst = &mut out[out_start..out_start + copy_len];
+    let mut written = 0;
+    let mut raw_offset = 0;
+    if offset_in_decoded != 0 {
+        decode_block_into_with_plan(
+            &raw[..4], word_samples, plan, &mut scratch.samples,
+            lsb_to_usb, first_sample_odd,
+        )?;
+        written = (word_samples - offset_in_decoded).min(copy_len);
+        dst[..written].copy_from_slice(
+            &scratch.samples[offset_in_decoded..offset_in_decoded + written],
+        );
+        raw_offset = 4;
+    }
+    let middle_samples = (copy_len - written) / word_samples * word_samples;
+    let middle_bytes = middle_samples / word_samples * 4;
+    if middle_samples != 0 {
+        decode_block_into_with_plan(
+            &raw[raw_offset..raw_offset + middle_bytes], middle_samples, plan,
+            &mut dst[written..written + middle_samples], lsb_to_usb,
+            first_sample_odd ^ ((raw_offset / 4 * word_samples) & 1 != 0),
+        )?;
+        written += middle_samples;
+        raw_offset += middle_bytes;
+    }
+    if written < copy_len {
+        decode_block_into_with_plan(
+            &raw[raw_offset..raw_offset + 4], word_samples, plan, &mut scratch.samples,
+            lsb_to_usb,
+            first_sample_odd ^ ((raw_offset / 4 * word_samples) & 1 != 0),
+        )?;
+        dst[written..].copy_from_slice(&scratch.samples[..copy_len - written]);
+    }
     Ok(())
 }
 
@@ -6739,18 +6818,17 @@ fn run_once(
                     (v.ra_raw, v.dec_raw)
                 }
             };
-            let (_, _, gd_t, _gr_t, _ga_t) =
-                geom::calculate_geometric_delay_and_derivatives_full_with_eop(
-                    ant1_ecef,
-                    ant2_ecef,
-                    ra_t,
-                    dec_t,
-                    mjd_t,
-                    v.mjd,
-                    earth_orientation,
-                    geom_delay_mode,
-                    source_vector_mode,
-                );
+            let gd_t = geom::calculate_geometric_delay_full_with_eop(
+                ant1_ecef,
+                ant2_ecef,
+                ra_t,
+                dec_t,
+                mjd_t,
+                v.mjd,
+                earth_orientation,
+                geom_delay_mode,
+                source_vector_mode,
+            );
             delay_grid.push(gd_t);
         }
 
@@ -7527,7 +7605,7 @@ fn run_once(
                         for k in 0..(ba.a1e - ba.a1s) {
                             let i1 = ba.a1s + k;
                             let i2 = ba.a2s + k;
-                            let v = (g1[i1] * g2[i2].conj()) * fr_mix * phase_corr;
+                            let v = (g1[i1] * g2[i2].conj()) * fr_mix * phase_to_f32(phase_corr);
                             match out_grid {
                                 OutputGrid::Ant1 => {
                                     st.acc[i1] += Complex::new(v.re as f64, v.im as f64)
@@ -8611,8 +8689,8 @@ fn run_once(
                                 for k in 0..(ba.a1e - ba.a1s) {
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
-                                    s1_aligned[i1] = g1[i1] * fr_lo1 * phase1;
-                                    s2_aligned[i1] = g2[i2] * fr_lo2 * phase2;
+                                    s1_aligned[i1] = g1[i1] * fr_lo1 * phase_to_f32(phase1);
+                                    s2_aligned[i1] = g2[i2] * fr_lo2 * phase_to_f32(phase2);
                                     phase1 *= step1;
                                     phase2 *= step2;
                                 }
@@ -8691,8 +8769,8 @@ fn run_once(
                                 for k in 0..(ba.a1e - ba.a1s) {
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
-                                    s1_aligned[i2] = g1[i1] * fr_lo1 * phase1;
-                                    s2_aligned[i2] = g2[i2] * fr_lo2 * phase2;
+                                    s1_aligned[i2] = g1[i1] * fr_lo1 * phase_to_f32(phase1);
+                                    s2_aligned[i2] = g2[i2] * fr_lo2 * phase_to_f32(phase2);
                                     phase1 *= step1;
                                     phase2 *= step2;
                                 }
@@ -9011,7 +9089,7 @@ fn run_once(
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
                                             let raw_xcf = st.g1[i1] * st.g2[i2].conj();
-                                            let v = raw_xcf * fr_mix * phase_corr;
+                                            let v = raw_xcf * fr_mix * phase_to_f32(phase_corr);
                                             fold.add_values(
                                                 rt,
                                                 t_since_process_s,
@@ -9038,7 +9116,7 @@ fn run_once(
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
                                             let raw_xcf = st.g1[i1] * st.g2[i2].conj();
-                                            let v = raw_xcf * fr_mix * phase_corr;
+                                            let v = raw_xcf * fr_mix * phase_to_f32(phase_corr);
                                             fold.add_values(
                                                 rt,
                                                 t_since_process_s,
@@ -9131,7 +9209,7 @@ fn run_once(
                                     }
                                     if let Some((ref mut pc, step)) = phase_corr {
                                         let raw_xcf = z1 * z2.conj();
-                                        let v = raw_xcf * fr_mix * *pc;
+                                        let v = raw_xcf * fr_mix * phase_to_f32(*pc);
                                         maybe_dump_xcf_debug(
                                             args.debug,
                                             emitted + i,
@@ -9141,7 +9219,7 @@ fn run_once(
                                             output_bin,
                                             raw_xcf,
                                             fr_mix,
-                                            *pc,
+                                            phase_to_f32(*pc),
                                             v,
                                             d,
                                             fs,

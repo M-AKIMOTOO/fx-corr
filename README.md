@@ -215,6 +215,110 @@ For process 2+ logs:
 
 ### yi-phasedarray
 
+#### 目的と処理結果
+
+`yi-phasedarray` は、2局の観測電圧を相関するだけのプログラムではない。
+各局に yi-corr と同じ遅延・fringe・周波数グリッド補正を施した後、複素電圧を
+ベクトル和として加算し、再び時間領域の packed raw data に戻すソフトウェアである。
+出力は YAMAGU32 と YAMAGU34 を1本の仮想局 YAMAGU66 として後段の yi-corr に
+入力できる。単純な byte 加算、実数値の平均、相関スペクトルの足し算ではない。
+
+FFT 後の共通周波数グリッド上で、各局の補正済み複素電圧を
+
+```text
+X1c(f,t) = X1(f,t) * D1(f,t) * F1(t)
+X2c(f,t) = X2(f,t) * D2(f,t) * F2(t)
+Y(f,t)   = w1 * X1c(f,t) + w2 * X2c(f,t)
+```
+
+として計算する。`D` は integer/fractional delay と周波数傾斜、`F` は fringe-stop
+位相である。`Y` を Hermitian な実信号スペクトルとして inverse FFT し、選択した
+出力局と同じ bit/level/shuffle/sideband/rotation へ再量子化したものが
+`YAMAGU66_<TAG>.raw` である。
+
+#### yi-corr と共通な部分、異なる部分
+
+両プログラムは raw file の解釈から補正済み FFT を得るまで同じ経路を使う。
+
+1. XML の process、station、terminal、clock、source、sideband、rotation を読む。
+2. `<station-name>_<YYYYDDDhhmmss>.raw` を解決する。
+3. 物理的な32-bit word境界を保ったまま shuffle と level map を使って復号する。
+4. read-align の整数 sample、frame ごとの整数追跡、fractional delay を適用する。
+5. LSB/USB を内部の共通規約へ正規化して real FFT を行う。
+6. rotation と band overlap を解決し、XML 周波数グリッドへ並べる。
+7. 幾何学遅延、clock polynomial、EOP、fringe stop を各局へ適用する。
+
+ここから yi-corr は `X1c * conj(X2c)` を積分して `.cor` を作る。一方
+yi-phasedarray は `w1*X1c + w2*X2c` を計算し、inverse FFT、sideband 復元、
+再量子化を行って新しい `.raw` を作る。この共通経路のため、yi-corr で正しく
+補正できない delay/rate/sideband/shuffle は yi-phasedarray でも正しくならない。
+
+#### 基準局と符号規約
+
+- XML baseline は `reference-corrected` の順序、例えば `K-L` を使用する。
+- gain phase calibration では K を変更せず、補正量を L の clock に加える。
+- 幾何学遅延は ant2-ant1 規約で評価し、実際に遅延させる側と residual correction
+  target はログへ明示する。
+- `reference_station` は合成位相と仮想局 ECEF の基準であり、物理的な2局の中点ではない。
+- `native_format_station` は出力 bit/level/shuffle/sideband/rotation を継承した局である。
+  位相基準局と packed-format 継承局は一致するとは限らない。
+- 出力グリッドは現在、`abs(rotation)` が小さい局を選ぶ。同率なら ant1 である。
+
+後段の XML に仮想局を登録するときは `.raw.meta` の `reference_station` と
+`reference_ecef_m` を使い、packed data の読取りには `native_format_station`、
+`bit`、`level`、`shuffle_external`、`sideband`、`rotation_hz` を使う。
+
+#### 重みと出力量子化
+
+相対電圧重みの優先順位は次のとおりである。
+
+1. `--sefd`: `w = 1/SEFD`
+2. `--diameter` と `--eta`: 有効面積と Tsys から SEFD を計算し `w = 1/SEFD`
+3. 上記がなければ `w = gain/Tsys`
+
+各オプションは `--tsys ant1:... ant2:...` のように局別指定できる。絶対値が非常に
+小さい SEFD 重みでも量子化器を潰さないよう、`w1/w2` の比を保存した共通
+`voltage_scale` を掛け、独立雑音の期待 power が出力 level map の平均 power に
+一致するよう正規化する。したがって `.raw.meta` の `weight_ant1/2` は実際に
+加算した有効電圧重みであり、`voltage_scale` は共通正規化係数である。
+
+重みは感度比を与えるが、誤った相対位相を修復しない。coherent gain を得るには
+delay、rate、acceleration、定数位相が十分に補正されていなければならない。
+
+#### 通常合成の実行
+
+```bash
+yi-phasedarray \
+  --sc S25302A_2_KL.xml \
+  --raw ../raw \
+  --output phased_array \
+  --phased-name YAMAGU66 \
+  --cpu 16
+```
+
+複数 `<process>` を含み、`--process-index/--epoch/--ra/--dec/--length/--skip` で
+上書きしなければ全 process を XML 記載順に処理する。`--output` を省略すると current
+directory に書く。`--usb` は外部 USB storage 向けの I/O tuning であり、電波の
+USB sideband 指定ではない。
+
+主なオプションは以下である。
+
+| Option | 意味 |
+|---|---|
+| `--sc XML` | station/source/clock/process を含む schedule |
+| `--raw DIR` | 入力 raw directory |
+| `--output DIR` | raw、meta、diagnostic の出力先 |
+| `--phased-name NAME` | 仮想局名。default `YAMAGU66` |
+| `--cpu N` | compute thread 数 |
+| `--chunk-frames N` | reader chunk。通常は auto tuning を推奨 |
+| `--usb` | USB 接続 storage 向けの読み出し調整 |
+| `--tsys/--gain/--sefd/--diameter/--eta` | 局別の感度重み |
+| `--phased-diagnostics` | 入力 ACF、短基線 XCF、合成前量子化 ACF、plot を追加 |
+| `--gain-phasecal` | gain scan から自動位相較正して全 scan を合成 |
+| `--phased-validation` | 3局 closure を使った完全な NPZ 検証を実行 |
+
+#### raw と sidecar metadata
+
 - `YAMAGU66_<TAG>.raw` (phased time-series)
 - `YAMAGU66_<TAG>.raw.meta` (virtual-station reference and packed-data format)
 
@@ -240,7 +344,82 @@ Optional `--phased-diagnostics` also writes:
 `--output DIR` selects the destination directory. If omitted,
 yi-phasedarray writes to the current directory.
 
-#### Automatic gain phase-reference workflow
+sidecar の主要 field は次のとおりである。
+
+| Field | 用途 |
+|---|---|
+| `software_version` | 生成に使用した yi-phasedarray version |
+| `epoch_utc/output_tag/source` | scan の時刻と天体 |
+| `reference_station/reference_ecef_m` | 仮想局の位相・座標基準 |
+| `native_format_station` | packed-data format を継承した入力局 |
+| `sampling_hz/observing_frequency_mhz/rotation_hz` | 周波数規約 |
+| `sideband/bit/level/shuffle_external` | raw decoder に必要な全 format |
+| `fft/frames/samples/duration_s` | 出力長と完全性検査 |
+| `input_ant1/input_ant2` | provenance |
+| `weight_ant1/weight_ant2/voltage_scale` | 実際に使用した合成重み |
+
+`shuffle_external` は内部 FFT buffer の順序ではなく、入力 XML/`--shuffle` と同じ
+外部表示順の32-entry permutation である。`level` は code index 順で、2 bit なら
+`00, 01, 10, 11` に対応する。`sideband` は inverse FFT 後に native representation へ
+戻した raw の sideband である。この3項を別々の局から混ぜず、必ず
+`native_format_station` の1組として扱う。
+
+出力は最初に `.raw.part` へ書き、期待 byte 数
+
+```text
+expected_bytes = frames * fft * bit / 8
+```
+
+と一致した場合だけ `.raw` へ rename する。
+同じ sampling、bit depth、nominal duration なら入力と出力の期待容量も同じになる。例えば
+`1.024e9 sample/s`、2 bit、3600 s なら
+
+```text
+1.024e9 * 2/8 * 3600 = 921600000000 bytes
+```
+
+である。比較すべきなのは `ls` の見た目だけでなく、この理論値、meta の
+`frames/samples/duration_s`、実 file size の4者である。入力末尾に余分な byte がある場合や、
+指定時間が FFT frame の整数倍でない場合は入力 file 全体と同じになるとは限らない。
+
+明示した process length は delay seek で入力末尾を越えても scan 長を短縮せず、利用不能な境界 sample だけ zero padding
+する。したがって正常終了した raw と meta の `frames/samples/duration_s` は一致する。
+
+`vdif2spec` は sidecar を自動では読まない。入力局が VSREC LSB なら、出力も
+meta に従って同じ native decoder を指定する。
+
+```bash
+vdif2spec \
+  --vdif YAMAGU66_<TAG>.raw \
+  --fft 8192 \
+  --cpu 16 \
+  --output \
+  --vsrec \
+  --sideband LSB
+```
+
+`--vsrec` の有無や sideband を変えて都合のよい spectrum を選んではならない。
+meta の `shuffle_external`、`level`、`sideband` と一致する条件を1つだけ使う。
+maser が4分割される、512 MHz band の反対側へ移る、spectrum が鏡像になる場合は、
+まず decoder の shuffle/level/sideband が meta と一致しているか確認する。
+
+#### 合成結果を何で検証するか
+
+単一局 spectrum が自然に見えることだけでは coherent phasing の証明にならない。
+最低限、次の順序で検証する。
+
+1. `vdif2spec` で入力2局と仮想局を同じ FFT、同じ native format で比較する。
+2. `--phased-diagnostics` の短基線 XCF で、補正後の relative phase が安定しているか確認する。
+3. 独立した第3局 H との長基線で `V1H`、`V2H`、`Vphased,H` を測る。
+4. `Vphased,H` が重み付き予測 `w1*V1H + w2*V2H` と高い coherence を持ち、
+   component 単局より感度が改善するか確認する。
+5. input/phased ACF、closure phase、再量子化前後の scale も同時に確認する。
+
+この完全な検査を自動化するのが後述の `--phased-validation` である。短基線
+Y32-Y34 の S/N が高いことだけでは、Y66-H の coherent gain を保証しない。110 m の
+短基線では連続波や共通環境成分も拾い得るため、873 km 級の独立基線を最終判定に使う。
+
+#### 自動 gain phase-reference workflow
 
 For a normal `target -> gain -> target -> gain ...` schedule, yi-phasedarray can
 solve the Y32--Y34 gain phase and then synthesize every target and gain scan in
@@ -256,9 +435,47 @@ nohup yi-phasedarray \
   --gain-source NRAO530 \
   --gain-reference-key K \
   --gain-corrected-key L \
-  --gain-fringe-length 1 \
+  --gain-fringe-length 10 \
   > yi-phasedarray_phasecal.log 2>&1 &
 ```
+
+`--gain-fringe-length` の単位は秒ではなく correlator sector 数である。XML の `<stream><output>` が 1 Hz（1 sector = 1 s）なら、`10` は10秒となる。
+
+この mode は schedule 中から `--gain-source` と一致する K-L scan を集め、K を固定したまま
+L の clock polynomial だけを更新する。gain scan と target scan が交互に並ぶ場合も、fit の
+時刻軸には各 sector の絶対 UTC を使うため、scan 間の空白時間を詰めない。最終的には補正後
+schedule を使って該当する K-L の gain と target を時刻順に合成する。
+
+frinZ の phase fit と clock への変換は次の規約である。frinZ の通常の結果表に表示される
+`Phase` は degree だが、`--search rate` と `--search acel` はその値を内部で radian へ
+変換して unwrap し、
+
+```text
+phi(t) = c0 + c1*t                    (rate candidate)
+phi(t) = c0 + c1*t + c2*t^2           (acceleration candidate)
+```
+
+を fit file に出力する。したがって fit file の `# Fitted: y = ...` の係数は radian 系であり、
+表示表の degree を yi-phasedarray が勝手に再解釈しているわけではない。frinZ 自身が出力する
+`Corrected Rate = c1/(2*pi)` と `Corrected Acel = c2/pi` をそのまま読み、観測周波数
+`f_ref` で L の clock へ
+
+```text
+phase_delay = c0 / (2*pi*f_ref)
+delta_rate = Corrected_Rate / f_ref
+delta_accel = Corrected_Acel / f_ref
+```
+
+として加える。group delay はこれとは別に peak search の residual delay 中央値を
+`sampling_hz` で秒へ変換する。最終 delay increment は `group_delay + phase_delay`
+である。fit epoch は最初の gain window の絶対 UTC で、既存の L clock はまずその epoch へ
+伝播してから差分を加える。`c0` 由来の phase delay には `1/f_ref` の整数 ambiguity が
+ある一方、peak の group delay が広帯域遅延 branch を決める。
+
+自動 mode では schedule 全体を一貫して扱うため、`--ant1/--ant2`、
+`--process-index/--epoch/--ra/--dec/--length/--skip` による scan override は禁止される。
+また `--phased-validation` および手動 `--gain-uncalibrated-sc` comparison とは同時に
+使わない。
 
 `--gain-source` must exactly match the gain scan `<object>` name. The workflow
 uses only ordered `K-L` processes for the solution and leaves K unchanged. It:
@@ -287,6 +504,22 @@ uses only ordered `K-L` processes for the solution and leaves K unchanged. It:
    as `gain_phasecal_on.cor`, and synthesizes every K-L target and gain process
    with that clock polynomial.
 
+候補比較で使う phase は、候補適用後の `.cor` に対して再度 peak search した結果であり、
+fit に使った元 phase の机上残差ではない。window 数を `n`、unwrap 後の phase residual
+平方和を `RSS`、parameter 数を rate で `k=2`、acceleration で `k=3` として、
+
+```text
+BIC = n * ln(RSS/n) + k * ln(n)
+```
+
+を比較する。標準偏差だけでなく extra parameter の罰則を含むため、観測時間の長短を
+手作業で判定せず、二次項が実際に residual を十分減らしたときだけ acceleration を選ぶ。
+最終 `gain_phasecal_on` の phase が0 degree付近になるのは、同じ gain data から求めた
+`c0/rate/acel` を再相関に適用した期待結果であり、phase を0へ固定して書いたものではない。
+
+最初の `--search peak` は広帯域 group delay branch を測る delay-rate search であり、
+tone の周波数 fringe search ではない。この段階では実装どおり `--frequency` を渡さない。
+
 The input XML is never overwritten. By default the corrected schedule is
 `<output>/<schedule-stem>_L_phasecal.xml`; select another path with
 `--phasecal-schedule-output`. Intermediate and verification products are in
@@ -301,6 +534,33 @@ The input XML is never overwritten. By default the corrected schedule is
 - `gain_phasecal_solution.txt`, including fit coefficients, exact clock
   increments, old/new L polynomial values, paths, and the phase-delay ambiguity.
 
+計算量を明確にすると、gain raw に対する XCF は原則として4系列である。
+
+1. 未補正 `gain_phasecal_off`
+2. group delay 補正後 `gain_delay_on`
+3. rate 候補 `gain_rate_candidate`
+4. acceleration 候補 `gain_acel_candidate`
+
+`gain_phasecal_on` は選択された3または4の完成済み file を検査して copy するため、第5の
+相関処理ではない。その後に全 target/gain scan の複素電圧合成を行う。したがって1時間の
+gain scan が単独相関で2時間かかる環境なら、初回の較正部分は概ね4回分を見込む。ただし
+resume により完了系列は再実行しない。
+
+`gain_phasecal_solution.txt` は判断を再現する監査 file である。特に確認すべき field は
+以下である。
+
+| Field | 意味 |
+|---|---|
+| `peak_delay_samples_*` | 全 peak window、中央値、MAD、最小・最大 |
+| `group_delay_s` | L に加えた広帯域 group delay |
+| `phase_unit/phase_c0_rad` | fit file と同じ phase 単位と選択候補の c0 |
+| `frinz_corrected_rate_hz` | frinZ が出力した選択候補の rate |
+| `frinz_corrected_accel_hz_s` | frinZ が出力した選択候補の acceleration |
+| `selected_model` | `rate` または `acel` |
+| `rate_*` / `acel_*` | 両候補の residual 統計と BIC |
+| `old_* / new_*_at_fit_*` | fit epoch における L clock の変更前後 |
+| `*_schedule` / `*_cor` / `*_fit` | 再現に必要な全 file path |
+
 The workflow writes `<output>/gain_correlation/gain_phasecal.resume` atomically through a `.tmp` file after every completed scan. Re-running the identical command validates and reuses complete phasecal-off, group-delay, rate candidate, acceleration candidate, selected, and phased products instead of repeating their correlation or phased synthesis. A pre-resume `gain_phasecal_off.cor` is also adopted when its header, sector count, FFT size, and exact file length prove that it is complete. The resume fingerprint includes the input XML contents and command conditions; if either changes, yi-phasedarray stops instead of mixing incompatible products. Move or delete `gain_phasecal.resume` only when intentionally starting a new calibration.
 
 Each gain scan sector count must be divisible by `--gain-fringe-length`, which
@@ -309,6 +569,67 @@ At least four windows are required for the quadratic fit and statistical compari
 the desired frinZ executable is not on `PATH`. The `c0` term remains a phase delay ambiguous by one observing-frequency cycle (`1/f`), while the median peak result supplies the measured group-delay branch. The median is deliberately used instead of the mean so that isolated low-S/N or wrong-peak windows do not move the applied delay. The generated
 XML uses an absolute clock epoch, so leave `YI_CLOCK_EPOCH_MODE` unset (the
 default is `clock`).
+
+##### resume と長時間運転
+
+`gain_phasecal.resume` は各 scan 完了後に `.tmp` へ書いて fsync し、atomic
+rename する。再実行時は command condition と入力 XML 内容から作った fingerprint を
+照合し、さらに各 `.cor` の magic、station/source、FFT、sector count、期待 file size
+を検査する。raw は sidecar の frames/fft/bit から期待 byte 数を検査する。
+
+再利用単位は phasecal-off scan、group-delay scan、rate candidate scan、acel
+candidate scan、selected on scan、phased raw scan である。途中で process が停止しても
+同じ command をそのまま再実行すれば、完了済みの2時間相関をやり直さない。
+group-delay solution が変われば stage 3以降、rate/acel solution が変われば candidate
+以降、selected model が変われば final on/phased だけを無効化する。
+
+XML や command 条件を変更したのに古い結果を混ぜることは許可せず停止する。意図的に
+別条件で最初から計算するときだけ resume file と対応する candidate 生成物を別 directory
+へ移すか削除する。通常の再開では resume を消さない。
+
+##### 実データでの確認コマンド
+
+group delay だけの結果と最終結果を同じ条件で比較する。
+
+```bash
+frinZ \
+  --in phased_array/gain_correlation/YAMAGU32_YAMAGU34_<TAG>_gain_delay_on.cor \
+  --length 10 --loop 100000 --add --search peak
+
+frinZ \
+  --in phased_array/gain_correlation/YAMAGU32_YAMAGU34_<TAG>_gain_phasecal_on.cor \
+  --length 10 --loop 100000 --add --search peak
+```
+
+期待される違いは次のとおりである。
+
+- `gain_delay_on`: group delay は0 sample付近だが、定数 phase、rate、曲率は残り得る。
+- `gain_rate_candidate`: 定数 phase と一次傾斜を補正した候補。
+- `gain_acel_candidate`: 定数 phase、一次傾斜、二次曲率を補正した候補。
+- `gain_phasecal_on`: BIC で選んだ候補。gain phase は0 degree付近が正常。
+- target の Y66 raw: gain solution を転送した結果であり、天体 visibility phase は一般に0ではない。
+
+frinZ の表示が `0.000 deg` でも、丸めである可能性がある。solution file の
+`rate_phase_std_rad` または `acel_phase_std_rad` を見れば、内部 residual
+が厳密な0か表示桁以下か判別できる。
+
+##### 適用限界と失敗時の切り分け
+
+- この較正は K-L 間の phase が gain scan 間で滑らかな clock polynomial として
+  target 時刻へ転送できることを仮定する。急激な大気変動、局発位相 jump、source
+  structure、scan 間の coherence loss は自動的には解決しない。
+- 12 GHz でも対流圏を常に無視できるとは限らない。短基線 K-L で共通 mode なら
+  相殺されやすいが、独立長基線の検証には EOP と大気条件の影響が残り得る。
+- gain source の S/N が低い場合は window を長くする。ただし `--gain-fringe-length`
+  は sector 単位であり、各 scan sector 数を割り切る必要がある。
+- peak delay が window ごとに別 branch へ飛ぶ場合、median だけを信用せず
+  `peak_delay_samples_all`、MAD、RFI、bandpass を確認する。
+- on phase が0でも coherent amplitude が増えない場合、shuffle/level/sideband、
+  weight ratio、量子化、長基線 closure を調べる。0 phase は必要条件だが十分条件ではない。
+- maser spectrum が4分割される場合は位相較正より先に raw packed format を疑う。
+- `no EOP file` warning を放置した結果と精密測地モデルを同等とみなさない。
+- yi-phasedarray は現在2入力を1仮想局へ合成する。多局 phased array はこの2局合成を
+  そのまま任意局数へ一般化した実装ではない。
 
 #### Gain phase-calibration before/after correlation
 
@@ -361,6 +682,12 @@ HITACH32, the required products are:
   YAMAGU34--HITACH32 XCFs;
 - YAMAGU66--HITACH32 XCF;
 - YAMAGU32, YAMAGU34, HITACH32, and YAMAGU66 ACFs.
+
+自動 gain phasecal と3局 validation は同一 command にはしない。phasecal を先に完了し、
+`gain_phasecal_solution.txt` の `corrected_schedule` を `--sc` に指定して、別 command で
+`--phased-validation` を実行する。これにより検証用の Y66 も選択済み L clock を使う。
+選択 process には後述の3本の closure baseline が必要である。phasecal 用 XML が K-L だけなら、
+生成 XML の L clock polynomial を対応する K-L-H validation schedule へ移してから実行する。
 
 The unattended path is a single yi-phasedarray command:
 
@@ -419,6 +746,43 @@ amplitude and phase arrays, per-time and per-frequency Pearson coefficients,
 YAMAGU32--YAMAGU34--HITACH32 closure phase, the weighted prediction for
 YAMAGU66--HITACH32, its fitted complex scale, coherence, and normalized
 residual. Reversed `.cor` baseline order is conjugated automatically.
+
+#### NPZ の判定方法
+
+archive を作ること自体は合格ではない。次の値を同じ RFI 除外帯域で解釈する。
+
+| NPZ key | 良好な結果の意味 |
+|---|---|
+| `long_baseline_amplitude_pearson_all` | Y32-H と Y34-H の振幅変化が一致し、+1に近い |
+| `long_baseline_amplitude_ratio_median` | 正規化後の2長基線振幅比。近接2局・同一 source なら概ね1 |
+| `long_baseline_complex_coherence` | 2 component visibility の複素的な整合性。1に近いほどよい |
+| `closure_phase_resultant_length` | closure phase の集中度。1に近いほど時間・周波数方向に安定 |
+| `prediction_complex_coherence` | 実測 Y66-H と `w32*V32H+w34*V34H` の一致度。最重要で1に近いほどよい |
+| `prediction_normalized_residual_coefficient` | complex scale を fit 後の予測残差。0に近いほどよい |
+| `acf_y66_postquant_over_prequant` | 再量子化による channel 別 power 変化。滑らかで局所的破綻がないこと |
+
+簡単な確認例は以下である。
+
+```bash
+python3 - <<PY
+import numpy as np
+z = np.load("YAMAGU66_<TAG>_visibility_validation.npz")
+for k in ("long_baseline_amplitude_pearson_all",
+          "long_baseline_complex_coherence",
+          "prediction_complex_coherence",
+          "prediction_normalized_residual_coefficient",
+          "closure_phase_resultant_length"):
+    print(k, z[k].item())
+PY
+```
+
+全観測へ共通の固定合格閾値は設けない。source structure、S/N、RFI、band edge、量子化で
+期待値が変わるためである。ただし phased station の主検証は
+`prediction_complex_coherence` の上昇と `prediction_normalized_residual_coefficient` の低下であり、
+単に Y32-Y34 の S/N が高い、Y66 の ACF peak が大きい、spectrum が自然に見える、という
+どれか1つだけを成功判定にしてはならない。等感度・独立雑音・正しい同相合成なら、Y66-H の
+fringe S/N は各単局-H より理想的に約 sqrt(2) 改善する。実測改善率は採用 weight、flag、
+再量子化 loss、gain solution の補間誤差と大気変動を含めて評価する。
 
 ### In-band `.cor` splitting
 
@@ -2416,13 +2780,15 @@ one ready-queue slot for the sector pairer.
 
 ## Scan window and end-time handling
 
-Processing length is clamped safely by both requested window and available samples:
+明示した XML/CLI process window は元の scan 時刻グリッドを保存する。coarse/read-align delay
+によって片方の物理 read start が数 sample 後ろへ移っても出力をその分だけ短縮せず、境界の
+不足 sample を zero-padding する。yi-phasedarray で length が未指定の場合も、delay 適用前の
+2入力に共通する nominal file duration を仮想局の長さとして使う。yi-corr で明示 window が
+ない場合だけは、read-align 後の保守的な共通 overlap 長を使う。
 
-- `requested = max(process_length - total_skip, 0)`
-- `processed = min(requested, available_from_file)`
-- frame count uses floor to complete FFT frames only
-
-This prevents overrun past scan/file end. Short reads are zero-padded when needed.
+frame 数は常に完全な FFT frame に限定する。ただし理論上整数 frame となる秒数が浮動小数点
+誤差で1 frame 短くならないよう、frame 数が整数から `1e-6` 以内なら nearest integer に丸め、
+それ以外は floor する。出力 raw の最終 size check はこの frame 数を基準にする。
 
 ## CPU affinity (optional)
 
