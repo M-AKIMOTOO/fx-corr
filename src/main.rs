@@ -8174,6 +8174,7 @@ fn run_once(
         let mut synth_read_bytes_total: u64 = 0;
         let mut synth_queue_hwm = 0usize;
         let mut timing_delay_s = 0.0_f64;
+        let mut timing_input_read_s = 0.0_f64;
         let mut timing_recv_wait_s = 0.0_f64;
         let mut timing_compute_s = 0.0_f64;
         let mut timing_output_s = 0.0_f64;
@@ -8204,6 +8205,7 @@ fn run_once(
             let [sector_sample_start1, sector_sample_start2] = block.starts;
             let frame_delays = &block.delays;
             timing_delay_s += block.delay_s;
+            timing_input_read_s += block.read_s;
             if args.debug && need_xcf_products {
                 print_delay_debug_samples(
                     &format!("delay sector {}", si + 1),
@@ -9014,7 +9016,6 @@ fn run_once(
             };
             timing_compute_s += timing_compute_start.elapsed().as_secs_f64();
             let timing_output_start = Instant::now();
-            let _io_affinity = affinity::IoAffinityGuard::enter(reader_core)?;
             let sec_failed = sector_failures.load(Ordering::Relaxed);
             if sec_failed > 0 {
                 println!(
@@ -9044,6 +9045,8 @@ fn run_once(
                 timing_output_s += timing_output_start.elapsed().as_secs_f64();
                 continue;
             }
+            // Migrate only when an integration is written, not for every input chunk.
+            let _io_affinity = affinity::IoAffinityGuard::enter(reader_core)?;
             let (batch_ph, batch_11, batch_12, batch_22, batch_fold) = integrated.take().unwrap();
             let nf = sec_counts[si];
             let sector_start_offset_s = (emitted - nf) as f64 * frame_sec;
@@ -9269,6 +9272,11 @@ fn run_once(
             println!(
                 "[info] Input delay preparation: {:.3}s (reader thread; overlaps compute)",
                 timing_delay_s
+            );
+            println!(
+                "[info] Input read calls: {:.3}s active, {:.1} MiB/s (includes filesystem/cache; excludes delay preparation and queue waits)",
+                timing_input_read_s,
+                synth_read_bytes_total as f64 / (1024.0 * 1024.0) / timing_input_read_s.max(1e-9)
             );
             let timed = timing_recv_wait_s + timing_compute_s + timing_output_s;
             let pct = |v: f64| {

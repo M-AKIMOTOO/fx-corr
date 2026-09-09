@@ -23,6 +23,7 @@ pub(crate) struct Block {
     pub raw: [Vec<u8>; 2],
     pub delays: Vec<FrameDelayEntry>,
     pub delay_s: f64,
+    pub read_s: f64,
 }
 
 impl Block {
@@ -35,6 +36,7 @@ impl Block {
             raw: [Vec::new(), Vec::new()],
             delays: Vec::new(),
             delay_s: 0.0,
+            read_s: 0.0,
         }
     }
 }
@@ -172,6 +174,7 @@ impl Pipeline {
                                 block.offsets[ant] = offset;
                                 counts[ant] = count;
                             }
+                            let read_start = Instant::now();
                             if concurrent {
                                 request_tx.send((
                                     std::mem::take(&mut block.raw[1]),
@@ -203,6 +206,7 @@ impl Pipeline {
                             };
                             first?;
                             second?;
+                            block.read_s = read_start.elapsed().as_secs_f64();
                             let bytes = block.raw.iter().map(|v| v.len() as u64).sum();
                             if ready_tx.send(Ok(block)).is_err() {
                                 return Ok(());
