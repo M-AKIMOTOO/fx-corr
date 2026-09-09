@@ -2456,6 +2456,11 @@ fn main() -> Result<(), DynError> {
         return model_sweep::run_unattended_model_sweep(&args);
     }
     init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
+    if let Some(seconds) = args.buffer_seconds {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return Err("--buffer-seconds must be finite and > 0".into());
+        }
+    }
     if args.cpu_auto && !matches!(run_mode, RunMode::Corr) {
         return Err("--cpu-auto is supported only by yi-corr".into());
     }
@@ -6475,10 +6480,17 @@ fn run_once(
             "  build-host: logical-cpu={} l3-cache={}",
             build_cpu, build_l3
         );
-        println!(
-            "  io:         chunk={} frames (pair-bytes={}), pipeline={} chunks",
-            io_chunk_frames, bytes_per_frame_pair, io_pipeline_depth
-        );
+        if let Some(seconds) = args.buffer_seconds {
+            println!(
+                "  io:         chunk={} frames (pair-bytes={}), RAM target={:.3} observation s",
+                io_chunk_frames, bytes_per_frame_pair, seconds
+            );
+        } else {
+            println!(
+                "  io:         chunk={} frames (pair-bytes={}), pipeline={} chunks",
+                io_chunk_frames, bytes_per_frame_pair, io_pipeline_depth
+            );
+        }
         println!(
             "  skip:       {:.6}s (xml {:.6}s + cli {:.6}s, {} samples)",
             total_skip_sec, xml_skip_sec, cli_skip_sec, total_skip_samples
@@ -7975,7 +7987,12 @@ fn run_once(
         let mut ql_fringe_start_offset_s = 0.0_f64;
         let mut ql_fringe_index = 0usize;
 
-        let paired_ready_capacity = io_pipeline_depth;
+        let paired_ready_capacity = if let Some(seconds) = args.buffer_seconds {
+            let target = ((seconds / frame_sec).ceil() as usize).min(total_f);
+            input_pipeline::prefill_chunk_count(&sec_counts, io_chunk_frames, target).max(1)
+        } else {
+            io_pipeline_depth
+        };
         println!(
             "[info] I/O prefetch: bounded streaming reader (chunk={} frames, ready={} chunks, reusable-slots={})",
             io_chunk_frames, paired_ready_capacity, paired_ready_capacity + 2
@@ -8103,7 +8120,7 @@ fn run_once(
                 d_seek: sector_d_seeks[si],
             })
             .collect();
-        let reader_pipeline = input_pipeline::Pipeline::start(
+        let mut reader_pipeline = input_pipeline::Pipeline::start(
             [a1p.clone(), a2p.clone()],
             [bit1, bit2],
             fft_len,
@@ -8175,6 +8192,13 @@ fn run_once(
             );
         }
         let synth_stats_start = Instant::now();
+        let mut timing_prefill_s = 0.0;
+        if args.buffer_seconds.is_some() {
+            let start = Instant::now();
+            let (frames, bytes) = reader_pipeline.prefill()?;
+            timing_prefill_s = start.elapsed().as_secs_f64();
+            println!("[info] RAM prefill: {:.6} observation s, {:.1} MiB, {:.3}s elapsed; consumed slots refill concurrently", frames as f64 * frame_sec, bytes as f64 / 1048576.0, timing_prefill_s);
+        }
         let mut synth_read_bytes_total: u64 = 0;
         let mut synth_queue_hwm = 0usize;
         let mut timing_delay_s = 0.0_f64;
@@ -8213,6 +8237,12 @@ fn run_once(
             let si = block.sector;
             let nf = block.delays.len();
             let last_chunk = block.frame + nf == sec_counts[si];
+            if args.buffer_seconds.is_some()
+                && last_chunk
+                && ((si + 1) % 10 == 0 || si + 1 == sec_counts.len())
+            {
+                println!("\n[info] RAM ready at sector {}: {:.6} observation s (excludes current compute block)", si + 1, reader_pipeline.ready_frames() as f64 * frame_sec);
+            }
             let [sector_sample_start1, sector_sample_start2] = block.starts;
             let frame_delays = &block.delays;
             timing_delay_s += block.delay_s;
@@ -9306,7 +9336,13 @@ fn run_once(
                 timing_input_read_s,
                 synth_read_bytes_total as f64 / (1024.0 * 1024.0) / timing_input_read_s.max(1e-9)
             );
-            let timed = timing_recv_wait_s + timing_compute_s + timing_output_s;
+            let timed = timing_prefill_s + timing_recv_wait_s + timing_compute_s + timing_output_s;
+            if args.buffer_seconds.is_some() {
+                println!(
+                    "[info] RAM prefill timing: {:.3}s (included in accounted and elapsed)",
+                    timing_prefill_s
+                );
+            }
             let pct = |v: f64| {
                 if timed > 0.0 {
                     100.0 * v / timed

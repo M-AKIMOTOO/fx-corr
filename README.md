@@ -72,6 +72,14 @@ writes to the I/O CPU and excludes it from the compute workers' CPU list.
 These are logical CPU assignments; SMT siblings can share a physical core.
 The operating system's file cache is separate from the application's buffers.
 
+Use `--buffer-seconds 3` to prefill three seconds of observation data before
+computing, then replenish consumed slots concurrently with later computation.
+This replaces `--pipeline-depth` and cannot be combined with `--cpu-auto`.
+The capacity includes integration-boundary chunks; the producer and current
+compute block need two additional reusable slots. Initial fill time is included
+in total elapsed time. `RAM ready` reports remaining prepared observation time,
+not allocated RSS. See [reservoir validation](docs/fx-corr-ram-reservoir.md).
+
 Binaries are created under `target/release/`:
 
 - `target/release/yi-corr`

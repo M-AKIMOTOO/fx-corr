@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -122,7 +123,24 @@ fn read_into(
     reader.read_packed_with_padding(buf)
 }
 
+// Include short chunks at integration boundaries when sizing the reservoir.
+pub fn prefill_chunk_count(sectors: &[usize], chunk: usize, mut frames: usize) -> usize {
+    let mut count = 0;
+    for &sector in sectors {
+        let n = sector.min(frames);
+        count += n.div_ceil(chunk);
+        frames -= n;
+        if frames == 0 {
+            break;
+        }
+    }
+    count
+}
+
 pub(crate) struct Pipeline {
+    prefilled: VecDeque<Block>,
+    depth: usize,
+    ready_frames: Arc<AtomicUsize>,
     ready: Option<mpsc::Receiver<Result<Block, String>>>,
     recycle: Option<mpsc::SyncSender<Block>>,
     handle: Option<thread::JoinHandle<()>>,
@@ -144,6 +162,8 @@ impl Pipeline {
         produced_bytes: Arc<AtomicU64>,
     ) -> Self {
         let (ready_tx, ready) = mpsc::sync_channel(depth);
+        let ready_frames = Arc::new(AtomicUsize::new(0));
+        let producer_ready_frames = Arc::clone(&ready_frames);
         // Fixed number of owned slots: queued, in computation, in the reader.
         let (recycle, free) = mpsc::sync_channel(depth + 2);
         for _ in 0..depth + 2 {
@@ -249,6 +269,7 @@ impl Pipeline {
                             second?;
                             block.read_s = read_start.elapsed().as_secs_f64();
                             let bytes = block.raw.iter().map(|v| v.len() as u64).sum();
+                            producer_ready_frames.fetch_add(block.delays.len(), Ordering::Release);
                             if ready_tx.send(Ok(block)).is_err() {
                                 return Ok(());
                             }
@@ -265,14 +286,52 @@ impl Pipeline {
             }
         });
         Self {
+            prefilled: VecDeque::new(),
+            depth,
+            ready_frames,
             ready: Some(ready),
             recycle: Some(recycle),
             handle: Some(handle),
         }
     }
 
-    pub fn recv(&self) -> Result<Block, DynError> {
-        self.ready.as_ref().unwrap().recv()?.map_err(|e| e.into())
+    // Receive into the same owned slots used during steady-state processing.
+    // Never hold more than depth slots here: otherwise the producer can run
+    // out of free slots before reaching the prefill target.
+    pub fn prefill(&mut self) -> Result<(usize, u64), DynError> {
+        let mut frames = 0;
+        let mut bytes = 0;
+        while self.prefilled.len() < self.depth {
+            match self.ready.as_ref().unwrap().recv() {
+                Ok(Ok(block)) => {
+                    frames += block.delays.len();
+                    bytes += block.raw.iter().map(|v| v.len() as u64).sum::<u64>();
+                    self.prefilled.push_back(block);
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break, // A short observation ended before the reservoir filled.
+            }
+        }
+        Ok((frames, bytes))
+    }
+
+    pub fn ready_frames(&self) -> usize {
+        self.ready_frames.load(Ordering::Acquire)
+    }
+
+    pub fn recv(&mut self) -> Result<Block, DynError> {
+        let block = match self.prefilled.pop_front() {
+            Some(block) => block,
+            None => self
+                .ready
+                .as_ref()
+                .unwrap()
+                .recv()?
+                .map_err(|e| -> DynError { e.into() })?,
+        };
+        self.ready_frames
+            .fetch_sub(block.delays.len(), Ordering::AcqRel);
+        Ok(block)
     }
 
     pub fn recycle(&self, block: Block) {
@@ -306,6 +365,80 @@ mod tests {
     use super::*;
     use crate::utils::{build_decode_plan, decode_block_into_with_plan};
     use crate::{decode_shifted_frame_from_chunk, DecodeWindowScratch};
+
+    #[test]
+    fn reservoir_size_accounts_for_integration_tails() {
+        assert_eq!(prefill_chunk_count(&[10, 10, 3], 4, 0), 0);
+        assert_eq!(prefill_chunk_count(&[10, 10, 3], 4, 10), 3);
+        assert_eq!(prefill_chunk_count(&[10, 10, 3], 4, 11), 4);
+        assert_eq!(prefill_chunk_count(&[10, 10, 3], 4, 100), 7);
+    }
+
+    #[test]
+    fn prefill_recycle_and_short_observations_keep_every_frame() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!(
+            "fx-prefill-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("input.raw");
+        std::fs::write(&file, vec![0x39_u8; 4096]).unwrap();
+        for concurrent in [false, true] {
+            for depth in [1, 4, 40] {
+                let paths = [file.clone(), file.clone()];
+                let (done_tx, done_rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let mut p = Pipeline::start(
+                        paths,
+                        [2, 2],
+                        32,
+                        vec![Sector {
+                            frames: 100,
+                            starts: [0; 2],
+                            samples: [3216; 2],
+                            d_seek: 0.0,
+                        }],
+                        DelayEvalConfig {
+                            fs: 8192.0,
+                            frame_dt: 32.0 / 8192.0,
+                            fx_integer_delay: true,
+                            ..Default::default()
+                        },
+                        3,
+                        depth,
+                        concurrent,
+                        None,
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicU64::new(0)),
+                    );
+                    let (frames, bytes) = p.prefill().unwrap();
+                    assert_eq!(frames, (depth * 3).min(100));
+                    assert!(bytes > 0);
+                    assert!(p.ready_frames() >= frames);
+                    let mut next = 0;
+                    while next < 100 {
+                        let block = p.recv().unwrap();
+                        assert_eq!(block.frame, next);
+                        next += block.delays.len();
+                        p.recycle(block);
+                    }
+                    assert_eq!(next, 100);
+                    assert_eq!(p.ready_frames(), 0);
+                    p.finish().unwrap();
+                    done_tx.send(()).unwrap();
+                });
+                done_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("prefill/refill deadlocked");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn readahead_is_bounded() {
@@ -420,7 +553,7 @@ mod tests {
                 let paths = [file.clone(), file.clone()];
                 let (done_tx, done_rx) = mpsc::channel();
                 thread::spawn(move || {
-                    let p = Pipeline::start(
+                    let mut p = Pipeline::start(
                         paths,
                         [2, 2],
                         32,
@@ -444,6 +577,7 @@ mod tests {
                         Arc::new(AtomicU64::new(0)),
                     );
                     if consume {
+                        p.prefill().unwrap();
                         let b = p.recv().unwrap();
                         p.recycle(b);
                     }
@@ -456,7 +590,7 @@ mod tests {
                     .recv_timeout(Duration::from_secs(5))
                     .expect("reader cancellation deadlocked");
             }
-            let p = Pipeline::start(
+            let mut p = Pipeline::start(
                 [file.clone(), root.join("missing.raw")],
                 [2, 2],
                 32,
