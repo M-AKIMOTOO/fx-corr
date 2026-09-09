@@ -375,14 +375,14 @@ pub struct Args {
     #[arg(
         long,
         value_name = "N",
-        help = "Number of compute threads [default: logical CPU count - 2, min 1]"
+        help = "Total logical CPUs: reserve one for I/O, use N-1 for compute (N=1 shares one CPU; default: physical core count)"
     )]
     pub cpu: Option<usize>,
 
     #[arg(
         long,
         value_name = "N",
-        help = "Reader chunk size [frames] (auto when omitted)"
+        help = "Reader chunk size [frames], independent of output integration (auto: up to 16 MiB per input pair)"
     )]
     pub chunk_frames: Option<usize>,
 
@@ -402,7 +402,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "N",
-        help = "Reader-worker queue depth [chunks] (auto when omitted)"
+        help = "Reader-worker queue depth [chunks] (default: 2, independent of CPU count)"
     )]
     pub pipeline_depth: Option<usize>,
 

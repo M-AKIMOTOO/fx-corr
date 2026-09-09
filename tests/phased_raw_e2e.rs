@@ -734,3 +734,81 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn small_io_chunks_preserve_integration_and_phased_raw_with_delay_drift() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let raw: Vec<u8> = (0..4096)
+        .map(|i| ((i * 53 + i / 7 + 79) % 256) as u8)
+        .collect();
+    for station in ["ANT1", "ANT2"] {
+        fs::write(raw_dir.join(format!("{station}_2000001000000.raw")), &raw).unwrap();
+    }
+    for rate in [-0.04, 0.0, 0.04] {
+        let schedule = root.join("test.xml");
+        write_schedule_with_clock_delay(&schedule, "ANT1", "ANT2", 13.25 / 8192.);
+        let xml = fs::read_to_string(&schedule).unwrap();
+        fs::write(
+            &schedule,
+            xml.replace(
+                "</delay><rate>0</rate></clock>\n  <terminal",
+                &format!("</delay><rate>{rate}</rate></clock>\n  <terminal"),
+            ),
+        )
+        .unwrap();
+        for phased in [false, true] {
+            let mut reference = std::collections::BTreeMap::new();
+            for (run, chunk, usb) in [(0, "1000", false), (1, "3", false), (2, "3", true)] {
+                let out = root.join(format!("out-{rate}-{phased}-{run}"));
+                let mut cmd = Command::new(if phased {
+                    env!("CARGO_BIN_EXE_yi-phasedarray")
+                } else {
+                    env!("CARGO_BIN_EXE_yi-corr")
+                });
+                cmd.args([
+                    "--sc",
+                    schedule.to_str().unwrap(),
+                    "--raw",
+                    raw_dir.to_str().unwrap(),
+                    if phased { "--output" } else { "--cor" },
+                    out.to_str().unwrap(),
+                    "--cpu",
+                    "2",
+                    "--chunk-frames",
+                    chunk,
+                    "--pipeline-depth",
+                    "1",
+                ]);
+                if phased {
+                    cmd.args(["--phased-name", "ARRAY"]);
+                }
+                if usb {
+                    cmd.arg("--usb");
+                }
+                let result = cmd.output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let products: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .filter(|p| {
+                        matches!(p.extension().and_then(|s| s.to_str()), Some("cor" | "raw"))
+                    })
+                    .map(|p| (p.file_name().unwrap().to_owned(), fs::read(&p).unwrap()))
+                    .collect();
+                assert!(!products.is_empty());
+                if run == 0 {
+                    reference = products;
+                } else {
+                    assert_eq!(products, reference, "rate={rate} phased={phased} usb={usb}");
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}

@@ -47,13 +47,20 @@ cd /home/akimoto/program/rust/fx-corr
 cargo build --release
 ```
 
-`fx-corr` now performs configure-like host probing at build time (`build.rs`):
+CPU allocation uses the runtime CPU affinity mask. `--cpu N` includes one
+logical CPU reserved for input and output; the remaining `N-1` CPUs run
+correlation workers. For example, `--cpu 30` gives 29 compute workers and one
+I/O CPU. With `--cpu 1`, computation and I/O share that CPU. Without `--cpu`,
+the total defaults to the available physical core count.
 
-- logical CPU count
-- L3 cache size (Linux `/sys/devices/system/cpu/cpu0/cache/...`)
-
-These build-time values are used as defaults for automatic `yi-corr` tuning
-(`--cpu` omitted, `--chunk-frames` omitted). Manual CLI values still override.
+Normal correlation reads bounded chunks independently of the XML integration
+interval. The automatic chunk target is 16 MiB per input pair (up to 32768
+frames), with two ready chunks and four reusable buffer slots. Integer-delay
+boundary samples are included as needed. `--chunk-frames` and
+`--pipeline-depth` override these defaults. Linux pins input readers and output
+writes to the I/O CPU and excludes it from the compute workers' CPU list.
+These are logical CPU assignments; SMT siblings can share a physical core.
+The operating system's file cache is separate from the application's buffers.
 
 Binaries are created under `target/release/`:
 
@@ -309,8 +316,8 @@ USB sideband 指定ではない。
 | `--raw DIR` | 入力 raw directory |
 | `--output DIR` | raw、meta、diagnostic の出力先 |
 | `--phased-name NAME` | 仮想局名。default `YAMAGU66` |
-| `--cpu N` | compute thread 数 |
-| `--chunk-frames N` | reader chunk。通常は auto tuning を推奨 |
+| `--cpu N` | I/O 用1論理CPUを含む総数。計算は N−1、N=1 は共用 |
+| `--chunk-frames N` | 内部読み込み単位。XML の積算時間とは独立。既定は2局合計約16 MiB以下 |
 | `--usb` | USB 接続 storage 向けの読み出し調整 |
 | `--tsys/--gain/--sefd/--diameter/--eta` | 局別の感度重み |
 | `--phased-diagnostics` | 入力 ACF、短基線 XCF、合成前量子化 ACF、plot を追加 |

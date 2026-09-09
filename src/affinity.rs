@@ -238,3 +238,107 @@ pub fn reader_core_from_env() -> Result<Option<core_affinity::CoreId>, DynError>
 pub fn set_current_thread_core(core: core_affinity::CoreId) -> bool {
     core_affinity::set_for_current(core)
 }
+
+pub struct CpuAllocation {
+    pub workers: Vec<core_affinity::CoreId>,
+    pub io: core_affinity::CoreId,
+    pub total: usize,
+}
+
+pub fn allocate_cpus(
+    available: &[core_affinity::CoreId],
+    requested: usize,
+    preferred_io: Option<core_affinity::CoreId>,
+) -> Result<CpuAllocation, DynError> {
+    if requested == 0 || available.is_empty() {
+        return Err("CPU allocation requires at least one available CPU".into());
+    }
+    let total = requested.min(available.len());
+    let io = preferred_io.unwrap_or(available[total - 1]);
+    if !available.iter().any(|c| c.id == io.id) {
+        return Err("YI_READER_CORE is outside the allowed CPU affinity set".into());
+    }
+    let workers = if total == 1 {
+        vec![io]
+    } else {
+        available
+            .iter()
+            .copied()
+            .filter(|c| c.id != io.id)
+            .take(total - 1)
+            .collect()
+    };
+    Ok(CpuAllocation { workers, io, total })
+}
+
+// Pin only the file-output section. Restoring the mask before workflows spawn
+// child processes prevents them from inheriting a one-CPU restriction.
+#[cfg(target_os = "linux")]
+pub struct IoAffinityGuard(libc::cpu_set_t);
+
+#[cfg(target_os = "linux")]
+impl IoAffinityGuard {
+    pub fn enter(core: Option<core_affinity::CoreId>) -> Result<Option<Self>, DynError> {
+        let Some(core) = core else {
+            return Ok(None);
+        };
+        let mut previous = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        let result = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut previous)
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if !set_current_thread_core(core) {
+            return Err("failed to pin output thread to I/O CPU".into());
+        }
+        Ok(Some(Self(previous)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IoAffinityGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub struct IoAffinityGuard;
+#[cfg(not(target_os = "linux"))]
+impl IoAffinityGuard {
+    pub fn enter(_core: Option<core_affinity::CoreId>) -> Result<Option<Self>, DynError> {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod cpu_allocation_tests {
+    use super::*;
+    #[test]
+    fn reserves_one_of_requested_cpus_and_respects_allowed_mask() {
+        let available: Vec<_> = [2, 4, 8, 10]
+            .into_iter()
+            .map(|id| core_affinity::CoreId { id })
+            .collect();
+        for n in 1..=6 {
+            let plan = allocate_cpus(&available, n, None).unwrap();
+            assert_eq!(plan.total, n.min(4));
+            assert_eq!(plan.workers.len(), n.min(4).saturating_sub(1).max(1));
+            if n > 1 {
+                assert!(plan.workers.iter().all(|c| c.id != plan.io.id));
+            }
+        }
+        let plan = allocate_cpus(&available, 3, Some(available[0])).unwrap();
+        assert_eq!(plan.io.id, 2);
+        assert_eq!(
+            plan.workers.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [4, 8]
+        );
+        assert!(allocate_cpus(&available, 0, None).is_err());
+        assert!(allocate_cpus(&[], 1, None).is_err());
+        assert!(allocate_cpus(&available, 2, Some(core_affinity::CoreId { id: 0 })).is_err());
+    }
+}

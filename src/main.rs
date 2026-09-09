@@ -7,6 +7,7 @@ mod eop;
 mod fringe;
 mod geom;
 mod ifile;
+mod input_pipeline;
 mod model_diag;
 mod model_diag_output;
 mod model_sweep;
@@ -1004,7 +1005,7 @@ fn antenna_phase_start_and_step(
     (phase_start, phase_step)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct FrameDelayEntry {
     t_mid_s: f64,
     full_rel_s: f64,
@@ -1028,6 +1029,7 @@ struct GeomDelaySample {
     snap_sps4: f64,
 }
 
+#[derive(Clone, Default)]
 struct DelayEvalConfig {
     frame_dt: f64,
     model_time_offset_s: f64,
@@ -1405,60 +1407,18 @@ fn build_l3_cache_bytes() -> Option<u64> {
         .filter(|&v| v > 0)
 }
 
-fn parse_cache_size_bytes(text: &str) -> Option<u64> {
-    let s = text.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num, mul) = if let Some(v) = s.strip_suffix('K') {
-        (v, 1024u64)
-    } else if let Some(v) = s.strip_suffix('M') {
-        (v, 1024u64 * 1024u64)
-    } else if let Some(v) = s.strip_suffix('G') {
-        (v, 1024u64 * 1024u64 * 1024u64)
+fn auto_chunk_frames(_cpu_threads: usize, bytes_per_frame_pair: usize) -> usize {
+    // Bound input memory independently of CPU model, core count and L3 size.
+    let frames = (16 * 1024 * 1024 / bytes_per_frame_pair.max(1)).clamp(1, 32768);
+    if frames >= 256 {
+        frames / 256 * 256
     } else {
-        (s, 1u64)
-    };
-    num.trim()
-        .parse::<u64>()
-        .ok()
-        .map(|v| v.saturating_mul(mul))
-}
-
-fn detect_l3_cache_bytes() -> Option<u64> {
-    let paths = [
-        "/sys/devices/system/cpu/cpu0/cache/index3/size",
-        "/sys/devices/system/cpu/cpu0/cache/index2/size",
-    ];
-    for p in paths {
-        if let Ok(txt) = read_to_string(p) {
-            if let Some(bytes) = parse_cache_size_bytes(&txt) {
-                if bytes > 0 {
-                    return Some(bytes);
-                }
-            }
-        }
+        frames
     }
-    None
 }
 
-fn auto_chunk_frames(cpu_threads: usize, bytes_per_frame_pair: usize) -> usize {
-    if bytes_per_frame_pair == 0 {
-        return 4096;
-    }
-    let l3_bytes = build_l3_cache_bytes()
-        .or_else(detect_l3_cache_bytes)
-        .unwrap_or(32 * 1024 * 1024);
-    let scale = (cpu_threads as u64).clamp(1, 16);
-    let target_bytes =
-        (l3_bytes.saturating_mul(scale) / 4).clamp(8 * 1024 * 1024, 128 * 1024 * 1024);
-    let mut frames = (target_bytes / bytes_per_frame_pair as u64) as usize;
-    frames = frames.clamp(1024, 32768);
-    ((frames / 256).max(1)) * 256
-}
-
-fn auto_pipeline_depth(cpu_threads: usize) -> usize {
-    (cpu_threads / 4).clamp(2, 16)
+fn auto_pipeline_depth(_cpu_threads: usize) -> usize {
+    2
 }
 
 fn parse_ifile_cached(path: &PathBuf) -> Result<Arc<ifile::IFileData>, DynError> {
@@ -1740,21 +1700,27 @@ fn decode_shifted_frame_from_chunk(
     let mut raw_offset = 0;
     if offset_in_decoded != 0 {
         decode_block_into_with_plan(
-            &raw[..4], word_samples, plan, &mut scratch.samples,
-            lsb_to_usb, first_sample_odd,
+            &raw[..4],
+            word_samples,
+            plan,
+            &mut scratch.samples,
+            lsb_to_usb,
+            first_sample_odd,
         )?;
         written = (word_samples - offset_in_decoded).min(copy_len);
-        dst[..written].copy_from_slice(
-            &scratch.samples[offset_in_decoded..offset_in_decoded + written],
-        );
+        dst[..written]
+            .copy_from_slice(&scratch.samples[offset_in_decoded..offset_in_decoded + written]);
         raw_offset = 4;
     }
     let middle_samples = (copy_len - written) / word_samples * word_samples;
     let middle_bytes = middle_samples / word_samples * 4;
     if middle_samples != 0 {
         decode_block_into_with_plan(
-            &raw[raw_offset..raw_offset + middle_bytes], middle_samples, plan,
-            &mut dst[written..written + middle_samples], lsb_to_usb,
+            &raw[raw_offset..raw_offset + middle_bytes],
+            middle_samples,
+            plan,
+            &mut dst[written..written + middle_samples],
+            lsb_to_usb,
             first_sample_odd ^ ((raw_offset / 4 * word_samples) & 1 != 0),
         )?;
         written += middle_samples;
@@ -1762,7 +1728,10 @@ fn decode_shifted_frame_from_chunk(
     }
     if written < copy_len {
         decode_block_into_with_plan(
-            &raw[raw_offset..raw_offset + 4], word_samples, plan, &mut scratch.samples,
+            &raw[raw_offset..raw_offset + 4],
+            word_samples,
+            plan,
+            &mut scratch.samples,
             lsb_to_usb,
             first_sample_odd ^ ((raw_offset / 4 * word_samples) & 1 != 0),
         )?;
@@ -1862,118 +1831,12 @@ impl PackedSampleReader {
     }
 }
 
-type PairedSectorRead = Result<(usize, Vec<u8>, Vec<u8>), String>;
-type StationSectorRead = Result<(usize, Vec<u8>), String>;
-
-struct SynthReaderPipeline {
-    receiver: Option<mpsc::Receiver<PairedSectorRead>>,
-    handles: Vec<(&'static str, thread::JoinHandle<()>)>,
-}
-
-impl SynthReaderPipeline {
-    fn new(
-        receiver: mpsc::Receiver<PairedSectorRead>,
-        handles: Vec<(&'static str, thread::JoinHandle<()>)>,
-    ) -> Self {
-        Self {
-            receiver: Some(receiver),
-            handles,
-        }
-    }
-
-    fn recv(&self) -> Result<PairedSectorRead, mpsc::RecvError> {
-        self.receiver
-            .as_ref()
-            .expect("synth reader receiver is available")
-            .recv()
-    }
-
-    fn finish(mut self) -> Result<(), DynError> {
-        self.receiver.take();
-        let mut panicked = Vec::new();
-        for (name, handle) in self.handles.drain(..) {
-            if handle.join().is_err() {
-                panicked.push(name);
-            }
-        }
-        if panicked.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("synth reader thread(s) panicked: {}", panicked.join(", ")).into())
-        }
-    }
-}
-
-impl Drop for SynthReaderPipeline {
-    fn drop(&mut self) {
-        // Dropping the ready receiver first releases a producer blocked on a
-        // bounded send.  In USB mode that also lets the pairer drop both
-        // rendezvous receivers before the station-reader joins below.
-        self.receiver.take();
-        for (_, handle) in self.handles.drain(..) {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn run_usb_station_reader(
-    path: PathBuf,
-    station_label: &'static str,
-    bit_depth: usize,
-    sector_reads: Vec<(u64, u64)>,
-    reader_core: Option<core_affinity::CoreId>,
-    sender: mpsc::SyncSender<StationSectorRead>,
-) {
-    if let Some(core) = reader_core {
-        let _ = affinity::set_current_thread_core(core);
-    }
-    let mut reader = match PackedSampleReader::open(&path, 0, 0) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = sender.send(Err(format!(
-                "failed to open {} for USB {} sector reader: {e}",
-                path.display(),
-                station_label
-            )));
-            return;
-        }
-    };
-    for (sector_idx, (start_sample, sample_count)) in sector_reads.into_iter().enumerate() {
-        let mut buf = vec![0u8; ((sample_count as usize * bit_depth) + 7) / 8];
-        let start_bits = start_sample * bit_depth as u64;
-        if let Err(e) = reader.seek_to(start_bits / 8, (start_bits % 8) as u8) {
-            let _ = sender.send(Err(format!(
-                "failed to seek {} USB {} input at sample {} (sector {}): {e}",
-                path.display(),
-                station_label,
-                start_sample,
-                sector_idx + 1
-            )));
-            return;
-        }
-        if let Err(e) = reader.read_packed_with_padding(&mut buf) {
-            let _ = sender.send(Err(format!(
-                "failed reading {} USB {} input at sample {} (sector {}): {e}",
-                path.display(),
-                station_label,
-                start_sample,
-                sector_idx + 1
-            )));
-            return;
-        }
-        if sender.send(Ok((sector_idx, buf))).is_err() {
-            return;
-        }
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn advise_sequential_readahead(file: &File) {
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     unsafe {
         let _ = libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        let _ = libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED);
     }
 }
 
@@ -2592,47 +2455,53 @@ fn main() -> Result<(), DynError> {
         return model_sweep::run_unattended_model_sweep(&args);
     }
     init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
-    let physical_cores = runtime_physical_cores();
-    let cpu_auto = physical_cores
-        .map(|n| n.saturating_sub(1).max(1))
-        .unwrap_or_else(|| {
-            build_logical_cpus()
-                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
-                .unwrap_or(2)
-                .saturating_sub(2)
-                .max(1)
-        });
-    let cpu_threads = match args.cpu {
-        Some(0) => return Err("--cpu must be >= 1".into()),
-        Some(v) => v,
-        None => cpu_auto,
-    };
-    if args.cpu.is_none() {
-        if let Some(physical) = physical_cores {
-            println!(
-                "[info] CPU auto-tuning: physical-cores={} reader-reserve=1 compute-threads={}",
-                physical, cpu_threads
-            );
-        }
-    }
     let affinity_runtime = affinity::AffinityRuntime::from_default_file()?;
     if let Some(msg) = affinity_runtime.info() {
         println!("[info] {msg}");
     }
-    let reader_core = affinity::reader_core_from_env()?;
-    if let Some(core) = reader_core {
+    let allowed = affinity_runtime
+        .worker_cores()
+        .map(|v| v.as_ref().clone())
+        .or_else(core_affinity::get_core_ids)
+        .ok_or("cannot determine allowed CPUs for I/O and computation")?;
+    let requested = args
+        .cpu
+        .unwrap_or_else(|| runtime_physical_cores().unwrap_or(allowed.len()));
+    let allocation =
+        affinity::allocate_cpus(&allowed, requested, affinity::reader_core_from_env()?)?;
+    let cpu_threads = allocation.workers.len();
+    let reader_core = Some(allocation.io);
+    if requested > allocation.total {
         println!(
-            "[info] I/O reader thread affinity enabled via YI_READER_CORE: core={}",
-            core.id
+            "[info] CPU request {} limited to {} allowed CPUs",
+            requested, allocation.total
         );
     }
-    let mut tp_builder = rayon::ThreadPoolBuilder::new().num_threads(cpu_threads);
-    if let Some(core_ids) = affinity_runtime.worker_cores() {
-        tp_builder = tp_builder.start_handler(move |thread_idx| {
-            let c = core_ids[thread_idx % core_ids.len()];
-            let _ = core_affinity::set_for_current(c);
+    println!(
+        "[info] CPU allocation: total={} I/O CPU={} compute-threads={} compute-CPUs={}{}",
+        allocation.total,
+        allocation.io.id,
+        cpu_threads,
+        allocation
+            .workers
+            .iter()
+            .map(|c| c.id.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        if allocation.total == 1 {
+            " (single CPU shared with I/O)"
+        } else {
+            ""
+        }
+    );
+    let core_ids = allocation.workers;
+    let tp_builder = rayon::ThreadPoolBuilder::new()
+        .num_threads(cpu_threads)
+        .start_handler(move |thread_idx| {
+            if !core_affinity::set_for_current(core_ids[thread_idx % core_ids.len()]) {
+                eprintln!("[warn] failed to pin compute worker {}", thread_idx);
+            }
         });
-    }
     tp_builder
         .build_global()
         .map_err(|e| format!("failed to configure rayon thread pool: {e}"))?;
@@ -6586,9 +6455,11 @@ fn run_once(
     }
     if !args.compact_logs {
         println!(
-            "  cpu:        {} (compute threads: {})",
+            "  cpu:        compute-threads={} I/O CPU={}",
             cpu_threads,
-            rayon::current_num_threads()
+            reader_core
+                .map(|c| c.id.to_string())
+                .unwrap_or_else(|| "unbound".to_string())
         );
         let build_cpu = build_logical_cpus()
             .map(|v| v.to_string())
@@ -8100,23 +7971,11 @@ fn run_once(
         let mut ql_fringe_start_offset_s = 0.0_f64;
         let mut ql_fringe_index = 0usize;
 
-        // auto_pipeline_depth() is already at least two.  Keep an explicit
-        // --pipeline-depth value unchanged, including a requested depth of one.
-        let prefetch_depth = io_pipeline_depth;
-        let paired_ready_capacity = if args.usb {
-            prefetch_depth.saturating_sub(1).max(1)
-        } else {
-            prefetch_depth
-        };
+        let paired_ready_capacity = io_pipeline_depth;
         println!(
-            "[info] I/O prefetch: process-window reader enabled (pipeline={} chunks, paired-ready={} chunks)",
-            prefetch_depth, paired_ready_capacity
+            "[info] I/O prefetch: bounded streaming reader (chunk={} frames, ready={} chunks, reusable-slots={})",
+            io_chunk_frames, paired_ready_capacity, paired_ready_capacity + 2
         );
-        if args.usb {
-            println!(
-                "[info] Input reader mode: USB-attached storage concurrent readers (one per antenna; unrelated to USB signal sideband)"
-            );
-        }
         let read_align_first = compute_frame_delay_entry(0, &delay_cfg, d_seek);
         let read_align_last_frame = total_f.saturating_sub(1);
         let read_align_last = compute_frame_delay_entry(read_align_last_frame, &delay_cfg, d_seek);
@@ -8142,11 +8001,9 @@ fn run_once(
         }
 
         let sec_counts_for_read = sec_counts.clone();
-        let (tx_sec, rx_sec) = mpsc::sync_channel::<PairedSectorRead>(paired_ready_capacity);
         let synth_produced_chunks = Arc::new(AtomicUsize::new(0));
         let synth_produced_bytes = Arc::new(AtomicU64::new(0));
         let synth_consumed_chunks = Arc::new(AtomicUsize::new(0));
-        let (a1_read, a2_read) = (a1p.clone(), a2p.clone());
         if fx_integer_delay_enabled() {
             println!(
                 "[info] FX delay correction: fixed read-align + per-frame integer sample shift enabled (YI_FX_INT_DELAY=1)"
@@ -8229,167 +8086,32 @@ fn run_once(
             sector_d_seeks.push(actual_sector_d_seek_samples as f64 / fs);
             sector_start_frame += nf;
         }
-        let sector_read_starts_rd = sector_read_starts.clone();
-        let sector_read_sample_counts_rd = sector_read_sample_counts.clone();
-        let synth_produced_chunks_rd = Arc::clone(&synth_produced_chunks);
-        let synth_produced_bytes_rd = Arc::clone(&synth_produced_bytes);
-        let reader_pipeline = if args.usb {
-            let sector_count = sec_counts_for_read.len();
-            let ant1_sector_reads = sector_read_starts_rd
-                .iter()
-                .zip(sector_read_sample_counts_rd.iter())
-                .map(|(&(start1, _), &(count1, _))| (start1, count1))
-                .collect::<Vec<_>>();
-            let ant2_sector_reads = sector_read_starts_rd
-                .iter()
-                .zip(sector_read_sample_counts_rd.iter())
-                .map(|(&(_, start2), &(_, count2))| (start2, count2))
-                .collect::<Vec<_>>();
-
-            // Rendezvous channels prevent either station reader from queuing
-            // an additional sector independently of the pairer.
-            let (tx_ant1, rx_ant1) = mpsc::sync_channel::<StationSectorRead>(0);
-            let (tx_ant2, rx_ant2) = mpsc::sync_channel::<StationSectorRead>(0);
-            let ant1_handle = thread::spawn(move || {
-                run_usb_station_reader(
-                    a1_read,
-                    "ant1",
-                    bit1,
-                    ant1_sector_reads,
-                    reader_core,
-                    tx_ant1,
-                );
-            });
-            let ant2_handle = thread::spawn(move || {
-                run_usb_station_reader(a2_read, "ant2", bit2, ant2_sector_reads, None, tx_ant2);
-            });
-            let pairer_handle = thread::spawn(move || {
-                for expected_sector in 0..sector_count {
-                    let (sector1, b1) = match rx_ant1.recv() {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            let _ = tx_sec.send(Err(e));
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = tx_sec.send(Err(format!(
-                                "USB ant1 reader channel failed at sector {}: {e}",
-                                expected_sector + 1
-                            )));
-                            return;
-                        }
-                    };
-                    let (sector2, b2) = match rx_ant2.recv() {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            let _ = tx_sec.send(Err(e));
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = tx_sec.send(Err(format!(
-                                "USB ant2 reader channel failed at sector {}: {e}",
-                                expected_sector + 1
-                            )));
-                            return;
-                        }
-                    };
-                    if sector1 != expected_sector || sector2 != expected_sector {
-                        let _ = tx_sec.send(Err(format!(
-                            "USB reader sector pairing mismatch: expected={} ant1={} ant2={}",
-                            expected_sector + 1,
-                            sector1 + 1,
-                            sector2 + 1
-                        )));
-                        return;
-                    }
-                    let chunk_bytes = (b1.len() + b2.len()) as u64;
-                    if tx_sec.send(Ok((expected_sector, b1, b2))).is_err() {
-                        return;
-                    }
-                    synth_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
-                    synth_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            SynthReaderPipeline::new(
-                rx_sec,
-                vec![
-                    ("USB sector pairer", pairer_handle),
-                    ("USB ant1 reader", ant1_handle),
-                    ("USB ant2 reader", ant2_handle),
+        let io_sectors = sec_counts
+            .iter()
+            .enumerate()
+            .map(|(si, &frames)| input_pipeline::Sector {
+                frames,
+                starts: [sector_read_starts[si].0, sector_read_starts[si].1],
+                samples: [
+                    sector_read_sample_counts[si].0,
+                    sector_read_sample_counts[si].1,
                 ],
-            )
-        } else {
-            let reader_handle = thread::spawn(move || {
-                if let Some(core) = reader_core {
-                    let _ = affinity::set_current_thread_core(core);
-                }
-                let mut pr1 = match PackedSampleReader::open(&a1_read, 0, 0) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed to open {} for sector reader: {e}",
-                            a1_read.display()
-                        )));
-                        return;
-                    }
-                };
-                let mut pr2 = match PackedSampleReader::open(&a2_read, 0, 0) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed to open {} for sector reader: {e}",
-                            a2_read.display()
-                        )));
-                        return;
-                    }
-                };
-                for (sector_idx, _nf) in sec_counts_for_read.into_iter().enumerate() {
-                    let (read_n1, read_n2) = sector_read_sample_counts_rd[sector_idx];
-                    let mut b1 = vec![0u8; ((read_n1 as usize * bit1) + 7) / 8];
-                    let mut b2 = vec![0u8; ((read_n2 as usize * bit2) + 7) / 8];
-                    let (sector_s1, sector_s2) = sector_read_starts_rd[sector_idx];
-                    let bits1 = sector_s1 * bit1 as u64;
-                    let bits2 = sector_s2 * bit2 as u64;
-                    if let Err(e) = pr1.seek_to(bits1 / 8, (bits1 % 8) as u8) {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed to seek {} at sample {}: {e}",
-                            a1_read.display(),
-                            sector_s1
-                        )));
-                        return;
-                    }
-                    if let Err(e) = pr2.seek_to(bits2 / 8, (bits2 % 8) as u8) {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed to seek {} at sample {}: {e}",
-                            a2_read.display(),
-                            sector_s2
-                        )));
-                        return;
-                    }
-                    if let Err(e) = pr1.read_packed_with_padding(&mut b1) {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed reading ant1 input at sample {}: {e}",
-                            sector_s1
-                        )));
-                        return;
-                    }
-                    if let Err(e) = pr2.read_packed_with_padding(&mut b2) {
-                        let _ = tx_sec.send(Err(format!(
-                            "failed reading ant2 input at sample {}: {e}",
-                            sector_s2
-                        )));
-                        return;
-                    }
-                    let chunk_bytes = (b1.len() + b2.len()) as u64;
-                    if tx_sec.send(Ok((sector_idx, b1, b2))).is_err() {
-                        return;
-                    }
-                    synth_produced_bytes_rd.fetch_add(chunk_bytes, Ordering::Relaxed);
-                    synth_produced_chunks_rd.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            SynthReaderPipeline::new(rx_sec, vec![("serial sector reader", reader_handle)])
-        };
+                d_seek: sector_d_seeks[si],
+            })
+            .collect();
+        let reader_pipeline = input_pipeline::Pipeline::start(
+            [a1p.clone(), a2p.clone()],
+            [bit1, bit2],
+            fft_len,
+            io_sectors,
+            delay_cfg.clone(),
+            io_chunk_frames,
+            paired_ready_capacity,
+            args.usb,
+            reader_core,
+            Arc::clone(&synth_produced_chunks),
+            Arc::clone(&synth_produced_bytes),
+        );
         let need_phased_products = write_raw || write_phased_cor || plot_phased;
         let need_acf_products = write_acf_cor;
         let need_xcf_products = write_xcf_cor;
@@ -8460,14 +8182,28 @@ fn run_once(
         let mut timing_sample_fft_s = 0.0_f64;
         let mut timing_sample_accum_s = 0.0_f64;
         let mut timing_sample_frames = 0usize;
-        for (si, &nf) in sec_counts.iter().enumerate() {
-            let sector_d_seek = sector_d_seeks[si];
-            let (sector_sample_start1, sector_sample_start2) = sector_read_starts[si];
-            let timing_delay_start = Instant::now();
-            let frame_delays: Vec<FrameDelayEntry> = (0..nf)
-                .map(|i| compute_frame_delay_entry(emitted + i, &delay_cfg, sector_d_seek))
-                .collect();
-            timing_delay_s += timing_delay_start.elapsed().as_secs_f64();
+        type IntegratedBatch = (
+            Vec<f64>,
+            Vec<f64>,
+            Vec<Complex<f64>>,
+            Vec<f64>,
+            Option<FoldAccum>,
+        );
+        let mut integrated: Option<IntegratedBatch> = None;
+        let block_count: usize = sec_counts
+            .iter()
+            .map(|&n| n.div_ceil(io_chunk_frames))
+            .sum();
+        for _ in 0..block_count {
+            let timing_recv_start = Instant::now();
+            let block = reader_pipeline.recv()?;
+            timing_recv_wait_s += timing_recv_start.elapsed().as_secs_f64();
+            let si = block.sector;
+            let nf = block.delays.len();
+            let last_chunk = block.frame + nf == sec_counts[si];
+            let [sector_sample_start1, sector_sample_start2] = block.starts;
+            let frame_delays = &block.delays;
+            timing_delay_s += block.delay_s;
             if args.debug && need_xcf_products {
                 print_delay_debug_samples(
                     &format!("delay sector {}", si + 1),
@@ -8536,42 +8272,13 @@ fn run_once(
                     )?;
                 }
             }
-            let timing_recv_start = Instant::now();
-            let (received_sector, raw1_vec, raw2_vec) = match reader_pipeline.recv() {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    return Err(std::io::Error::other(format!("synth reader error: {e}")).into())
-                }
-                Err(e) => {
-                    return Err(
-                        std::io::Error::other(format!("synth reader channel error: {e}")).into(),
-                    )
-                }
-            };
-            if received_sector != si {
-                return Err(std::io::Error::other(format!(
-                    "synth reader sector order mismatch: expected={} received={}",
-                    si + 1,
-                    received_sector + 1
-                ))
-                .into());
-            }
-            timing_recv_wait_s += timing_recv_start.elapsed().as_secs_f64();
             synth_consumed_chunks.fetch_add(1, Ordering::Relaxed);
-            let raw1: &[u8] = &raw1_vec;
-            let raw2: &[u8] = &raw2_vec;
+            let raw1: &[u8] = &block.raw[0];
+            let raw2: &[u8] = &block.raw[1];
             synth_read_bytes_total += (raw1.len() + raw2.len()) as u64;
             let produced = synth_produced_chunks.load(Ordering::Relaxed);
             let consumed = synth_consumed_chunks.load(Ordering::Relaxed);
-            let queue_fill = produced.saturating_sub(consumed);
-            if queue_fill > synth_queue_hwm {
-                synth_queue_hwm = queue_fill;
-            }
-            let consumed = synth_consumed_chunks.load(Ordering::Relaxed);
-            let queue_fill = produced.saturating_sub(consumed);
-            if queue_fill > synth_queue_hwm {
-                synth_queue_hwm = queue_fill;
-            }
+            synth_queue_hwm = synth_queue_hwm.max(produced.saturating_sub(consumed));
             let sector_failures = AtomicUsize::new(0);
             let process_frame =
                 |i: usize,
@@ -8595,7 +8302,7 @@ fn run_once(
                         samples_per_word1,
                         &dp1,
                         lsb1,
-                        d.int1,
+                        d.int1 - block.offsets[0],
                         &mut f1,
                         &mut dw1,
                     )
@@ -8616,7 +8323,7 @@ fn run_once(
                         samples_per_word2,
                         &dp2,
                         lsb2,
-                        d.int2,
+                        d.int2 - block.offsets[1],
                         &mut f2,
                         &mut dw2,
                     )
@@ -8884,6 +8591,7 @@ fn run_once(
                     })
                     .reduce(zero_acc, reduce_acc);
                 if let Some(w) = wr.as_mut() {
+                    let _io_affinity = affinity::IoAffinityGuard::enter(reader_core)?;
                     w.write_all(&enc)?;
                 }
                 (acc.0, acc.1, acc.2, acc.3, None)
@@ -8943,7 +8651,9 @@ fn run_once(
                     timing_accum_s: 0.0,
                     timing_samples: 0,
                 };
-                let frames_per_job = (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(128, 2048);
+                let min_job_frames = (nf / cpu_threads.saturating_mul(4).max(1)).clamp(1, 128);
+                let frames_per_job =
+                    (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(min_job_frames, 2048);
                 let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
                 let chunk_abs_start1 = sector_sample_start1;
                 let chunk_abs_start2 = sector_sample_start2;
@@ -8973,7 +8683,7 @@ fn run_once(
                                 samples_per_word1,
                                 &dp1,
                                 lsb1,
-                                d.int1,
+                                d.int1 - block.offsets[0],
                                 &mut st.f1,
                                 &mut st.dw1,
                             )
@@ -8991,7 +8701,7 @@ fn run_once(
                                 samples_per_word2,
                                 &dp2,
                                 lsb2,
-                                d.int2,
+                                d.int2 - block.offsets[1],
                                 &mut st.f2,
                                 &mut st.dw2,
                             )
@@ -9304,6 +9014,7 @@ fn run_once(
             };
             timing_compute_s += timing_compute_start.elapsed().as_secs_f64();
             let timing_output_start = Instant::now();
+            let _io_affinity = affinity::IoAffinityGuard::enter(reader_core)?;
             let sec_failed = sector_failures.load(Ordering::Relaxed);
             if sec_failed > 0 {
                 println!(
@@ -9312,9 +9023,31 @@ fn run_once(
                     sec_failed
                 );
             }
-            let sector_start_offset_s = emitted as f64 * frame_sec;
-            let sector_integ_s = nf as f64 * frame_sec;
+            reader_pipeline.recycle(block);
+            if let Some(acc) = integrated.as_mut() {
+                for (a, b) in acc.0.iter_mut().zip(&batch_ph) {
+                    *a += b;
+                }
+                for k in 0..acc.1.len() {
+                    acc.1[k] += batch_11[k];
+                    acc.2[k] += batch_12[k];
+                    acc.3[k] += batch_22[k];
+                }
+                if let (Some(a), Some(b)) = (acc.4.as_mut(), batch_fold) {
+                    a.merge(b);
+                }
+            } else {
+                integrated = Some((batch_ph, batch_11, batch_12, batch_22, batch_fold));
+            }
             emitted += nf;
+            if !last_chunk {
+                timing_output_s += timing_output_start.elapsed().as_secs_f64();
+                continue;
+            }
+            let (batch_ph, batch_11, batch_12, batch_22, batch_fold) = integrated.take().unwrap();
+            let nf = sec_counts[si];
+            let sector_start_offset_s = (emitted - nf) as f64 * frame_sec;
+            let sector_integ_s = nf as f64 * frame_sec;
             if is_phased_mode {
                 print!(
                     "\r[info] Synthesised sector {}/{} ({:.2}%)",
@@ -9533,7 +9266,11 @@ fn run_once(
                 synth_queue_hwm,
                 paired_ready_capacity
             );
-            let timed = timing_delay_s + timing_recv_wait_s + timing_compute_s + timing_output_s;
+            println!(
+                "[info] Input delay preparation: {:.3}s (reader thread; overlaps compute)",
+                timing_delay_s
+            );
+            let timed = timing_recv_wait_s + timing_compute_s + timing_output_s;
             let pct = |v: f64| {
                 if timed > 0.0 {
                     100.0 * v / timed
@@ -9543,8 +9280,8 @@ fn run_once(
             };
             println!(
                 "[info] Synth timing summary: delay={:.3}s ({:.1}%) recv-wait={:.3}s ({:.1}%) compute={:.3}s ({:.1}%) output={:.3}s ({:.1}%) accounted={:.3}s elapsed={:.3}s",
-                timing_delay_s,
-                pct(timing_delay_s),
+                0.0,
+                0.0,
                 timing_recv_wait_s,
                 pct(timing_recv_wait_s),
                 timing_compute_s,
@@ -9571,6 +9308,7 @@ fn run_once(
                 );
             }
         }
+        let final_io_affinity = affinity::IoAffinityGuard::enter(reader_core)?;
         if let Some(mut w) = wr.take() {
             w.flush()?;
             drop(w);
@@ -9672,6 +9410,7 @@ fn run_once(
             dw.flush()?;
         }
 
+        drop(final_io_affinity);
         if plot_phased {
             println!("[info] Generating phased-array plots...");
             let power_norm = (emitted as f64 * fft_len as f64).max(1.0);
