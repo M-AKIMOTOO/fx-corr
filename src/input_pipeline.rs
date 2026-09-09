@@ -7,6 +7,34 @@ use std::time::Instant;
 use crate::utils::DynError;
 use crate::{compute_frame_delay_entry, DelayEvalConfig, FrameDelayEntry, PackedSampleReader};
 
+// Bound hints to the current and next chunk, never the entire input file.
+fn readahead_range(start: u64, samples: u64, end: u64, bits: usize) -> (u64, u64) {
+    let byte = (start as u128 * bits as u128 / 8).min(i64::MAX as u128);
+    let limit = (end as u128 * bits as u128 / 8).min(i64::MAX as u128);
+    let wanted = (samples as u128 * bits as u128 * 2).div_ceil(8);
+    let len = wanted.min(64 * 1024 * 1024).min(limit.saturating_sub(byte));
+    (byte as u64, len as u64)
+}
+fn advise_window(file: &std::fs::File, range: (u64, u64)) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        // Zero length means through EOF to fadvise; skip empty hints.
+        if range.1 != 0 {
+            unsafe {
+                let _ = libc::posix_fadvise(
+                    file.as_raw_fd(),
+                    range.0 as libc::off_t,
+                    range.1 as libc::off_t,
+                    libc::POSIX_FADV_WILLNEED,
+                );
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (file, range);
+}
+
 pub(crate) struct Sector {
     pub frames: usize,
     pub starts: [u64; 2],
@@ -128,6 +156,10 @@ impl Pipeline {
             let result = (|| -> Result<(), DynError> {
                 let mut r1 = PackedSampleReader::open(&paths[0], 0, 0)?;
                 let r2 = PackedSampleReader::open(&paths[1], 0, 0)?;
+                let advice_files = [
+                    r1.reader.get_ref().try_clone()?,
+                    r2.reader.get_ref().try_clone()?,
+                ];
                 thread::scope(|scope| -> Result<(), DynError> {
                     // Optional second persistent reader for separate USB devices.
                     let (request_tx, request_rx) = mpsc::sync_channel::<(Vec<u8>, u64, u64)>(0);
@@ -175,6 +207,15 @@ impl Pipeline {
                                 counts[ant] = count;
                             }
                             let read_start = Instant::now();
+                            // Submit both hints before blocking on either antenna.
+                            // Advisory handles never seek or consume input.
+                            for ant in 0..2 {
+                                let end = sector.starts[ant].saturating_add(sector.samples[ant]);
+                                advise_window(
+                                    &advice_files[ant],
+                                    readahead_range(block.starts[ant], counts[ant], end, bits[ant]),
+                                );
+                            }
                             if concurrent {
                                 request_tx.send((
                                     std::mem::take(&mut block.raw[1]),
@@ -265,6 +306,22 @@ mod tests {
     use super::*;
     use crate::utils::{build_decode_plan, decode_block_into_with_plan};
     use crate::{decode_shifted_frame_from_chunk, DecodeWindowScratch};
+
+    #[test]
+    fn readahead_is_bounded() {
+        assert_eq!(readahead_range(32, 64, 1024, 2), (8, 32));
+        assert_eq!(readahead_range(32, 64, 64, 2), (8, 8));
+        assert_eq!(readahead_range(32, 0, 1024, 2), (8, 0));
+        assert_eq!(readahead_range(32, 64, 16, 2), (8, 0));
+        assert_eq!(
+            readahead_range(0, u64::MAX, u64::MAX, 8),
+            (0, 64 * 1024 * 1024)
+        );
+        assert_eq!(
+            readahead_range(u64::MAX, 64, u64::MAX, 8),
+            (i64::MAX as u64, 0)
+        );
+    }
 
     #[test]
     fn chunk_windows_match_whole_sector_with_integer_delays_and_padding() {
