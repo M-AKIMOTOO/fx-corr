@@ -381,6 +381,12 @@ pub struct Args {
 
     #[arg(
         long,
+        help = "Adapt simultaneous compute jobs to measured input supply (--cpu is the total CPU limit; yi-corr only)"
+    )]
+    pub cpu_auto: bool,
+
+    #[arg(
+        long,
         value_name = "N",
         help = "Reader chunk size [frames], independent of output integration (auto: up to 16 MiB per input pair)"
     )]

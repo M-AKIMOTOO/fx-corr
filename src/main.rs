@@ -3,6 +3,7 @@ mod affinity;
 mod args;
 mod cor;
 mod corr_kernel;
+mod cpu_balance;
 mod eop;
 mod fringe;
 mod geom;
@@ -2455,6 +2456,9 @@ fn main() -> Result<(), DynError> {
         return model_sweep::run_unattended_model_sweep(&args);
     }
     init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
+    if args.cpu_auto && !matches!(run_mode, RunMode::Corr) {
+        return Err("--cpu-auto is supported only by yi-corr".into());
+    }
     let affinity_runtime = affinity::AffinityRuntime::from_default_file()?;
     if let Some(msg) = affinity_runtime.info() {
         println!("[info] {msg}");
@@ -8191,6 +8195,12 @@ fn run_once(
             Option<FoldAccum>,
         );
         let mut integrated: Option<IntegratedBatch> = None;
+        let mut cpu_balance = args
+            .cpu_auto
+            .then(|| cpu_balance::Balance::new(cpu_threads));
+        if cpu_balance.is_some() {
+            println!("[info] CPU auto: max-compute-jobs={} initial={} (I/O CPU reserved; continuous input/compute sampling)", cpu_threads, cpu_threads);
+        }
         let block_count: usize = sec_counts
             .iter()
             .map(|&n| n.div_ceil(io_chunk_frames))
@@ -8198,7 +8208,8 @@ fn run_once(
         for _ in 0..block_count {
             let timing_recv_start = Instant::now();
             let block = reader_pipeline.recv()?;
-            timing_recv_wait_s += timing_recv_start.elapsed().as_secs_f64();
+            let block_wait_s = timing_recv_start.elapsed().as_secs_f64();
+            timing_recv_wait_s += block_wait_s;
             let si = block.sector;
             let nf = block.delays.len();
             let last_chunk = block.frame + nf == sec_counts[si];
@@ -8654,8 +8665,11 @@ fn run_once(
                     timing_samples: 0,
                 };
                 let min_job_frames = (nf / cpu_threads.saturating_mul(4).max(1)).clamp(1, 128);
-                let frames_per_job =
-                    (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(min_job_frames, 2048);
+                let frames_per_job = if let Some(balance) = &cpu_balance {
+                    nf.div_ceil(balance.active()).max(1)
+                } else {
+                    (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(min_job_frames, 2048)
+                };
                 let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
                 let chunk_abs_start1 = sector_sample_start1;
                 let chunk_abs_start2 = sector_sample_start2;
@@ -9014,7 +9028,21 @@ fn run_once(
                     out.fold.take(),
                 )
             };
-            timing_compute_s += timing_compute_start.elapsed().as_secs_f64();
+            let block_compute_s = timing_compute_start.elapsed().as_secs_f64();
+            timing_compute_s += block_compute_s;
+            if let Some(balance) = &mut cpu_balance {
+                if let Some((old, new)) =
+                    balance.observe(block.read_s + block.delay_s, block_compute_s, block_wait_s)
+                {
+                    println!(
+                        "[info] CPU auto: compute-jobs {} -> {} at frame {} (limit={})",
+                        old,
+                        new,
+                        emitted + nf,
+                        cpu_threads
+                    );
+                }
+            }
             let timing_output_start = Instant::now();
             let sec_failed = sector_failures.load(Ordering::Relaxed);
             if sec_failed > 0 {

@@ -53,6 +53,16 @@ correlation workers. For example, `--cpu 30` gives 29 compute workers and one
 I/O CPU. With `--cpu 1`, computation and I/O share that CPU. Without `--cpu`,
 the total defaults to the available physical core count.
 
+For normal correlation, add `--cpu-auto` to adapt the number of simultaneous
+compute jobs to measured input supply. `--cpu N` remains the total CPU limit,
+including the reserved I/O CPU. The worker pool stays allocated; fewer jobs
+let unused workers wait. Input read/delay preparation and compute time are
+sampled throughout the run, so an initially fast cached region does not fix
+the choice for the whole observation. Changes appear as `CPU auto: compute-jobs`.
+This balances work under variable input; it does not guarantee shorter elapsed
+time or constant CPU utilization. See [validation](docs/fx-corr-cpu-auto.md).
+
+
 Normal correlation reads bounded chunks independently of the XML integration
 interval. The automatic chunk target is 16 MiB per input pair (up to 32768
 frames), with two ready chunks and four reusable buffer slots. Integer-delay
