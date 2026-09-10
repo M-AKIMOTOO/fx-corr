@@ -812,3 +812,101 @@ fn small_io_chunks_preserve_integration_and_phased_raw_with_delay_drift() {
     }
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn vlbi_flag_matches_explicit_models_on_short_and_long_baselines() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let raw: Vec<u8> = (0..4096)
+        .map(|i| ((i * 53 + i / 7 + 79) % 256) as u8)
+        .collect();
+    for station in ["ANT1", "ANT2"] {
+        fs::write(raw_dir.join(format!("{station}_2000001000000.raw")), &raw).unwrap();
+    }
+    for (baseline, xyz) in [
+        (
+            "short",
+            "<pos-x>-3502567.576</pos-x><pos-y>3950885.734</pos-y><pos-z>3566449.115</pos-z>",
+        ),
+        (
+            "long",
+            "<pos-x>-3961788.974</pos-x><pos-y>3243597.492</pos-y><pos-z>3790597.692</pos-z>",
+        ),
+    ] {
+        let schedule = root.join("test.xml");
+        write_schedule(&schedule, "ANT1", "ANT2");
+        let xml = fs::read_to_string(&schedule).unwrap();
+        let original = "<station key=\"B\"><name>ANT2</name><pos-x>-3502544.587</pos-x><pos-y>3950966.235</pos-y><pos-z>3566381.192</pos-z>";
+        assert!(xml.contains(original));
+        fs::write(
+            &schedule,
+            xml.replace(
+                original,
+                &format!("<station key=\"B\"><name>ANT2</name>{xyz}"),
+            ),
+        )
+        .unwrap();
+        let mut products = Vec::new();
+        for run in 0..4 {
+            let out = root.join(format!("{baseline}-{run}"));
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
+            cmd.args([
+                "--sc",
+                schedule.to_str().unwrap(),
+                "--raw",
+                raw_dir.to_str().unwrap(),
+                "--cor",
+                out.to_str().unwrap(),
+                "--cpu",
+                "2",
+            ])
+            .env_remove("YI_SOURCE_VECTOR_MODE")
+            .env_remove("YI_GEOM_DELAY_MODE")
+            .env("YI_EOP_MODE", "none");
+            if run == 1 {
+                cmd.env("YI_SOURCE_VECTOR_MODE", "mean-gast")
+                    .env("YI_GEOM_DELAY_MODE", "anchored");
+            }
+            if run == 2 {
+                cmd.env("YI_SOURCE_VECTOR_MODE", "pnm-gast")
+                    .env("YI_GEOM_DELAY_MODE", "vlbi-minus");
+            }
+            if run == 3 {
+                cmd.arg("--vlbi")
+                    .env("YI_SOURCE_VECTOR_MODE", "mean-gast")
+                    .env("YI_GEOM_DELAY_MODE", "vlbi-plus");
+            }
+            let result = cmd.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if run == 3 {
+                assert!(String::from_utf8_lossy(&result.stdout).contains("VLBI preset:"));
+            }
+            let files: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("cor"))
+                .map(|p| (p.file_name().unwrap().to_owned(), fs::read(&p).unwrap()))
+                .collect();
+            assert!(!files.is_empty());
+            products.push(files);
+        }
+        assert_eq!(
+            products[0], products[1],
+            "legacy defaults changed: {baseline}"
+        );
+        assert_eq!(
+            products[2], products[3],
+            "preset differs from explicit model: {baseline}"
+        );
+        assert_ne!(
+            products[0], products[3],
+            "model switch had no effect: {baseline}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}

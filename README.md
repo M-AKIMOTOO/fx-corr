@@ -2191,6 +2191,27 @@ Delay-model coordinates: precessed-to-date RA/Dec
 
 ### Geometric-model diagnostics and unattended sweep
 
+`--vlbi` selects `pnm-gast` and the existing first-order `vlbi-minus` delay model.
+It overrides `YI_SOURCE_VECTOR_MODE` and `YI_GEOM_DELAY_MODE`. Without this flag,
+existing defaults and environment settings are preserved. EOP and station clock
+settings are unchanged. This is not a full IERS propagation model: atmospheric
+and gravitational delays are not added. Integer alignment remains before FFT;
+fractional delay and fringe-stop remain after FFT. Pre-FFT complex fringe
+rotation is not enabled by this flag.
+
+For a controlled comparison, use the same schedule and separate output directories:
+
+```bash
+env -u YI_SOURCE_VECTOR_MODE -u YI_GEOM_DELAY_MODE yi-corr --sc test.xml --raw ../raw --cor cor_default --cpu 15 --stdout
+yi-corr --sc test.xml --raw ../raw --cor cor_vlbi --cpu 15 --stdout --vlbi --model-diagnostics
+```
+
+Repeat for the 110 m and 870 km datasets using their respective schedules.
+Compare amplitude, residual delay/rate, and unwrapped phase with independently
+fitted rate/acceleration for each result. `--model-sweep --vlbi` keeps the preset
+for the active case only; fixed sweep cases retain their specified models.
+
+
 `--model-diagnostics` diagnoses a curved residual delay or fringe phase without
 changing the correlation numerics. It performs the requested correlation once;
 the raw reads and FFT are therefore not repeated for each model variant. For a

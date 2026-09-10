@@ -5391,7 +5391,10 @@ fn run_once(
         xp_arcsec,
         yp_arcsec,
     };
-    let geom_delay_mode = match std::env::var("YI_GEOM_DELAY_MODE") {
+    let geom_delay_mode = if args.vlbi {
+        geom::GeometricDelayMode::VlbiMinus
+    } else {
+        match std::env::var("YI_GEOM_DELAY_MODE") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
             "" | "anchored" | "mixed" | "default" => geom::GeometricDelayMode::Anchored,
             "bary" | "barycentric" | "absolute-barycentric" => {
@@ -5412,23 +5415,31 @@ fn run_once(
             }
         },
         Err(_) => geom::GeometricDelayMode::Anchored,
+    }
     };
-    let source_vector_mode = match std::env::var("YI_SOURCE_VECTOR_MODE") {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "" | "mean" | "mean-gast" | "precess-gast" | "default" => {
-                geom::SourceVectorMode::MeanGast
-            }
-            "pnm" | "pnm-gast" | "true-gast" => geom::SourceVectorMode::PnmGast,
-            "pnm-era" | "era" | "c2t" | "c2t-era" => geom::SourceVectorMode::PnmEra,
-            other => {
-                return Err(format!(
+    let source_vector_mode = if args.vlbi {
+        geom::SourceVectorMode::PnmGast
+    } else {
+        match std::env::var("YI_SOURCE_VECTOR_MODE") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "" | "mean" | "mean-gast" | "precess-gast" | "default" => {
+                    geom::SourceVectorMode::MeanGast
+                }
+                "pnm" | "pnm-gast" | "true-gast" => geom::SourceVectorMode::PnmGast,
+                "pnm-era" | "era" | "c2t" | "c2t-era" => geom::SourceVectorMode::PnmEra,
+                other => {
+                    return Err(format!(
                     "invalid YI_SOURCE_VECTOR_MODE='{other}' (use mean-gast, pnm-gast, or pnm-era)"
                 )
-                .into())
-            }
-        },
-        Err(_) => geom::SourceVectorMode::MeanGast,
+                    .into())
+                }
+            },
+            Err(_) => geom::SourceVectorMode::MeanGast,
+        }
     };
+    if args.vlbi {
+        println!("[info] VLBI preset: PNM06A+GAST, first-order VLBI minus; overrides YI_SOURCE_VECTOR_MODE/YI_GEOM_DELAY_MODE; EOP unchanged; integer delay before FFT, fractional delay and fringe-stop after FFT");
+    }
     if let (Some(ra_s), Some(dec_s)) = (ra_in, dec_in) {
         let (ra_raw, dec_raw, mjd) = (
             geom::parse_ra(&ra_s)?,

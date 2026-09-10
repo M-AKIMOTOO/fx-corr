@@ -431,6 +431,13 @@ pub struct Args {
     #[arg(
         long,
         default_value_t = false,
+        help = "Use PNM06A+GAST and first-order VLBI minus delay model (overrides model environment variables; EOP unchanged)"
+    )]
+    pub vlbi: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Run an unattended five-case full-correlation model sweep into subdirectories"
     )]
     pub model_sweep: bool,
@@ -624,6 +631,11 @@ mod tests {
         let default_args = Args::try_parse_from(["yi-corr", "--mkxml"]).unwrap();
         assert!(!default_args.model_diagnostics);
         assert!(!default_args.model_sweep);
+        assert!(!default_args.vlbi);
+        let vlbi =
+            Args::try_parse_from(["yi-corr", "--mkxml", "--vlbi", "--model-diagnostics"]).unwrap();
+        assert!(vlbi.vlbi);
+        assert!(vlbi.model_diagnostics);
 
         let diagnostic =
             Args::try_parse_from(["yi-corr", "--mkxml", "--model-diagnostics"]).unwrap();
