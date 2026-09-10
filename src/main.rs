@@ -8120,6 +8120,9 @@ fn run_once(
                 d_seek: sector_d_seeks[si],
             })
             .collect();
+        if args.read_batch_mib != 0 {
+            println!("[info] Input read batching: {} MiB per antenna, sector-bounded; compute chunks unchanged, reusable packed buffers", args.read_batch_mib);
+        }
         let mut reader_pipeline = input_pipeline::Pipeline::start(
             [a1p.clone(), a2p.clone()],
             [bit1, bit2],
@@ -8129,6 +8132,7 @@ fn run_once(
             io_chunk_frames,
             paired_ready_capacity,
             args.usb,
+            args.read_batch_mib as usize * 1024 * 1024,
             reader_core,
             Arc::clone(&synth_produced_chunks),
             Arc::clone(&synth_produced_bytes),

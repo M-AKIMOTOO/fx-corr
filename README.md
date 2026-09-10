@@ -72,6 +72,16 @@ writes to the I/O CPU and excludes it from the compute workers' CPU list.
 These are logical CPU assignments; SMT siblings can share a physical core.
 The operating system's file cache is separate from the application's buffers.
 
+Use `--read-batch-mib 256` to read larger contiguous packed windows per
+antenna while keeping compute chunks small. This reduces file switching for
+paired HDD input. Each window stops at the integration boundary and is reused;
+up to twice the specified MiB is added to the existing buffer budget. It also
+adds a packed-memory copy, so the default remains 0 until measured on the
+target storage. The maximum is 1024 MiB per antenna. Batch refill overlaps
+queued computation; it does not require a full-reservoir startup wait.
+In this mode `Input read calls` includes batch refill and copies to compute
+blocks; its byte numerator is delivered logical input, not physical disk traffic.
+
 Use `--buffer-seconds 3` to prefill three seconds of observation data before
 computing, then replenish consumed slots concurrently with later computation.
 This replaces `--pipeline-depth` and cannot be combined with `--cpu-auto`.

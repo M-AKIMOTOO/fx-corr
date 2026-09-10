@@ -123,6 +123,63 @@ fn read_into(
     reader.read_packed_with_padding(buf)
 }
 
+// Keep packed samples; expansion and FFT stay on compute workers.
+// Requests are word-aligned relative to the sector even for sub-byte origins.
+struct ReadBatch {
+    raw: Vec<u8>,
+    start: u64,
+    samples: u64,
+    bytes: usize,
+}
+impl ReadBatch {
+    fn new(bytes: usize) -> Self {
+        Self {
+            raw: Vec::new(),
+            start: 0,
+            samples: 0,
+            bytes,
+        }
+    }
+
+    fn read(
+        &mut self,
+        reader: &mut PackedSampleReader,
+        out: &mut Vec<u8>,
+        start: u64,
+        samples: u64,
+        end: u64,
+        bits: usize,
+    ) -> Result<(), DynError> {
+        let len = usize::try_from((samples as u128 * bits as u128).div_ceil(8))?;
+        if samples == 0 {
+            out.clear();
+            return Ok(());
+        }
+        if self.bytes == 0 || len >= self.bytes {
+            return read_into(reader, out, start, samples, bits);
+        }
+        let offset_bits = start
+            .checked_sub(self.start)
+            .map(|n| n as u128 * bits as u128);
+        let hit = offset_bits.is_some_and(|n| n % 8 == 0)
+            && start >= self.start
+            && start.saturating_add(samples) <= self.start.saturating_add(self.samples);
+        if !hit {
+            let count = (self.bytes as u64 * 8 / bits as u64)
+                .max(samples)
+                .min(end.saturating_sub(start));
+            read_into(reader, &mut self.raw, start, count, bits)?;
+            self.start = start;
+            self.samples = count;
+        }
+        let offset = usize::try_from((start - self.start) as u128 * bits as u128 / 8)?;
+        out.clear();
+        out.try_reserve(len)?;
+        out.extend_from_slice(&self.raw[offset..offset + len]);
+        Ok(())
+    }
+}
+
 // Include short chunks at integration boundaries when sizing the reservoir.
 pub fn prefill_chunk_count(sectors: &[usize], chunk: usize, mut frames: usize) -> usize {
     let mut count = 0;
@@ -157,6 +214,7 @@ impl Pipeline {
         chunk_frames: usize,
         depth: usize,
         concurrent: bool,
+        read_batch_bytes: usize,
         core: Option<core_affinity::CoreId>,
         produced: Arc<AtomicUsize>,
         produced_bytes: Arc<AtomicU64>,
@@ -182,14 +240,17 @@ impl Pipeline {
                 ];
                 thread::scope(|scope| -> Result<(), DynError> {
                     // Optional second persistent reader for separate USB devices.
-                    let (request_tx, request_rx) = mpsc::sync_channel::<(Vec<u8>, u64, u64)>(0);
+                    let (request_tx, request_rx) =
+                        mpsc::sync_channel::<(Vec<u8>, u64, u64, u64)>(0);
                     let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<Vec<u8>, DynError>>(0);
                     let mut serial_r2 = Some(r2);
                     if concurrent {
                         let mut r2 = serial_r2.take().unwrap();
+                        let mut batch = ReadBatch::new(read_batch_bytes);
                         scope.spawn(move || {
-                            while let Ok((mut buf, start, samples)) = request_rx.recv() {
-                                let result = read_into(&mut r2, &mut buf, start, samples, bits[1])
+                            while let Ok((mut buf, start, samples, end)) = request_rx.recv() {
+                                let result = batch
+                                    .read(&mut r2, &mut buf, start, samples, end, bits[1])
                                     .map(|()| buf);
                                 if reply_tx.send(result).is_err() {
                                     break;
@@ -197,6 +258,8 @@ impl Pipeline {
                             }
                         });
                     }
+                    let mut batch1 = ReadBatch::new(read_batch_bytes);
+                    let mut batch2 = ReadBatch::new(read_batch_bytes);
                     let mut emitted = 0;
                     for (si, sector) in sectors.iter().enumerate() {
                         for frame in (0..sector.frames).step_by(chunk_frames) {
@@ -230,6 +293,9 @@ impl Pipeline {
                             // Submit both hints before blocking on either antenna.
                             // Advisory handles never seek or consume input.
                             for ant in 0..2 {
+                                if read_batch_bytes != 0 {
+                                    continue;
+                                }
                                 let end = sector.starts[ant].saturating_add(sector.samples[ant]);
                                 advise_window(
                                     &advice_files[ant],
@@ -241,15 +307,17 @@ impl Pipeline {
                                     std::mem::take(&mut block.raw[1]),
                                     block.starts[1],
                                     counts[1],
+                                    sector.starts[1].saturating_add(sector.samples[1]),
                                 ))?;
                             }
                             // Always collect the concurrent result before returning an error,
                             // so the worker cannot remain blocked on its rendezvous send.
-                            let first = read_into(
+                            let first = batch1.read(
                                 &mut r1,
                                 &mut block.raw[0],
                                 block.starts[0],
                                 counts[0],
+                                sector.starts[0].saturating_add(sector.samples[0]),
                                 bits[0],
                             );
                             let second = if concurrent {
@@ -257,11 +325,12 @@ impl Pipeline {
                                     block.raw[1] = buf;
                                 })
                             } else {
-                                read_into(
+                                batch2.read(
                                     serial_r2.as_mut().unwrap(),
                                     &mut block.raw[1],
                                     block.starts[1],
                                     counts[1],
+                                    sector.starts[1].saturating_add(sector.samples[1]),
                                     bits[1],
                                 )
                             };
@@ -367,6 +436,43 @@ mod tests {
     use crate::{decode_shifted_frame_from_chunk, DecodeWindowScratch};
 
     #[test]
+    fn batched_reads_match_direct_with_overlap_bit_origins_and_eof() {
+        let root = std::env::temp_dir().join(format!("fx-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("input.raw");
+        std::fs::write(
+            &path,
+            (0..523).map(|i| (i * 73 + 19) as u8).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for bits in [1, 2, 4, 8] {
+            for origin in [0, 1, 7] {
+                for batch_bytes in [0, 16, 128] {
+                    let mut direct = PackedSampleReader::open(&path, 0, 0).unwrap();
+                    let mut reader = PackedSampleReader::open(&path, 0, 0).unwrap();
+                    let mut batch = ReadBatch::new(batch_bytes);
+                    let mut actual = Vec::new();
+                    let mut expected = Vec::new();
+                    // Forward overlapping windows, cache boundaries, then backward seek.
+                    for step in (0..150).chain([1, 10, 2]) {
+                        let start = origin + step * (32 / bits as u64);
+                        let count = 73;
+                        let end = start + count + 37; // non-byte-aligned batch tail
+                        batch
+                            .read(&mut reader, &mut actual, start, count, end, bits)
+                            .unwrap();
+                        read_into(&mut direct, &mut expected, start, count, bits).unwrap();
+                        assert_eq!(actual, expected, "bits={bits} origin={origin} step={step}");
+                    }
+                    batch.read(&mut reader, &mut actual, 0, 0, 0, bits).unwrap();
+                    assert!(actual.is_empty());
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reservoir_size_accounts_for_integration_tails() {
         assert_eq!(prefill_chunk_count(&[10, 10, 3], 4, 0), 0);
         assert_eq!(prefill_chunk_count(&[10, 10, 3], 4, 10), 3);
@@ -412,6 +518,7 @@ mod tests {
                         3,
                         depth,
                         concurrent,
+                        128,
                         None,
                         Arc::new(AtomicUsize::new(0)),
                         Arc::new(AtomicU64::new(0)),
@@ -572,6 +679,7 @@ mod tests {
                         3,
                         1,
                         concurrent,
+                        128,
                         None,
                         Arc::new(AtomicUsize::new(0)),
                         Arc::new(AtomicU64::new(0)),
@@ -607,6 +715,7 @@ mod tests {
                 3,
                 1,
                 concurrent,
+                128,
                 None,
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicU64::new(0)),

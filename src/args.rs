@@ -415,6 +415,9 @@ pub struct Args {
     #[arg(long, value_name = "S", conflicts_with_all = ["pipeline_depth", "cpu_auto"], help = "Prefill S observation seconds in reusable RAM slots, then refill consumed slots during computation")]
     pub buffer_seconds: Option<f64>,
 
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1024), help = "Per-antenna packed input read batch in MiB (0: direct compute chunks; max 1024)")]
+    pub read_batch_mib: u32,
+
     #[arg(long, help = "Enable diagnostic debug logging to file (all frames)")]
     pub debug: bool,
 
