@@ -431,7 +431,7 @@ pub struct Args {
     #[arg(
         long,
         default_value_t = false,
-        help = "Use PNM06A+GAST and first-order VLBI minus delay model (overrides model environment variables; EOP unchanged)"
+        help = "Use PNM06A+GAST, first-order VLBI minus delay and nominal troposphere (overrides model environment variables; EOP unchanged)"
     )]
     pub vlbi: bool,
 

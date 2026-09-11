@@ -10,7 +10,7 @@ fn main() {
     let dec=geom::parse_dec("-13d04m49.5482s").unwrap();
     let epoch=60977.34375;
     let e=E::default();
-    println!("t,mean_anchored,pnm_geo,pnm_bary,pnm_minus,el1,el2,interp_error_s");
+    println!("t,mean_anchored,pnm_geo,pnm_bary,pnm_minus,el1,el2,interp_error_s,troposphere_s");
     let eval = |t:f64,s:S,d:D| {
         let m=epoch+t/86400.;
         let (r,de)=if s==S::MeanGast {geom::precess_j2000_to_mean_of_date(ra,dec,m+e.tt_minus_utc_s/86400.)} else {(ra,dec)};
@@ -30,6 +30,7 @@ fn main() {
             let approx=grid[10]+r*dt+ac*dt.powi(2)/2.+j*dt.powi(3)/6.+sn*dt.powi(4)/24.;
             worst=worst.max((approx-eval(t+dt,S::PnmGast,D::VlbiMinus)).abs());
         }
-        println!(",{worst:.17e}");
+        let tropo = geom::nominal_troposphere_delay(a,b,ra,dec,epoch+t/86400.,e,S::PnmGast);
+        println!(",{worst:.17e},{tropo:.17e}");
     }
 }

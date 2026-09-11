@@ -5438,6 +5438,7 @@ fn run_once(
         }
     };
     if args.vlbi {
+        println!("[info] VLBI atmosphere: nominal troposphere enabled (height-dependent dry path + 0.1 m zenith wet path); applied to sample delay and fringe phase");
         println!("[info] VLBI preset: PNM06A+GAST, first-order VLBI minus; overrides YI_SOURCE_VECTOR_MODE/YI_GEOM_DELAY_MODE; EOP unchanged; integer delay before FFT, fractional delay and fringe-stop after FFT");
     }
     if let (Some(ra_s), Some(dec_s)) = (ra_in, dec_in) {
@@ -5876,7 +5877,25 @@ fn run_once(
                     geom_delay_mode,
                     source_vector_mode,
                 );
-            Ok((gd_t, gr_t, ga_t))
+            let atmosphere = |m| {
+                if args.vlbi {
+                    geom::nominal_troposphere_delay(
+                        ant1_ecef,
+                        ant2_ecef,
+                        ra_t,
+                        dec_t,
+                        m,
+                        earth_orientation,
+                        source_vector_mode,
+                    )
+                } else {
+                    0.0
+                }
+            };
+            let at = atmosphere(mjd_t);
+            let am = atmosphere(mjd_t - 1.0 / 86400.0);
+            let ap = atmosphere(mjd_t + 1.0 / 86400.0);
+            Ok((gd_t + at, gr_t + (ap - am) / 2.0, ga_t + ap - 2.0 * at + am))
         } else {
             Ok((
                 gd0 + gr0 * elapsed_s + 0.5 * ga0 * elapsed_s * elapsed_s,
@@ -6727,7 +6746,20 @@ fn run_once(
                 geom_delay_mode,
                 source_vector_mode,
             );
-            delay_grid.push(gd_t);
+            let atmosphere = if args.vlbi {
+                geom::nominal_troposphere_delay(
+                    ant1_ecef,
+                    ant2_ecef,
+                    ra_t,
+                    dec_t,
+                    mjd_t,
+                    earth_orientation,
+                    source_vector_mode,
+                )
+            } else {
+                0.0
+            };
+            delay_grid.push(gd_t + atmosphere);
         }
 
         let sample = |i: usize, offset: isize| -> f64 {
@@ -6994,8 +7026,12 @@ fn run_once(
                 "[geom-diag:phase-convention] correction_cycles=-frequency_hz*delay_s rate_hz=-f*tau1 accel_hz_s=-f*tau2 jerk_hz_s2=-f*tau3 polynomial_deg=c0+c1*dt+c2*dt2+c3*dt3+c4*dt4"
             );
             println!(
-                "[geom-diag:not-modeled] troposphere ionosphere solid-earth-tide ocean-loading pole-tide station-velocity axis-offset gravitational-delay"
+                "[geom-diag:not-modeled] {}ionosphere solid-earth-tide ocean-loading pole-tide station-velocity axis-offset gravitational-delay",
+                if args.vlbi { "" } else { "troposphere " }
             );
+            if args.vlbi {
+                println!("[geom-diag:atmosphere] nominal troposphere included in correlation delay table; geometric variant comparisons exclude atmosphere");
+            }
             println!(
                 "[geom-diag:warning] pnm-era-engineering is a sign-control path, not standard CIO-plus-ERA"
             );

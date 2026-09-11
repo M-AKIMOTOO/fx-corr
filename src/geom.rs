@@ -530,6 +530,63 @@ pub fn source_az_el_with_eop_mode(
     (azimuth, elevation)
 }
 
+/// Nominal neutral-atmosphere delay (station 2 minus station 1), seconds.
+/// ESA Navipedia Tropospheric Delay equations 4 and 9:
+/// https://gssc.esa.int/navipedia/index.php/Tropospheric_Delay
+/// Ellipsoid height approximates altitude; zenith wet path is fixed at 0.1 m.
+pub fn nominal_troposphere_delay(
+    ant1: [f64; 3],
+    ant2: [f64; 3],
+    ra: f64,
+    dec: f64,
+    mjd: f64,
+    eop: EarthOrientation,
+    source_mode: SourceVectorMode,
+) -> f64 {
+    let station_path = |xyz: [f64; 3]| {
+        let (lat, lon) = ecef_geodetic_lat_lon(xyz);
+        let e2 = (1.0 / 298.257_223_563) * (2.0 - 1.0 / 298.257_223_563);
+        let height =
+            xyz[0] * lat.cos() * lon.cos() + xyz[1] * lat.cos() * lon.sin() + xyz[2] * lat.sin()
+                - 6_378_137.0 * (1.0 - e2 * lat.sin().powi(2)).sqrt();
+        let elevation = source_az_el_with_eop_mode(xyz, ra, dec, mjd, eop, source_mode).1;
+        let mapping = 1.001 / (0.002001 + elevation.max(0.0).sin().powi(2)).sqrt();
+        (2.3 * (-0.116e-3 * height).exp() + 0.1) * mapping
+    };
+    (station_path(ant2) - station_path(ant1)) / 299_792_458.0
+}
+
+#[cfg(test)]
+mod troposphere_tests {
+    use super::*;
+
+    #[test]
+    fn nominal_atmosphere_matches_independent_reference_and_baseline_sign() {
+        let a = [-3502544.587, 3950966.235, 3566381.192];
+        let b = [-3961788.974, 3243597.492, 3790597.692];
+        let ra = parse_ra("17h33m02.70628s").unwrap();
+        let dec = parse_dec("-13d04m49.5482s").unwrap();
+        // C ERFA geodetic heights + independently evaluated ESA nominal model.
+        for (t, expected) in [(0.0, 2.925772388144136e-9), (3590.0, 6.443165071883832e-9)] {
+            let m = 60977.34375 + t / 86400.0;
+            let eval = |x, y| {
+                nominal_troposphere_delay(
+                    x,
+                    y,
+                    ra,
+                    dec,
+                    m,
+                    EarthOrientation::default(),
+                    SourceVectorMode::PnmGast,
+                )
+            };
+            assert!((eval(a, b) - expected).abs() < 1e-16);
+            assert_eq!(eval(a, a), 0.0);
+            assert_eq!(eval(a, b), -eval(b, a));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BaselinePhaseBasis {
     pub u_lambda: f64,

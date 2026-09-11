@@ -42,6 +42,7 @@ ztd=2.3*np.exp(-.116e-3*h)+.1
 el=np.column_stack([y['el1'],y['el2']])
 mapping=1.001/np.sqrt(.002001+np.sin(el)**2)
 tropo=(mapping[:,1]*ztd[1]-mapping[:,0]*ztd[0])/C
+assert np.max(np.abs(tropo-y['troposphere_s'])) < 1e-16, 'Rust atmosphere differs from independent model'
 
 def detrend(time,values):
     x=(time-time.mean())/1800.
