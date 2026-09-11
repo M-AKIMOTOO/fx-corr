@@ -1,0 +1,154 @@
+{
+  "input": {
+    "epoch_mjd": 60977.34375,
+    "ra_rad": 4.59477606211041,
+    "dec_rad": -0.2282965720462692,
+    "ant1_m": [
+      -3502544.587,
+      3950966.235,
+      3566381.192
+    ],
+    "ant2_m": [
+      -3961788.974,
+      3243597.492,
+      3790597.692
+    ],
+    "carrier_hz": 6600000000.0,
+    "tt_minus_utc_s": 69.184,
+    "dut1_xp_yp": 0.0,
+    "nominal_ztd_m": [
+      2.3562099120072024,
+      2.368193914620272
+    ]
+  },
+  "quadratic_removed_360_rows": {
+    "CIO_vs_yi_PNM_GAST": {
+      "rms_deg": 1.7544999725871684e-05,
+      "peak_to_peak_deg": 9.070467714872299e-05,
+      "start_deg": 4.4868270871356586e-05,
+      "end_deg": -4.5836406277366404e-05
+    },
+    "ERFA_aberration_vs_yi_vlbi": {
+      "rms_deg": 0.001249772377692759,
+      "peak_to_peak_deg": 0.006501482653835655,
+      "start_deg": -0.003256912881564933,
+      "end_deg": 0.0032445697722707223
+    },
+    "IERS_kinematics_vs_yi_vlbi": {
+      "rms_deg": 1.7899421429118543,
+      "peak_to_peak_deg": 9.30493011767203,
+      "start_deg": 4.679876088702713,
+      "end_deg": -4.625054028969316
+    },
+    "VLBI_preset_correction_vs_old": {
+      "rms_deg": 34.04185386294752,
+      "peak_to_peak_deg": 177.10597989481175,
+      "start_deg": 89.04944226890802,
+      "end_deg": -88.05653762590373
+    },
+    "nominal_troposphere": {
+      "rms_deg": 46.02152504518225,
+      "peak_to_peak_deg": 241.9824229675578,
+      "start_deg": -104.32058901097298,
+      "end_deg": 137.66183395658481
+    }
+  },
+  "interpolation_max_deg": 0.1912820526972503,
+  "paired_13_rows": {
+    "observed_difference": {
+      "rms_deg": 57.60015636380649,
+      "peak_to_peak_deg": 190.8573239389662,
+      "start_deg": -86.2259195087795,
+      "end_deg": 104.6314044301867
+    },
+    "CIO_vs_yi_PNM_GAST": {
+      "after_subtraction": {
+        "rms_deg": 57.60017759569041,
+        "peak_to_peak_deg": 190.85739498252937,
+        "start_deg": -86.2259540064698,
+        "end_deg": 104.63144097605957
+      },
+      "correlation": -0.9953820059453116
+    },
+    "ERFA_aberration_vs_yi_vlbi": {
+      "after_subtraction": {
+        "rms_deg": 57.59865842279401,
+        "peak_to_peak_deg": 190.85233424920824,
+        "start_deg": -86.22341233290744,
+        "end_deg": 104.6289219163008
+      },
+      "correlation": 0.9924888529185425
+    },
+    "IERS_kinematics_vs_yi_vlbi": {
+      "after_subtraction": {
+        "rms_deg": 59.745029691382676,
+        "peak_to_peak_deg": 198.00177440490512,
+        "start_deg": -89.82600574733533,
+        "end_deg": 108.17576865756979
+      },
+      "correlation": -0.9920580802435149
+    },
+    "VLBI_preset_correction_vs_old": {
+      "after_subtraction": {
+        "rms_deg": 98.53109559380867,
+        "peak_to_peak_deg": 326.83523810164485,
+        "start_deg": -154.73007196635854,
+        "end_deg": 172.1051661352863
+      },
+      "correlation": -0.9921005485061803
+    },
+    "nominal_troposphere": {
+      "after_subtraction": {
+        "rms_deg": 1.596000090505372,
+        "peak_to_peak_deg": 5.255435527407883,
+        "start_deg": -2.813105622079547,
+        "end_deg": 2.442329905328336
+      },
+      "correlation": 0.9999816036469935
+    },
+    "troposphere_free_scale": 1.0277879768504883
+  },
+  "held_out_12_rows_fixed_prediction": {
+    "rms_deg": 1.3316817925124973,
+    "peak_to_peak_deg": 3.7398239884078066,
+    "errors_deg": [
+      -1.0944697933246061,
+      0.9806779764212479,
+      1.8165403663906545,
+      1.9094381186168903,
+      1.2851092855235038,
+      0.3168426102529338,
+      -0.626090184554414,
+      -1.430246771480597,
+      -1.8303858697909163,
+      -1.5524511851726857,
+      -0.7415601487300592,
+      1.2943461955073872
+    ]
+  },
+  "elevation_start_end_deg": [
+    [
+      34.94943035934645,
+      28.27682203284881
+    ],
+    [
+      26.489523696110222,
+      19.05717959772383
+    ]
+  ],
+  "nominal_tropo_start_end_ns": [
+    2.925772388144136,
+    6.443165071883832
+  ],
+  "public_sources": [
+    "https://raw.githubusercontent.com/liberfa/erfa/master/src/c2t06a.c",
+    "https://raw.githubusercontent.com/liberfa/erfa/master/src/ab.c",
+    "https://iers-conventions.obspm.fr/conventions/content/tn36.pdf (11.9; kinematics only)",
+    "https://gssc.esa.int/navipedia/index.php/Tropospheric_Delay (4,9; nominal sensitivity)"
+  ],
+  "residual_delay_13_rows": {
+    "before_rms_sample": 0.025014292843871362,
+    "after_rms_sample": 0.0010094843836558295,
+    "correlation": 0.9997709938597487
+  }
+}
