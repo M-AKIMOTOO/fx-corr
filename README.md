@@ -2710,6 +2710,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.6.0` | Release after validating the nominal troposphere correction on the 890 km YAMAGU32--HITACH32 VLBI baseline; residual short-timescale phase fluctuations remain as atmospheric variability. |
 | `3.5.6` | Adds the nominal troposphere delay model to the `--vlbi` preset. The delay is applied consistently to sample alignment, the geometric delay table, and fringe phase, with independent geometry and atmosphere validation. |
 | `3.5.5` | Runs both frinZ rate and acceleration phase solutions, uses the emitted corrected Rate/Acel values, re-correlates both candidates, and selects the statistically supported model by residual-phase BIC. The audit records residual phase standard deviation/RMS, rate RMS, delay MAD, and median S/N; candidate scans are resumable. |
 | `3.5.4` | Corrected automatic `frinZ --search acel` interpretation from radians to degrees. For the fitted degree polynomial `c2*t^2+c1*t+c0`, L clock increments are now `delay=c0/(360*f)`, `rate=c1/(360*f)`, and `accel=c2/(180*f)`. The resume final-solution signature is unit-tagged so v3.5.3 phasecal-on and phased products are invalidated while valid phasecal-off and group-delay products remain reusable. |
