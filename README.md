@@ -53,6 +53,19 @@ correlation workers. For example, `--cpu 30` gives 29 compute workers and one
 I/O CPU. With `--cpu 1`, computation and I/O share that CPU. Without `--cpu`,
 the total defaults to the available physical core count.
 
+On Unix, an explicit `yi-corr --cpu N` also reserves its CPU IDs for the
+process lifetime in `$HOME/.yi-corr`. Concurrent runs
+take the first free IDs in order, so with a full 0-31 affinity mask and no
+custom reader CPU, `--cpu 6`, another `--cpu 6`, and then `--cpu 12` receive
+IDs `0-5`, `6-11`, and `12-23`.
+At least two visible CPU IDs remain unreserved. If a request cannot fit while
+preserving that reserve, yi-corr exits with an explanatory error instead of
+sharing CPUs. The advisory lock in `$HOME/.yi-corr.lock` serializes updates;
+normal exit releases the entry and removes the registry when no claims remain.
+The next run removes entries left by dead processes. These are OS
+logical CPU IDs; SMT siblings may still share a physical core. The registry
+does not change the default allocation when `--cpu` is omitted.
+
 For normal correlation, add `--cpu-auto` to adapt the number of simultaneous
 compute jobs to measured input supply. `--cpu N` remains the total CPU limit,
 including the reserved I/O CPU. The worker pool stays allocated; fewer jobs
@@ -2710,6 +2723,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.7.0` | Adds coordinated CPU-core allocation for concurrent yi-corr processes and reuses partial correlation accumulators to improve compute throughput. |
 | `3.6.0` | Release after validating the nominal troposphere correction on the 890 km YAMAGU32--HITACH32 VLBI baseline; residual short-timescale phase fluctuations remain as atmospheric variability. |
 | `3.5.6` | Adds the nominal troposphere delay model to the `--vlbi` preset. The delay is applied consistently to sample alignment, the geometric delay table, and fringe phase, with independent geometry and atmosphere validation. |
 | `3.5.5` | Runs both frinZ rate and acceleration phase solutions, uses the emitted corrected Rate/Acel values, re-correlates both candidates, and selects the statistically supported model by residual-phase BIC. The audit records residual phase standard deviation/RMS, rate RMS, delay MAD, and median S/N; candidate scans are resumable. |

@@ -2473,11 +2473,27 @@ fn main() -> Result<(), DynError> {
         .map(|v| v.as_ref().clone())
         .or_else(core_affinity::get_core_ids)
         .ok_or("cannot determine allowed CPUs for I/O and computation")?;
+    let cpu_universe =
+        core_affinity::get_core_ids().ok_or("cannot determine the process-visible CPU set")?;
     let requested = args
         .cpu
         .unwrap_or_else(|| runtime_physical_cores().unwrap_or(allowed.len()));
-    let allocation =
-        affinity::allocate_cpus(&allowed, requested, affinity::reader_core_from_env()?)?;
+    let preferred_io = affinity::reader_core_from_env()?;
+    let (allocation, _cpu_reservation) = if args.cpu.is_some() && matches!(run_mode, RunMode::Corr)
+    {
+        let (allocation, reservation) =
+            affinity::reserve_cpus(&allowed, &cpu_universe, requested, preferred_io)?;
+        println!(
+            "[info] Cross-process CPU reservation: {} (at least 2 visible CPUs left unassigned)",
+            reservation.info()
+        );
+        (allocation, Some(reservation))
+    } else {
+        (
+            affinity::allocate_cpus(&allowed, requested, preferred_io)?,
+            None,
+        )
+    };
     let cpu_threads = allocation.workers.len();
     let reader_core = Some(allocation.io);
     if requested > allocation.total {
@@ -8764,8 +8780,12 @@ fn run_once(
                     + ant2_grid_extra_offset();
                 let mut out = chunk_starts
                     .into_par_iter()
-                    .map(|start| {
-                        let mut st = init();
+                    // Keep large spectra accumulators and FFT scratch alive across
+                    // multiple frame jobs in the same Rayon fold. Mapping each job
+                    // independently zeroed and reduced several full spectra per
+                    // input block, adding memory traffic that is especially costly
+                    // when the worker count is intentionally small.
+                    .fold(init, |mut st, start| {
                         let end = (start + frames_per_job).min(nf);
                         for i in start..end {
                             let d = frame_delays[i];
