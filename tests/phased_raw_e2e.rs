@@ -229,7 +229,7 @@ fn phased_raw_is_complete_and_can_be_read_by_yi_corr() {
         .exists());
     let meta = fs::read_to_string(&phased_meta).unwrap();
     assert!(meta.contains("format=yi-phasedarray-raw-v1"));
-    assert!(meta.contains("software_version=3.5.5"));
+    assert!(meta.contains(&format!("software_version={}", env!("CARGO_PKG_VERSION"))));
     assert!(meta.contains("virtual_station=ARRAY"));
     assert!(meta.contains("native_format_station=ANT1"));
     assert!(meta.contains("bit=2"));
@@ -814,7 +814,7 @@ fn small_io_chunks_preserve_integration_and_phased_raw_with_delay_drift() {
 }
 
 #[test]
-fn vlbi_flag_matches_explicit_models_on_short_and_long_baselines() {
+fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
     let root = unique_temp_dir();
     let raw_dir = root.join("raw");
     fs::create_dir_all(&raw_dir).unwrap();
@@ -848,7 +848,7 @@ fn vlbi_flag_matches_explicit_models_on_short_and_long_baselines() {
         )
         .unwrap();
         let mut products = Vec::new();
-        for run in 0..4 {
+        for run in 0..5 {
             let out = root.join(format!("{baseline}-{run}"));
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
             cmd.args([
@@ -877,6 +877,9 @@ fn vlbi_flag_matches_explicit_models_on_short_and_long_baselines() {
                     .env("YI_SOURCE_VECTOR_MODE", "mean-gast")
                     .env("YI_GEOM_DELAY_MODE", "vlbi-plus");
             }
+            if run == 4 {
+                cmd.arg("--vlbi");
+            }
             let result = cmd.output().unwrap();
             assert!(
                 result.status.success(),
@@ -885,6 +888,8 @@ fn vlbi_flag_matches_explicit_models_on_short_and_long_baselines() {
             );
             if run == 3 {
                 assert!(String::from_utf8_lossy(&result.stdout).contains("VLBI preset:"));
+                assert!(String::from_utf8_lossy(&result.stdout)
+                    .contains("VLBI atmosphere: nominal troposphere enabled"));
             }
             let files: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
                 .unwrap()
@@ -899,9 +904,13 @@ fn vlbi_flag_matches_explicit_models_on_short_and_long_baselines() {
             products[0], products[1],
             "legacy defaults changed: {baseline}"
         );
-        assert_eq!(
+        assert_ne!(
             products[2], products[3],
-            "preset differs from explicit model: {baseline}"
+            "VLBI troposphere did not affect the model: {baseline}"
+        );
+        assert_eq!(
+            products[3], products[4],
+            "VLBI preset did not override conflicting environment models: {baseline}"
         );
         assert_ne!(
             products[0], products[3],

@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "yi-corr"
-path = "src/main.rs"
+path = "src/yi_corr.rs"
 
 [[bin]]
 name = "xtask"
