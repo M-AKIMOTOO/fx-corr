@@ -1890,11 +1890,6 @@ fn resolve_input_paths(
             find_station_input_file(&data_dir, p1, &tag),
             find_station_input_file(&data_dir, p2, &tag),
         ) {
-            println!(
-                "[info] Auto-resolved inputs: {} / {}",
-                a1.display(),
-                a2.display()
-            );
             return Ok((a1, a2, pe.to_string(), tag));
         }
     }
@@ -2673,10 +2668,12 @@ fn run_cli() -> Result<(), DynError> {
                 meta.processes.len()
             );
             for (idx, p) in meta.processes.iter().enumerate() {
+                let object = p.object.as_deref().unwrap_or("-");
                 println!(
-                    "[info] process {}/{}: epoch={} skip={} length={}",
+                    "[info] process {}/{}: source={} epoch={} skip={} length={}",
                     idx + 1,
                     meta.processes.len(),
+                    object,
                     p.epoch,
                     p.skip_sec,
                     p.length_sec
@@ -2692,26 +2689,29 @@ fn run_cli() -> Result<(), DynError> {
                 match run_result {
                     Ok(()) => {
                         println!(
-                            "[info] process {}/{} elapsed: {:.3}s",
+                            "[info] process {}/{} source={} elapsed: {:.3}s",
                             idx + 1,
                             meta.processes.len(),
+                            object,
                             elapsed_sec
                         );
                     }
                     Err(e) if e.is::<InputFilesNotFound>() => {
                         println!(
-                            "[error] process {}/{} skipped after {:.3}s: {}",
+                            "[error] process {}/{} source={} skipped after {:.3}s: {}",
                             idx + 1,
                             meta.processes.len(),
+                            object,
                             elapsed_sec,
                             e
                         );
                     }
                     Err(e) => {
                         println!(
-                            "[error] process {}/{} failed after {:.3}s",
+                            "[error] process {}/{} source={} failed after {:.3}s",
                             idx + 1,
                             meta.processes.len(),
+                            object,
                             elapsed_sec
                         );
                         return Err(e);
@@ -5355,8 +5355,20 @@ fn run_once(
         .or_else(|| selected_process.as_ref().map(|p| p.epoch.clone()))
         .or_else(|| if_d.as_ref().and_then(|d| d.epoch.clone()))
         .unwrap_or("2000".into());
-    let (a1p, a2p, _, _unused_tag) =
-        resolve_input_paths(&args, &ep_i, if_d.as_ref().map(|v| &**v))?;
+    let (a1p, a2p, _, input_tag) = resolve_input_paths(&args, &ep_i, if_d.as_ref().map(|v| &**v))?;
+    let input_source = selected_process
+        .as_ref()
+        .and_then(|process| process.object.as_deref())
+        .or_else(|| if_d.as_ref().and_then(|data| data.source.as_deref()))
+        .unwrap_or("-");
+    println!(
+        "[info] Input files: source={} epoch={} tag={} ANT1={} ANT2={}",
+        input_source,
+        ep_i,
+        input_tag,
+        a1p.display(),
+        a2p.display()
+    );
     let (c_unix_base, process_epoch_tag) = epoch_to_yyyydddhhmmss(&ep_i)?;
     let ant1_ecef = if_d
         .as_ref()
