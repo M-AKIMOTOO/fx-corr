@@ -21,10 +21,10 @@ pub(crate) fn accumulate_direct_acf_xcf(
     phase_start: Complex<f64>,
     phase_step: Complex<f64>,
 ) {
-    assert_eq!(spectrum1.len(), spectrum2.len());
-    assert_eq!(spectrum1.len(), acc11.len());
-    assert_eq!(spectrum1.len(), acc12.len());
-    assert_eq!(spectrum1.len(), acc22.len());
+    debug_assert_eq!(spectrum1.len(), spectrum2.len());
+    debug_assert_eq!(spectrum1.len(), acc11.len());
+    debug_assert_eq!(spectrum1.len(), acc12.len());
+    debug_assert_eq!(spectrum1.len(), acc22.len());
 
     const LANES: usize = 8;
     let mut phases = [phase_start; LANES];

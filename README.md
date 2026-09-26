@@ -192,10 +192,12 @@ By default, input raw files are auto-resolved from:
 
 Expected pattern:
 
-- `<DIR>/<ANT1_NAME>_<YYYYDDDhhmmss>.raw`
-- `<DIR>/<ANT2_NAME>_<YYYYDDDhhmmss>.raw`
+- `<DIR>/<ANT1_NAME>_<YYYYDDDhhmmss>.raw` or `.vdif`
+- `<DIR>/<ANT2_NAME>_<YYYYDDDhhmmss>.raw` or `.vdif`
 
 Fallback station names are `YAMAGU32` and `YAMAGU34`.
+When processing all schedule scans, a scan with missing input files is reported
+as an error and skipped; processing continues with the next scan.
 
 You can override auto-resolution with explicit files:
 

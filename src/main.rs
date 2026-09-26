@@ -1844,12 +1844,33 @@ fn advise_sequential_readahead(file: &File) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn advise_sequential_readahead(_file: &File) {}
 
+#[derive(Debug)]
+struct InputFilesNotFound;
+
+impl std::fmt::Display for InputFilesNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Input files not found")
+    }
+}
+
+impl std::error::Error for InputFilesNotFound {}
+
+fn find_station_input_file(data_dir: &Path, station: &str, tag: &str) -> Option<PathBuf> {
+    ["raw", "vdif"].into_iter().find_map(|extension| {
+        let path = data_dir.join(format!("{station}_{tag}.{extension}"));
+        path.is_file().then_some(path)
+    })
+}
+
 fn resolve_input_paths(
     args: &args::Args,
     pe: &str,
     meta: Option<&ifile::IFileData>,
 ) -> Result<(PathBuf, PathBuf, String, String), DynError> {
     if let (Some(a1), Some(a2)) = (&args.ant1, &args.ant2) {
+        if !a1.is_file() || !a2.is_file() {
+            return Err(InputFilesNotFound.into());
+        }
         let (_, tag) = epoch_to_yyyydddhhmmss(pe)?;
         return Ok((a1.clone(), a2.clone(), pe.to_string(), tag));
     }
@@ -1865,9 +1886,10 @@ fn resolve_input_paths(
         }
     }
     for (p1, p2) in candidates {
-        let a1 = data_dir.join(format!("{}_{}.raw", p1, tag));
-        let a2 = data_dir.join(format!("{}_{}.raw", p2, tag));
-        if a1.exists() && a2.exists() {
+        if let (Some(a1), Some(a2)) = (
+            find_station_input_file(&data_dir, p1, &tag),
+            find_station_input_file(&data_dir, p2, &tag),
+        ) {
             println!(
                 "[info] Auto-resolved inputs: {} / {}",
                 a1.display(),
@@ -1876,7 +1898,55 @@ fn resolve_input_paths(
             return Ok((a1, a2, pe.to_string(), tag));
         }
     }
-    Err("Input files not found".into())
+    Err(InputFilesNotFound.into())
+}
+
+#[cfg(test)]
+mod input_resolution_tests {
+    use super::find_station_input_file;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_input_dir() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fx-corr-input-resolution-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temporary input directory");
+        dir
+    }
+
+    #[test]
+    fn resolves_raw_or_vdif_and_prefers_raw_when_both_exist() {
+        let dir = temporary_input_dir();
+        let raw = dir.join("ANT_2025302081500.raw");
+        let vdif = dir.join("ANT_2025302081500.vdif");
+
+        std::fs::write(&vdif, []).expect("create VDIF input");
+        assert_eq!(
+            find_station_input_file(&dir, "ANT", "2025302081500"),
+            Some(vdif.clone())
+        );
+
+        std::fs::write(&raw, []).expect("create raw input");
+        assert_eq!(
+            find_station_input_file(&dir, "ANT", "2025302081500"),
+            Some(raw)
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove temporary input directory");
+    }
+
+    #[test]
+    fn returns_none_when_raw_and_vdif_are_missing() {
+        let dir = temporary_input_dir();
+        assert_eq!(find_station_input_file(&dir, "ANT", "2025302081500"), None);
+        std::fs::remove_dir_all(dir).expect("remove temporary input directory");
+    }
 }
 
 fn resolve_output_layout(
@@ -2418,7 +2488,7 @@ fn print_schedule_summary(
     print_ant_table(&ant1_label, &ant2_label, &ant_rows);
 }
 
-fn main() -> Result<(), DynError> {
+fn run_cli() -> Result<(), DynError> {
     let args = args::Args::parse();
     if args.mkxml {
         let out = PathBuf::from("example.xml");
@@ -2628,6 +2698,15 @@ fn main() -> Result<(), DynError> {
                             elapsed_sec
                         );
                     }
+                    Err(e) if e.is::<InputFilesNotFound>() => {
+                        println!(
+                            "[error] process {}/{} skipped after {:.3}s: {}",
+                            idx + 1,
+                            meta.processes.len(),
+                            elapsed_sec,
+                            e
+                        );
+                    }
                     Err(e) => {
                         println!(
                             "[error] process {}/{} failed after {:.3}s",
@@ -2643,6 +2722,16 @@ fn main() -> Result<(), DynError> {
         }
     }
     run_once(args, run_mode, cpu_threads, reader_core)
+}
+
+fn main() -> Result<(), DynError> {
+    match run_cli() {
+        Err(error) if error.is::<InputFilesNotFound>() => {
+            println!("[error] {error}; skipping process");
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn same_validation_scan(a: &ifile::ProcessEntry, b: &ifile::ProcessEntry) -> bool {

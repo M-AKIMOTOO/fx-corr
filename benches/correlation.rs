@@ -36,7 +36,7 @@ fn legacy(
 fn main() {
     benchmark_delay_model();
     println!("bins legacy_ns/bin new_ns/bin speedup legacy_max_error new_max_error");
-    for n in [1025, 3200, 4097, 32769, 524289] {
+    for n in [169, 1025, 3200, 4097, 32769, 524289] {
         let s1 = vec![Complex::new(1.0_f32, 0.0); n];
         let s2 = s1.clone();
         let mut a11 = vec![0.0; n];
