@@ -2483,6 +2483,81 @@ fn print_schedule_summary(
     print_ant_table(&ant1_label, &ant2_label, &ant_rows);
 }
 
+fn mk_xml_handoff_args(
+    schedule: &Path,
+    process_index: Option<usize>,
+    sample_delay: f64,
+    sample_rate: f64,
+) -> Vec<String> {
+    let scan = process_index.unwrap_or(0).saturating_add(1);
+    vec![
+        format!("--xml={}", schedule.display()),
+        format!("--scan={scan}"),
+        format!("--sample-delay={sample_delay:.17e}"),
+        format!("--sample-rate={sample_rate:.17e}"),
+        "--yes".to_string(),
+    ]
+}
+
+fn print_mk_xml_handoff(args: &args::Args, run_mode: RunMode, sample_delay: f64, sample_rate: f64) {
+    if !matches!(run_mode, RunMode::Corr) {
+        return;
+    }
+    let Some(schedule) = args.schedule.as_deref() else {
+        return;
+    };
+    if !schedule
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
+    {
+        return;
+    }
+
+    let scan = args.process_index.unwrap_or(0).saturating_add(1);
+    println!("[mk_xml-args-begin] scan={scan}");
+    println!("[info] mk_xml.py args (one shell argument per following line):");
+    println!("[info] mk_xml.py sample-delay/rate use this run's delay+resdelay [samples] and rate+resrate [Hz].");
+    for argument in mk_xml_handoff_args(schedule, args.process_index, sample_delay, sample_rate) {
+        println!("[mk_xml-arg] {argument}");
+    }
+    println!("[mk_xml-args-end]");
+}
+
+#[cfg(test)]
+mod mk_xml_handoff_tests {
+    use super::mk_xml_handoff_args;
+    use std::path::Path;
+
+    #[test]
+    fn emits_shell_parseable_xml_scan_and_corrections() {
+        let args = mk_xml_handoff_args(
+            Path::new("/tmp/schedule with spaces.xml"),
+            Some(3),
+            12.5,
+            -0.25,
+        );
+
+        assert_eq!(args[0], "--xml=/tmp/schedule with spaces.xml");
+        assert_eq!(args[1], "--scan=4");
+        assert_eq!(
+            args[2].split_once('=').unwrap().1.parse::<f64>().unwrap(),
+            12.5
+        );
+        assert_eq!(
+            args[3].split_once('=').unwrap().1.parse::<f64>().unwrap(),
+            -0.25
+        );
+        assert_eq!(args[4], "--yes");
+    }
+
+    #[test]
+    fn defaults_single_process_to_scan_one() {
+        let args = mk_xml_handoff_args(Path::new("schedule.xml"), None, 0.0, 0.0);
+        assert_eq!(args[1], "--scan=1");
+    }
+}
+
 fn run_cli() -> Result<(), DynError> {
     let args = args::Args::parse();
     if args.mkxml {
@@ -6363,6 +6438,7 @@ fn run_once(
                 bw_mhz: meta.ant2_bw_mhz,
             };
             print_schedule_summary(sch, meta, &gv, &a1v, &a2v, !args.compact_logs);
+            print_mk_xml_handoff(&args, run_mode, delay_user_samples, rate_user_hz);
         }
     }
 
