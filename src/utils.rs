@@ -16,6 +16,7 @@ pub struct FftHelper {
 
 pub struct FftScratch {
     forward_r2c: Vec<Complex<f32>>,
+    inverse_c2r: Vec<Complex<f32>>,
 }
 
 impl FftHelper {
@@ -43,21 +44,16 @@ impl FftHelper {
         }
         Ok(())
     }
-    pub fn forward_r2c_process(
-        &self,
-        input: &mut [f32],
-        output: &mut [Complex<f32>],
-    ) -> Result<(), DynError> {
-        if input.len() != self.len || output.len() != self.len / 2 + 1 {
-            return Err("Length mismatch".into());
-        }
-        self.forward_r2c.process(input, output)?;
-        Ok(())
-    }
-    pub fn make_scratch(&self) -> FftScratch {
+    pub fn make_forward_scratch(&self) -> FftScratch {
         FftScratch {
             forward_r2c: self.forward_r2c.make_scratch_vec(),
+            inverse_c2r: Vec::new(),
         }
+    }
+    pub fn make_scratch(&self) -> FftScratch {
+        let mut scratch = self.make_forward_scratch();
+        scratch.inverse_c2r = self.inverse_c2r.make_scratch_vec();
+        scratch
     }
     pub fn forward_r2c_process_with_scratch(
         &self,
@@ -72,15 +68,17 @@ impl FftHelper {
             .process_with_scratch(input, output, &mut scratch.forward_r2c)?;
         Ok(())
     }
-    pub fn inverse_c2r_process(
+    pub fn inverse_c2r_process_with_scratch(
         &self,
         spectrum: &mut [Complex<f32>],
         output: &mut [f32],
+        scratch: &mut FftScratch,
     ) -> Result<(), DynError> {
         if spectrum.len() != self.len / 2 + 1 || output.len() != self.len {
             return Err("Length mismatch".into());
         }
-        self.inverse_c2r.process(spectrum, output)?;
+        self.inverse_c2r
+            .process_with_scratch(spectrum, output, &mut scratch.inverse_c2r)?;
         let scale = 1.0_f32 / self.len as f32;
         for value in output.iter_mut() {
             *value *= scale;
@@ -406,6 +404,109 @@ pub fn decode_block_into_with_plan(
     Ok(())
 }
 
+/// Quantize directly into the output block. Four byte tables replace the
+/// 32 individual bit permutations for each native recorder word.
+pub struct QuantizePlan {
+    bits: usize,
+    levels: Vec<f32>,
+    shuffle_bytes: Box<[[u32; 256]; 4]>,
+}
+
+impl QuantizePlan {
+    pub fn new(bits: usize, levels: &[f64], shuffle: &[usize]) -> Result<Self, DynError> {
+        if !(1..=32).contains(&bits) || levels.is_empty() {
+            return Err("invalid quantization bit depth or empty level map".into());
+        }
+        if shuffle.len() != 32 || shuffle.iter().any(|&target| target >= 32) {
+            return Err("output shuffle must contain 32 bit positions in 0..32".into());
+        }
+        let mut shuffle_bytes = Box::new([[0; 256]; 4]);
+        for byte in 0..4 {
+            for value in 0..256 {
+                for bit in 0..8 {
+                    shuffle_bytes[byte][value] |=
+                        (((value >> bit) & 1) as u32) << shuffle[byte * 8 + bit];
+                }
+            }
+        }
+        Ok(Self {
+            bits,
+            levels: levels.iter().map(|&level| level as f32).collect(),
+            shuffle_bytes,
+        })
+    }
+
+    #[inline]
+    fn shuffle_word(&self, word: u32) -> [u8; 4] {
+        let bytes = word.to_le_bytes();
+        (self.shuffle_bytes[0][bytes[0] as usize]
+            | self.shuffle_bytes[1][bytes[1] as usize]
+            | self.shuffle_bytes[2][bytes[2] as usize]
+            | self.shuffle_bytes[3][bytes[3] as usize])
+            .to_le_bytes()
+    }
+
+    #[inline]
+    fn nearest_code(value: f32, levels: &[f32]) -> usize {
+        let mut best = 0;
+        let mut min_error = f32::MAX;
+        for (code, &level) in levels.iter().enumerate() {
+            let error = (value - level).abs();
+            // Preserve the original lower-code tie break and NaN behavior.
+            if error < min_error {
+                min_error = error;
+                best = code;
+            }
+        }
+        best
+    }
+
+    pub fn quantise_into(&self, samples: &[f32], output: &mut [u8]) -> Result<(), DynError> {
+        let total_bits = samples
+            .len()
+            .checked_mul(self.bits)
+            .ok_or("output size overflow")?;
+        if output.len() != total_bits.div_ceil(32) * 4 {
+            return Err("quantized output buffer length mismatch".into());
+        }
+        if self.bits == 2 && self.levels.len() == 4 {
+            let levels: &[f32; 4] = self.levels.as_slice().try_into().unwrap();
+            for (frame, word_out) in samples.chunks(16).zip(output.chunks_exact_mut(4)) {
+                let mut word = 0u32;
+                for (sample, &value) in frame.iter().enumerate() {
+                    word |= (Self::nearest_code(value, levels) as u32) << (sample * 2);
+                }
+                word_out.copy_from_slice(&self.shuffle_word(word));
+            }
+        } else {
+            let mask = (1u64 << self.bits) - 1;
+            let mut word = 0u64;
+            let mut bits = 0;
+            let mut words = output.chunks_exact_mut(4);
+            for &value in samples {
+                word |= (Self::nearest_code(value, &self.levels) as u64 & mask) << bits;
+                bits += self.bits;
+                if bits >= 32 {
+                    words
+                        .next()
+                        .unwrap()
+                        .copy_from_slice(&self.shuffle_word(word as u32));
+                    word >>= 32;
+                    bits -= 32;
+                }
+            }
+            if bits != 0 {
+                words
+                    .next()
+                    .unwrap()
+                    .copy_from_slice(&self.shuffle_word(word as u32));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub fn quantise_frame(
     samples: &[f32],
     bits: usize,
@@ -480,6 +581,50 @@ pub fn safe_arg(z: &Complex<f64>) -> f64 {
 #[cfg(test)]
 mod decode_tests {
     use super::*;
+
+    #[test]
+    fn planned_quantization_matches_scalar_at_boundaries_and_word_tails() {
+        let maps = [
+            (0..32).collect::<Vec<_>>(),
+            (0..32).rev().collect(),
+            (0..32).map(|i| i ^ 24).collect(),
+            (0..32).map(|i| (i * 13 + 7) % 32).collect(),
+        ];
+        for bits in [1, 2, 3, 4, 8] {
+            let levels: Vec<_> = (0..1usize << bits).map(|i| i as f64 - 1.5).collect();
+            let mut samples = vec![
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::MAX,
+                -f32::MAX,
+            ];
+            for &level in &levels {
+                let midpoint = level as f32 + 0.5;
+                samples.extend([level as f32, midpoint, midpoint - 1e-6, midpoint + 1e-6]);
+            }
+            for shuffle in &maps {
+                let plan = QuantizePlan::new(bits, &levels, shuffle).unwrap();
+                for n in (0..=33.min(samples.len())).chain(std::iter::once(samples.len())) {
+                    let mut reference = Vec::new();
+                    quantise_frame(&samples[..n], bits, &levels, shuffle, &mut reference).unwrap();
+                    let mut actual = vec![0xa5; reference.len()];
+                    plan.quantise_into(&samples[..n], &mut actual).unwrap();
+                    assert_eq!(actual, reference, "bits={bits} n={n} shuffle={shuffle:?}");
+                }
+            }
+        }
+        // Arbitrary, unsorted level maps retain their original code ordering.
+        let levels = [1.5, -0.5, -1.5, 0.5];
+        let samples = [-2.0, -1.0, 0.0, 1.0, 2.0, f32::NAN];
+        let mut reference = Vec::new();
+        quantise_frame(&samples, 2, &levels, &maps[2], &mut reference).unwrap();
+        let plan = QuantizePlan::new(2, &levels, &maps[2]).unwrap();
+        let mut actual = vec![0; reference.len()];
+        plan.quantise_into(&samples, &mut actual).unwrap();
+        assert_eq!(actual, reference);
+        assert!(plan.quantise_into(&samples, &mut []).is_err());
+    }
 
     #[test]
     fn packed2_byte_tables_match_independent_bit_permutation() {

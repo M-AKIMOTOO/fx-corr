@@ -53,7 +53,23 @@ correlation workers. For example, `--cpu 30` gives 29 compute workers and one
 I/O CPU. With `--cpu 1`, computation and I/O share that CPU. Without `--cpu`,
 the total defaults to the available physical core count.
 
-On Unix, an explicit `yi-corr --cpu N` also reserves its CPU IDs for the
+To compare CPU pinning at the same worker count, add `--no-affinity`:
+
+```bash
+time yi-corr --sc test.xml --raw raw --cor cor-pinned --cpu 10
+time yi-corr --sc test.xml --raw raw --cor cor-unpinned --cpu 10 --no-affinity
+```
+
+Both runs use nine compute workers. With `--no-affinity`, workers, input
+readers, and output processing can run anywhere within the inherited OS CPU
+mask (for example, a `taskset` or cpuset restriction). `--cpu` then controls
+the worker count, not a fixed CPU set; no physical CPU is reserved for I/O.
+This mode ignores the affinity file and `YI_READER_CORE`, and bypasses the
+cross-process CPU reservation registry, so concurrent runs may share CPUs.
+Repeat the comparison in alternating order with the same input, chunk size,
+and queue depth; input caching can otherwise obscure the effect of pinning.
+
+With pinning enabled, on Unix an explicit `yi-corr --cpu N` also reserves its CPU IDs for the
 process lifetime in `$HOME/.yi-corr`. Concurrent runs
 take the first free IDs in order, so with a full 0-31 affinity mask and no
 custom reader CPU, `--cpu 6`, another `--cpu 6`, and then `--cpu 12` receive
@@ -360,6 +376,7 @@ USB sideband 指定ではない。
 | `--output DIR` | raw、meta、diagnostic の出力先 |
 | `--phased-name NAME` | 仮想局名。default `YAMAGU66` |
 | `--cpu N` | I/O 用1論理CPUを含む総数。計算は N−1、N=1 は共用 |
+| `--no-affinity` | 計算 worker 数を維持し、CPU 固定・プロセス間 CPU 予約を解除。OS の許可 CPU 集合内で実行 |
 | `--chunk-frames N` | 内部読み込み単位。XML の積算時間とは独立。既定は2局合計約16 MiB以下 |
 | `--usb` | USB 接続 storage 向けの読み出し調整 |
 | `--tsys/--gain/--sefd/--diameter/--eta` | 局別の感度重み |
@@ -2488,6 +2505,7 @@ About the `0.5` factor:
 Performance:
 
 - `--cpu <N>`
+- `--no-affinity` (keep worker count; disable pinning and CPU reservations)
 - `--chunk-frames <N>`
 - `--usb` (read the two antenna files concurrently on USB-attached storage; unrelated to USB signal sideband)
 - `--pipeline-depth <N>`
@@ -2725,6 +2743,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.8.0` | Reuses per-worker decode/FFT/accumulation buffers across input chunks, fuses phased spectrum mapping/correction/synthesis, skips unused diagnostics, and quantizes directly into packed output with precomputed bit-shuffle tables. Adds `--no-affinity` at unchanged worker counts and an ACF-free fast kernel for internal XCF-only workflows. Includes reproducible [throughput measurements](docs/fx-corr-performance.md) and mixed-bit/rotated-grid output regression tests. |
 | `3.7.0` | Adds coordinated CPU-core allocation for concurrent yi-corr processes and reuses partial correlation accumulators to improve compute throughput. |
 | `3.6.0` | Release after validating the nominal troposphere correction on the 890 km YAMAGU32--HITACH32 VLBI baseline; residual short-timescale phase fluctuations remain as atmospheric variability. |
 | `3.5.6` | Adds the nominal troposphere delay model to the `--vlbi` preset. The delay is applied consistently to sample alignment, the geometric delay table, and fringe phase, with independent geometry and atmosphere validation. |
@@ -2866,7 +2885,9 @@ frame 数は常に完全な FFT frame に限定する。ただし理論上整数
 
 ## CPU affinity (optional)
 
-If present, the file below is used to pin rayon workers:
+By default, compute workers and I/O are pinned even without a configuration
+file. `--no-affinity` disables these pins and ignores the configuration below.
+If present, this file selects the allowed CPU group:
 
 - `$CARGO_HOME/tmp/yi-corr-affinity.txt`
 - or `~/.cargo/tmp/yi-corr-affinity.txt`
@@ -2888,7 +2909,7 @@ The input reader thread can also be pinned independently for I/O experiments:
 YI_READER_CORE=0 yi-corr --sc schedule.xml --raw raw --cor cor --cpu 13
 ```
 
-`YI_READER_CORE` accepts the same core-number syntax, but only the first available core is used. Keep the chosen reader core out of the worker affinity set, or reduce `--cpu` accordingly, if you want to reserve it exclusively for input transfer.
+`YI_READER_CORE` accepts the same core-number syntax, but only the first available core is used. It must be inside the allowed CPU group. With `--cpu N` where N > 1, the selected I/O CPU is excluded from compute workers automatically. `--no-affinity` ignores this variable.
 
 ## Example full command (2-station corr)
 

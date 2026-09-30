@@ -381,6 +381,12 @@ pub struct Args {
 
     #[arg(
         long,
+        help = "Keep the compute worker count but disable CPU pinning and cross-process reservations (ignore affinity file and YI_READER_CORE; respect inherited OS CPU mask)"
+    )]
+    pub no_affinity: bool,
+
+    #[arg(
+        long,
         help = "Adapt simultaneous compute jobs to measured input supply (--cpu is the total CPU limit; yi-corr only)"
     )]
     pub cpu_auto: bool,

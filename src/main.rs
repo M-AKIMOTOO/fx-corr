@@ -40,12 +40,12 @@ use args::{
 use cor::{
     epoch_to_yyyydddhhmmss, unix_seconds_to_yyyydddhhmmss, CorHeaderConfig, CorStation, CorWriter,
 };
-use corr_kernel::{accumulate_direct_acf_xcf, phase_to_f32};
+use corr_kernel::{accumulate_direct_acf_xcf, accumulate_direct_xcf, phase_to_f32};
 use plot::{plot_multi_series_f64_x, plot_series_f64_x, plot_series_with_x, BLUE, GREEN, RED};
 use pulsar::{FoldAccum, FoldProduct, PulsarRuntime};
 use utils::{
-    build_decode_plan, decode_block_into_with_plan, quantise_frame, DecodePlan, DynError,
-    FftHelper, FftScratch,
+    build_decode_plan, decode_block_into_with_plan, DecodePlan, DynError, FftHelper, FftScratch,
+    QuantizePlan,
 };
 use xcf::finalize_cross_spectrum;
 
@@ -287,6 +287,7 @@ fn contiguous_real_fft_src_start(
 #[cfg(test)]
 mod correlation_hot_path_tests {
     use super::*;
+    use crate::utils::quantise_frame;
 
     #[test]
     fn decoded_windows_match_full_decode_with_boundary_padding() {
@@ -2604,12 +2605,17 @@ fn run_cli() -> Result<(), DynError> {
     if args.cpu_auto && !matches!(run_mode, RunMode::Corr) {
         return Err("--cpu-auto is supported only by yi-corr".into());
     }
-    let affinity_runtime = affinity::AffinityRuntime::from_default_file()?;
-    if let Some(msg) = affinity_runtime.info() {
+    let affinity_runtime = if args.no_affinity {
+        None
+    } else {
+        Some(affinity::AffinityRuntime::from_default_file()?)
+    };
+    if let Some(msg) = affinity_runtime.as_ref().and_then(|runtime| runtime.info()) {
         println!("[info] {msg}");
     }
     let allowed = affinity_runtime
-        .worker_cores()
+        .as_ref()
+        .and_then(|runtime| runtime.worker_cores())
         .map(|v| v.as_ref().clone())
         .or_else(core_affinity::get_core_ids)
         .ok_or("cannot determine allowed CPUs for I/O and computation")?;
@@ -2618,55 +2624,67 @@ fn run_cli() -> Result<(), DynError> {
     let requested = args
         .cpu
         .unwrap_or_else(|| runtime_physical_cores().unwrap_or(allowed.len()));
-    let preferred_io = affinity::reader_core_from_env()?;
-    let (allocation, _cpu_reservation) = if args.cpu.is_some() && matches!(run_mode, RunMode::Corr)
-    {
-        let (allocation, reservation) =
-            affinity::reserve_cpus(&allowed, &cpu_universe, requested, preferred_io)?;
-        println!(
+    let preferred_io = if args.no_affinity {
+        None
+    } else {
+        affinity::reader_core_from_env()?
+    };
+    let (allocation, _cpu_reservation) =
+        if !args.no_affinity && args.cpu.is_some() && matches!(run_mode, RunMode::Corr) {
+            let (allocation, reservation) =
+                affinity::reserve_cpus(&allowed, &cpu_universe, requested, preferred_io)?;
+            println!(
             "[info] Cross-process CPU reservation: {} (at least 2 visible CPUs left unassigned)",
             reservation.info()
         );
-        (allocation, Some(reservation))
-    } else {
-        (
-            affinity::allocate_cpus(&allowed, requested, preferred_io)?,
-            None,
-        )
-    };
+            (allocation, Some(reservation))
+        } else {
+            (
+                affinity::allocate_cpus(&allowed, requested, preferred_io)?,
+                None,
+            )
+        };
     let cpu_threads = allocation.workers.len();
-    let reader_core = Some(allocation.io);
+    let reader_core = (!args.no_affinity).then_some(allocation.io);
     if requested > allocation.total {
         println!(
             "[info] CPU request {} limited to {} allowed CPUs",
             requested, allocation.total
         );
     }
-    println!(
-        "[info] CPU allocation: total={} I/O CPU={} compute-threads={} compute-CPUs={}{}",
-        allocation.total,
-        allocation.io.id,
-        cpu_threads,
-        allocation
-            .workers
-            .iter()
-            .map(|c| c.id.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        if allocation.total == 1 {
-            " (single CPU shared with I/O)"
-        } else {
-            ""
-        }
-    );
-    let core_ids = allocation.workers;
-    let tp_builder = rayon::ThreadPoolBuilder::new()
-        .num_threads(cpu_threads)
-        .start_handler(move |thread_idx| {
+    if args.no_affinity {
+        println!(
+            "[info] CPU allocation: total={} compute-threads={} affinity=disabled (I/O and compute use inherited OS CPU mask; no cross-process CPU reservation)",
+            allocation.total, cpu_threads
+        );
+    } else {
+        println!(
+            "[info] CPU allocation: total={} I/O CPU={} compute-threads={} compute-CPUs={}{}",
+            allocation.total,
+            allocation.io.id,
+            cpu_threads,
+            allocation
+                .workers
+                .iter()
+                .map(|c| c.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            if allocation.total == 1 {
+                " (single CPU shared with I/O)"
+            } else {
+                ""
+            }
+        );
+    }
+    let mut tp_builder = rayon::ThreadPoolBuilder::new().num_threads(cpu_threads);
+    if !args.no_affinity {
+        let core_ids = allocation.workers;
+        tp_builder = tp_builder.start_handler(move |thread_idx| {
             if !core_affinity::set_for_current(core_ids[thread_idx % core_ids.len()]) {
                 eprintln!("[warn] failed to pin compute worker {}", thread_idx);
             }
         });
+    }
     tp_builder
         .build_global()
         .map_err(|e| format!("failed to configure rayon thread pool: {e}"))?;
@@ -7602,7 +7620,7 @@ fn run_once(
                 f2: vec![0.0_f32; fft_len],
                 s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
                 s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
-                fft_scratch: helper.make_scratch(),
+                fft_scratch: helper.make_forward_scratch(),
                 dw1: DecodeWindowScratch::new(),
                 dw2: DecodeWindowScratch::new(),
             };
@@ -8377,7 +8395,7 @@ fn run_once(
             Arc::clone(&synth_produced_chunks),
             Arc::clone(&synth_produced_bytes),
         );
-        let need_phased_products = write_raw || write_phased_cor || plot_phased;
+        let need_phased_products = write_phased_cor || plot_phased;
         let need_acf_products = write_acf_cor;
         let need_xcf_products = write_xcf_cor;
         let fft_peak_debug = fft_peak_dbg_enabled();
@@ -8387,9 +8405,7 @@ fn run_once(
         // Frequency-grid maps are constant for the whole process.  Building
         // them inside every output sector is especially expensive for very
         // large FFTs, where a map pair can occupy many MiB.
-        let normal_grid_maps = if write_raw {
-            None
-        } else {
+        let normal_grid_maps = {
             let half = fft_len / 2 + 1;
             let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
             let station_offset2 =
@@ -8417,8 +8433,16 @@ fn run_once(
         } else {
             None
         };
-        let mut acc_11_total = vec![0.0; fft_len / 2 + 1];
-        let mut acc_22_total = vec![0.0; fft_len / 2 + 1];
+        let mut acc_11_total = if plot_phased {
+            vec![0.0; fft_len / 2 + 1]
+        } else {
+            Vec::new()
+        };
+        let mut acc_22_total = if plot_phased {
+            vec![0.0; fft_len / 2 + 1]
+        } else {
+            Vec::new()
+        };
         if need_xcf_products {
             println!(
                 "[info] XCF phase bins: a1=[{}..{}) a2=[{}..{}) rotation_bins=({}, {}) phase_start_used_raw=({}, {}) phase_start_xml=({}, {}) overlap_bins={}",
@@ -8467,8 +8491,143 @@ fn run_once(
             .cpu_auto
             .then(|| cpu_balance::Balance::new(cpu_threads));
         if cpu_balance.is_some() {
-            println!("[info] CPU auto: max-compute-jobs={} initial={} (I/O CPU reserved; continuous input/compute sampling)", cpu_threads, cpu_threads);
+            println!(
+                "[info] CPU auto: max-compute-jobs={} initial={} ({}; continuous input/compute sampling)",
+                cpu_threads,
+                cpu_threads,
+                if reader_core.is_some() { "I/O CPU reserved" } else { "CPU affinity disabled" }
+            );
         }
+        // Retain one workspace per compute worker across every input block.
+        // RAW without diagnostics allocates no power/visibility arrays.
+        struct RawThreadAccum {
+            f1: Vec<f32>,
+            f2: Vec<f32>,
+            s1: Vec<Complex<f32>>,
+            s2: Vec<Complex<f32>>,
+            cb: Vec<Complex<f32>>,
+            out_t: Vec<f32>,
+            fft_scratch: FftScratch,
+            dw1: DecodeWindowScratch,
+            dw2: DecodeWindowScratch,
+            pow_ph: Vec<f64>,
+            pow_11: Vec<f64>,
+            pow_12: Vec<Complex<f64>>,
+            pow_22: Vec<f64>,
+            acc_ph: Vec<f64>,
+            acc_11: Vec<f64>,
+            acc_12: Vec<Complex<f64>>,
+            acc_22: Vec<f64>,
+        }
+        let half = fft_len / 2 + 1;
+        let worker_count = cpu_threads
+            .min(io_chunk_frames)
+            .min(sec_counts.iter().copied().max().unwrap_or(0));
+        let mut raw_workers: Vec<_> = (0..if write_raw { worker_count } else { 0 })
+            .map(|_| {
+                let real_acc = |enabled| if enabled { vec![0.0; half] } else { Vec::new() };
+                let complex_acc = || {
+                    if need_xcf_products {
+                        vec![Complex::new(0.0, 0.0); half]
+                    } else {
+                        Vec::new()
+                    }
+                };
+                RawThreadAccum {
+                    f1: vec![0.0; fft_len],
+                    f2: vec![0.0; fft_len],
+                    s1: vec![Complex::new(0.0, 0.0); half],
+                    s2: vec![Complex::new(0.0, 0.0); half],
+                    cb: vec![Complex::new(0.0, 0.0); half],
+                    out_t: vec![0.0; fft_len],
+                    fft_scratch: helper.make_scratch(),
+                    dw1: DecodeWindowScratch::new(),
+                    dw2: DecodeWindowScratch::new(),
+                    pow_ph: real_acc(need_phased_products),
+                    pow_11: real_acc(need_acf_products),
+                    pow_12: complex_acc(),
+                    pow_22: real_acc(need_acf_products),
+                    acc_ph: real_acc(need_phased_products),
+                    acc_11: real_acc(need_acf_products),
+                    acc_12: complex_acc(),
+                    acc_22: real_acc(need_acf_products),
+                }
+            })
+            .collect();
+        let quantize_plan = if write_raw {
+            Some(QuantizePlan::new(bit_out, &levels_out, &output_shuffle)?)
+        } else {
+            None
+        };
+        let mut raw_encoded = Vec::new();
+        struct ThreadAccum {
+            acc_ph: Vec<f64>,
+            acc_11: Vec<f64>,
+            acc_12: Vec<Complex<f64>>,
+            acc_22: Vec<f64>,
+            fold: Option<FoldAccum>,
+            f1: Vec<f32>,
+            f2: Vec<f32>,
+            s1: Vec<Complex<f32>>,
+            s2: Vec<Complex<f32>>,
+            g1: Vec<Complex<f32>>,
+            g2: Vec<Complex<f32>>,
+            fft_scratch: FftScratch,
+            dw1: DecodeWindowScratch,
+            dw2: DecodeWindowScratch,
+            timing_decode_s: f64,
+            timing_fft_s: f64,
+            timing_accum_s: f64,
+            timing_samples: usize,
+        }
+        let half = fft_len / 2 + 1;
+        let init = || ThreadAccum {
+            acc_ph: if need_phased_products {
+                vec![0.0; half]
+            } else {
+                Vec::new()
+            },
+            acc_11: if need_acf_products {
+                vec![0.0; half]
+            } else {
+                Vec::new()
+            },
+            acc_12: if need_xcf_products {
+                vec![Complex::new(0.0_f64, 0.0_f64); half]
+            } else {
+                Vec::new()
+            },
+            acc_22: if need_acf_products {
+                vec![0.0; half]
+            } else {
+                Vec::new()
+            },
+            fold: None,
+            f1: vec![0.0_f32; fft_len],
+            f2: vec![0.0_f32; fft_len],
+            s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
+            s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
+            g1: if need_grid_buffers {
+                vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
+            } else {
+                Vec::new()
+            },
+            g2: if need_grid_buffers {
+                vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
+            } else {
+                Vec::new()
+            },
+            fft_scratch: helper.make_forward_scratch(),
+            dw1: DecodeWindowScratch::new(),
+            dw2: DecodeWindowScratch::new(),
+            timing_decode_s: 0.0,
+            timing_fft_s: 0.0,
+            timing_accum_s: 0.0,
+            timing_samples: 0,
+        };
+        let mut corr_workers: Vec<_> = (0..if write_raw { 0 } else { worker_count })
+            .map(|_| init())
+            .collect();
         let block_count: usize = sec_counts
             .iter()
             .map(|&n| n.div_ceil(io_chunk_frames))
@@ -8567,384 +8726,181 @@ fn run_once(
             let consumed = synth_consumed_chunks.load(Ordering::Relaxed);
             synth_queue_hwm = synth_queue_hwm.max(produced.saturating_sub(consumed));
             let sector_failures = AtomicUsize::new(0);
-            let process_frame =
-                |i: usize,
-                 out_f: Option<&mut [u8]>|
-                 -> Option<(Vec<f64>, Vec<f64>, Vec<Complex<f64>>, Vec<f64>)> {
-                    let d = frame_delays[i];
-                    let (mut f1, mut f2, mut s1, mut s2) = (
-                        vec![0.0_f32; fft_len],
-                        vec![0.0_f32; fft_len],
-                        vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1],
-                        vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1],
-                    );
-                    let mut dw1 = DecodeWindowScratch::new();
-                    let mut dw2 = DecodeWindowScratch::new();
-                    if decode_shifted_frame_from_chunk(
-                        raw1,
-                        sector_sample_start1,
-                        i,
-                        fft_len,
-                        bit1,
-                        samples_per_word1,
-                        &dp1,
-                        lsb1,
-                        d.int1 - block.offsets[0],
-                        &mut f1,
-                        &mut dw1,
-                    )
-                    .is_err()
-                    {
-                        if let Some(out_f) = out_f {
-                            out_f.fill(0);
-                        }
-                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    }
-                    if decode_shifted_frame_from_chunk(
-                        raw2,
-                        sector_sample_start2,
-                        i,
-                        fft_len,
-                        bit2,
-                        samples_per_word2,
-                        &dp2,
-                        lsb2,
-                        d.int2 - block.offsets[1],
-                        &mut f2,
-                        &mut dw2,
-                    )
-                    .is_err()
-                    {
-                        if let Some(out_f) = out_f {
-                            out_f.fill(0);
-                        }
-                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    }
-                    // The integer-delay sign convention is opposite to the sample-window
-                    // displacement used by the decoded FFT frame.
-                    if helper.forward_r2c_process(&mut f1, &mut s1).is_err() {
-                        if let Some(out_f) = out_f {
-                            out_f.fill(0);
-                        }
-                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    }
-                    if helper.forward_r2c_process(&mut f2, &mut s2).is_err() {
-                        if let Some(out_f) = out_f {
-                            out_f.fill(0);
-                        }
-                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    }
-                    // Keep the same reference as cross-correlation path.
-                    let fr_lo1 = d.fr_lo1;
-                    let fr_lo2 = d.fr_lo2;
-                    let half = fft_len / 2 + 1;
-                    let mut g1 = vec![Complex::new(0.0_f32, 0.0_f32); half];
-                    let mut g2 = vec![Complex::new(0.0_f32, 0.0_f32); half];
-                    shift_real_fft_to_xml_grid_with_extra_offset(
-                        &s1,
-                        &mut g1,
-                        fft_len,
-                        rotation_bins1,
-                        station_grid_origin_offset_bins(a1_name, fs, fft_len),
-                    );
-                    shift_real_fft_to_xml_grid_with_extra_offset(
-                        &s2,
-                        &mut g2,
-                        fft_len,
-                        rotation_bins2,
-                        station_grid_origin_offset_bins(a2_name, fs, fft_len)
-                            + ant2_grid_extra_offset(),
-                    );
-
-                    let mut phased_pow = vec![0.0; half];
-                    let mut p11 = vec![0.0; half];
-                    let mut p12 = vec![Complex::new(0.0_f64, 0.0_f64); half];
-                    let mut p22 = vec![0.0; half];
-
-                    let mut s1_aligned = vec![Complex::new(0.0_f32, 0.0_f32); half];
-                    let mut s2_aligned = vec![Complex::new(0.0_f32, 0.0_f32); half];
-                    match out_grid {
-                        OutputGrid::Ant1 => {
-                            if need_xcf_products || need_acf_products || need_phased_products {
-                                let (mut phase1, step1) = antenna_phase_start_and_step(
-                                    df_hz,
-                                    d.frac1,
-                                    ba.a1s as isize - rotation_bins1,
-                                );
-                                let (mut phase2, step2) = antenna_phase_start_and_step(
-                                    df_hz,
-                                    d.frac2,
-                                    ba.a2s as isize - rotation_bins2,
-                                );
-                                for k in 0..(ba.a1e - ba.a1s) {
-                                    let i1 = ba.a1s + k;
-                                    let i2 = ba.a2s + k;
-                                    s1_aligned[i1] = g1[i1] * fr_lo1 * phase_to_f32(phase1);
-                                    s2_aligned[i1] = g2[i2] * fr_lo2 * phase_to_f32(phase2);
-                                    phase1 *= step1;
-                                    phase2 *= step2;
-                                }
-                            }
-                            let s1c = &s1_aligned;
-                            if need_phased_products {
-                                let mut cb = vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1];
-                                for k in 0..cb.len() {
-                                    cb[k] = s1c[k] * (w1 as f32) + s2_aligned[k] * (w2 as f32);
-                                }
-                                phased_pow =
-                                    cb.iter().map(|c| c.norm_sqr() as f64).collect::<Vec<_>>();
-                                if let Some(out_f) = out_f {
-                                    cb[0].im = 0.0_f32;
-                                    if fft_len % 2 == 0 {
-                                        cb[fft_len / 2].im = 0.0_f32;
-                                    }
-                                    let mut out_t = vec![0.0_f32; fft_len];
-                                    if helper.inverse_c2r_process(&mut cb, &mut out_t).is_err() {
-                                        out_f.fill(0);
-                                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                                        return None;
-                                    }
-                                    if output_lsb_restore {
-                                        for odd in out_t.iter_mut().skip(1).step_by(2) {
-                                            *odd = -*odd;
-                                        }
-                                    }
-                                    let mut tmp_enc = Vec::new();
-                                    if quantise_frame(
-                                        &out_t,
-                                        bit_out,
-                                        &levels_out,
-                                        &output_shuffle,
-                                        &mut tmp_enc,
-                                    )
-                                    .is_err()
-                                    {
-                                        out_f.fill(0);
-                                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                                        return None;
-                                    }
-                                    out_f.copy_from_slice(&tmp_enc);
-                                }
-                            }
-                            if need_acf_products {
-                                p11 = s1c.iter().map(|c| c.norm_sqr() as f64).collect::<Vec<_>>();
-                                p22 = s2_aligned
-                                    .iter()
-                                    .map(|c| c.norm_sqr() as f64)
-                                    .collect::<Vec<_>>();
-                            }
-                            if need_xcf_products {
-                                p12 = s1c
-                                    .iter()
-                                    .zip(s2_aligned.iter())
-                                    .map(|(z1, z2)| {
-                                        let v = *z1 * z2.conj();
-                                        Complex::new(v.re as f64, v.im as f64)
-                                    })
-                                    .collect::<Vec<_>>();
-                            }
-                        }
-                        OutputGrid::Ant2 => {
-                            if need_xcf_products || need_acf_products || need_phased_products {
-                                let (mut phase1, step1) = antenna_phase_start_and_step(
-                                    df_hz,
-                                    d.frac1,
-                                    ba.a1s as isize - rotation_bins1,
-                                );
-                                let (mut phase2, step2) = antenna_phase_start_and_step(
-                                    df_hz,
-                                    d.frac2,
-                                    ba.a2s as isize - rotation_bins2,
-                                );
-                                for k in 0..(ba.a1e - ba.a1s) {
-                                    let i1 = ba.a1s + k;
-                                    let i2 = ba.a2s + k;
-                                    s1_aligned[i2] = g1[i1] * fr_lo1 * phase_to_f32(phase1);
-                                    s2_aligned[i2] = g2[i2] * fr_lo2 * phase_to_f32(phase2);
-                                    phase1 *= step1;
-                                    phase2 *= step2;
-                                }
-                            }
-                            let s2c = &s2_aligned;
-                            if need_phased_products {
-                                let mut cb = vec![Complex::new(0.0_f32, 0.0_f32); fft_len / 2 + 1];
-                                for k in 0..cb.len() {
-                                    cb[k] = s1_aligned[k] * (w1 as f32) + s2c[k] * (w2 as f32);
-                                }
-                                phased_pow =
-                                    cb.iter().map(|c| c.norm_sqr() as f64).collect::<Vec<_>>();
-                                if let Some(out_f) = out_f {
-                                    cb[0].im = 0.0_f32;
-                                    if fft_len % 2 == 0 {
-                                        cb[fft_len / 2].im = 0.0_f32;
-                                    }
-                                    let mut out_t = vec![0.0_f32; fft_len];
-                                    if helper.inverse_c2r_process(&mut cb, &mut out_t).is_err() {
-                                        out_f.fill(0);
-                                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                                        return None;
-                                    }
-                                    if output_lsb_restore {
-                                        for odd in out_t.iter_mut().skip(1).step_by(2) {
-                                            *odd = -*odd;
-                                        }
-                                    }
-                                    let mut tmp_enc = Vec::new();
-                                    if quantise_frame(
-                                        &out_t,
-                                        bit_out,
-                                        &levels_out,
-                                        &output_shuffle,
-                                        &mut tmp_enc,
-                                    )
-                                    .is_err()
-                                    {
-                                        out_f.fill(0);
-                                        sector_failures.fetch_add(1, Ordering::Relaxed);
-                                        return None;
-                                    }
-                                    out_f.copy_from_slice(&tmp_enc);
-                                }
-                            }
-                            if need_acf_products {
-                                p11 = s1_aligned
-                                    .iter()
-                                    .map(|c| c.norm_sqr() as f64)
-                                    .collect::<Vec<_>>();
-                                p22 = s2c.iter().map(|c| c.norm_sqr() as f64).collect::<Vec<_>>();
-                            }
-                            if need_xcf_products {
-                                p12 = s1_aligned
-                                    .iter()
-                                    .zip(s2c.iter())
-                                    .map(|(z1, z2)| {
-                                        let v = *z1 * z2.conj();
-                                        Complex::new(v.re as f64, v.im as f64)
-                                    })
-                                    .collect::<Vec<_>>();
-                            }
-                        }
-                    }
-                    Some((phased_pow, p11, p12, p22))
-                };
-            let zero_acc = || {
-                (
-                    if need_phased_products {
-                        vec![0.0; fft_len / 2 + 1]
-                    } else {
-                        Vec::new()
-                    },
-                    vec![0.0; fft_len / 2 + 1],
-                    vec![Complex::new(0.0, 0.0); fft_len / 2 + 1],
-                    vec![0.0; fft_len / 2 + 1],
-                )
-            };
-            let reduce_acc =
-                |mut acc1: (Vec<f64>, Vec<f64>, Vec<Complex<f64>>, Vec<f64>),
-                 acc2: (Vec<f64>, Vec<f64>, Vec<Complex<f64>>, Vec<f64>)| {
-                    if need_phased_products {
-                        for k in 0..acc1.0.len() {
-                            acc1.0[k] += acc2.0[k];
-                        }
-                    }
-                    for k in 0..acc1.1.len() {
-                        acc1.1[k] += acc2.1[k];
-                        acc1.2[k] += acc2.2[k];
-                        acc1.3[k] += acc2.3[k];
-                    }
-                    acc1
-                };
             let timing_compute_start = Instant::now();
             let (batch_ph, batch_11, batch_12, batch_22, batch_fold) = if write_raw {
-                let mut enc = vec![0u8; nf * bpf_o];
-                let acc = enc
-                    .par_chunks_mut(bpf_o)
-                    .enumerate()
-                    .map(|(i, out_f)| process_frame(i, Some(out_f)))
-                    .fold(zero_acc, |mut acc, res| {
-                        if let Some((p_ph, p_11, p_12, p_22)) = res {
-                            for k in 0..acc.0.len() {
-                                acc.0[k] += p_ph[k];
-                                acc.1[k] += p_11[k];
-                                acc.2[k] += p_12[k];
-                                acc.3[k] += p_22[k];
+                let half = fft_len / 2 + 1;
+                raw_encoded.resize(nf * bpf_o, 0);
+                let active = raw_workers.len().min(nf);
+                let frames_per_worker = nf.div_ceil(active);
+                let (grid_map1, grid_map2, _, _) = normal_grid_maps.as_ref().unwrap();
+                let output_start = match out_grid {
+                    OutputGrid::Ant1 => ba.a1s,
+                    OutputGrid::Ant2 => ba.a2s,
+                };
+                let process_raw_frame =
+                    |st: &mut RawThreadAccum, i: usize, out_f: &mut [u8]| -> Result<(), DynError> {
+                        let d = frame_delays[i];
+                        decode_shifted_frame_from_chunk(
+                            raw1,
+                            sector_sample_start1,
+                            i,
+                            fft_len,
+                            bit1,
+                            samples_per_word1,
+                            &dp1,
+                            lsb1,
+                            d.int1 - block.offsets[0],
+                            &mut st.f1,
+                            &mut st.dw1,
+                        )?;
+                        decode_shifted_frame_from_chunk(
+                            raw2,
+                            sector_sample_start2,
+                            i,
+                            fft_len,
+                            bit2,
+                            samples_per_word2,
+                            &dp2,
+                            lsb2,
+                            d.int2 - block.offsets[1],
+                            &mut st.f2,
+                            &mut st.dw2,
+                        )?;
+                        helper.forward_r2c_process_with_scratch(
+                            &mut st.f1,
+                            &mut st.s1,
+                            &mut st.fft_scratch,
+                        )?;
+                        helper.forward_r2c_process_with_scratch(
+                            &mut st.f2,
+                            &mut st.s2,
+                            &mut st.fft_scratch,
+                        )?;
+                        // The inverse FFT destroys cb; reset bins outside the overlap as well.
+                        st.cb.fill(Complex::new(0.0, 0.0));
+                        let (mut phase1, step1) = antenna_phase_start_and_step(
+                            df_hz,
+                            d.frac1,
+                            ba.a1s as isize - rotation_bins1,
+                        );
+                        let (mut phase2, step2) = antenna_phase_start_and_step(
+                            df_hz,
+                            d.frac2,
+                            ba.a2s as isize - rotation_bins2,
+                        );
+                        // Map, correct and combine each bin once, without intermediate spectra.
+                        for k in 0..overlap_len {
+                            let bin = output_start + k;
+                            let z1 = mapped_real_fft_bin(&st.s1, grid_map1, ba.a1s + k)
+                                * d.fr_lo1
+                                * phase_to_f32(phase1);
+                            let z2 = mapped_real_fft_bin(&st.s2, grid_map2, ba.a2s + k)
+                                * d.fr_lo2
+                                * phase_to_f32(phase2);
+                            let beam = z1 * w1 as f32 + z2 * w2 as f32;
+                            st.cb[bin] = beam;
+                            if need_phased_products {
+                                st.pow_ph[bin] = beam.norm_sqr() as f64;
+                            }
+                            if need_acf_products {
+                                st.pow_11[bin] = z1.norm_sqr() as f64;
+                                st.pow_22[bin] = z2.norm_sqr() as f64;
+                            }
+                            if need_xcf_products {
+                                let value = z1 * z2.conj();
+                                st.pow_12[bin] = Complex::new(value.re as f64, value.im as f64);
+                            }
+                            phase1 *= step1;
+                            phase2 *= step2;
+                        }
+                        // Preserve unprojected diagnostic powers before projecting real DC/Nyquist.
+                        st.cb[0].im = 0.0;
+                        if fft_len % 2 == 0 {
+                            st.cb[fft_len / 2].im = 0.0;
+                        }
+                        helper.inverse_c2r_process_with_scratch(
+                            &mut st.cb,
+                            &mut st.out_t,
+                            &mut st.fft_scratch,
+                        )?;
+                        if output_lsb_restore {
+                            for odd in st.out_t.iter_mut().skip(1).step_by(2) {
+                                *odd = -*odd;
                             }
                         }
-                        acc
-                    })
-                    .reduce(zero_acc, reduce_acc);
+                        quantize_plan
+                            .as_ref()
+                            .unwrap()
+                            .quantise_into(&st.out_t, out_f)?;
+                        // Commit diagnostics only after a complete, successful frame.
+                        if need_phased_products || need_acf_products || need_xcf_products {
+                            for k in output_start..output_start + overlap_len {
+                                if need_phased_products {
+                                    st.acc_ph[k] += st.pow_ph[k];
+                                }
+                                if need_acf_products {
+                                    st.acc_11[k] += st.pow_11[k];
+                                    st.acc_22[k] += st.pow_22[k];
+                                }
+                                if need_xcf_products {
+                                    st.acc_12[k] += st.pow_12[k];
+                                }
+                            }
+                        }
+                        Ok(())
+                    };
+                raw_workers[..active]
+                    .par_iter_mut()
+                    .zip(raw_encoded.par_chunks_mut(frames_per_worker * bpf_o))
+                    .enumerate()
+                    .for_each(|(worker, (st, bytes))| {
+                        st.acc_ph.fill(0.0);
+                        st.acc_11.fill(0.0);
+                        st.acc_12.fill(Complex::new(0.0, 0.0));
+                        st.acc_22.fill(0.0);
+                        for (frame, out_f) in bytes.chunks_exact_mut(bpf_o).enumerate() {
+                            let i = worker * frames_per_worker + frame;
+                            if process_raw_frame(st, i, out_f).is_err() {
+                                out_f.fill(0);
+                                sector_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                let used = nf.div_ceil(frames_per_worker);
+                let batch_real = |get: fn(&RawThreadAccum) -> &Vec<f64>, enabled: bool| {
+                    let mut acc = if enabled { vec![0.0; half] } else { Vec::new() };
+                    for st in &raw_workers[..used] {
+                        for (a, b) in acc.iter_mut().zip(get(st)) {
+                            *a += b;
+                        }
+                    }
+                    acc
+                };
+                let batch_ph = batch_real(|st| &st.acc_ph, need_phased_products);
+                let batch_11 = batch_real(|st| &st.acc_11, need_acf_products);
+                let batch_22 = batch_real(|st| &st.acc_22, need_acf_products);
+                let mut batch_12 = if need_xcf_products {
+                    vec![Complex::new(0.0, 0.0); half]
+                } else {
+                    Vec::new()
+                };
+                for st in &raw_workers[..used] {
+                    for (a, b) in batch_12.iter_mut().zip(&st.acc_12) {
+                        *a += b;
+                    }
+                }
                 if let Some(w) = wr.as_mut() {
                     let _io_affinity = affinity::IoAffinityGuard::enter(reader_core)?;
-                    w.write_all(&enc)?;
+                    w.write_all(&raw_encoded)?;
                 }
-                (acc.0, acc.1, acc.2, acc.3, None)
+                (batch_ph, batch_11, batch_12, batch_22, None)
             } else {
-                struct ThreadAccum {
-                    acc_ph: Vec<f64>,
-                    acc_11: Vec<f64>,
-                    acc_12: Vec<Complex<f64>>,
-                    acc_22: Vec<f64>,
-                    fold: Option<FoldAccum>,
-                    f1: Vec<f32>,
-                    f2: Vec<f32>,
-                    s1: Vec<Complex<f32>>,
-                    s2: Vec<Complex<f32>>,
-                    g1: Vec<Complex<f32>>,
-                    g2: Vec<Complex<f32>>,
-                    fft_scratch: FftScratch,
-                    dw1: DecodeWindowScratch,
-                    dw2: DecodeWindowScratch,
-                    timing_decode_s: f64,
-                    timing_fft_s: f64,
-                    timing_accum_s: f64,
-                    timing_samples: usize,
-                }
-                let half = fft_len / 2 + 1;
-                let init = || ThreadAccum {
-                    acc_ph: if need_phased_products {
-                        vec![0.0; half]
-                    } else {
-                        Vec::new()
-                    },
-                    acc_11: vec![0.0; half],
-                    acc_12: vec![Complex::new(0.0_f64, 0.0_f64); half],
-                    acc_22: vec![0.0; half],
-                    fold: pulsar_runtime
-                        .as_ref()
-                        .map(|rt| FoldAccum::new(rt.bins(), half, need_phased_products)),
-                    f1: vec![0.0_f32; fft_len],
-                    f2: vec![0.0_f32; fft_len],
-                    s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
-                    s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
-                    g1: if need_grid_buffers {
-                        vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
-                    } else {
-                        Vec::new()
-                    },
-                    g2: if need_grid_buffers {
-                        vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
-                    } else {
-                        Vec::new()
-                    },
-                    fft_scratch: helper.make_scratch(),
-                    dw1: DecodeWindowScratch::new(),
-                    dw2: DecodeWindowScratch::new(),
-                    timing_decode_s: 0.0,
-                    timing_fft_s: 0.0,
-                    timing_accum_s: 0.0,
-                    timing_samples: 0,
-                };
-                let min_job_frames = (nf / cpu_threads.saturating_mul(4).max(1)).clamp(1, 128);
-                let frames_per_job = if let Some(balance) = &cpu_balance {
-                    nf.div_ceil(balance.active()).max(1)
-                } else {
-                    (nf / (cpu_threads.saturating_mul(8)).max(1)).clamp(min_job_frames, 2048)
-                };
-                let chunk_starts: Vec<usize> = (0..nf).step_by(frames_per_job).collect();
+                let active = cpu_balance
+                    .as_ref()
+                    .map_or(corr_workers.len(), |b| b.active())
+                    .min(corr_workers.len())
+                    .min(nf);
+                let frames_per_job = nf.div_ceil(active);
                 let chunk_abs_start1 = sector_sample_start1;
                 let chunk_abs_start2 = sector_sample_start2;
                 let (grid_map1, grid_map2, direct_src1, direct_src2) = normal_grid_maps
@@ -8955,14 +8911,22 @@ fn run_once(
                 let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
                 let station_offset2 = station_grid_origin_offset_bins(a2_name, fs, fft_len)
                     + ant2_grid_extra_offset();
-                let mut out = chunk_starts
-                    .into_par_iter()
-                    // Keep large spectra accumulators and FFT scratch alive across
-                    // multiple frame jobs in the same Rayon fold. Mapping each job
-                    // independently zeroed and reduced several full spectra per
-                    // input block, adding memory traffic that is especially costly
-                    // when the worker count is intentionally small.
-                    .fold(init, |mut st, start| {
+                let out = corr_workers[..active]
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(worker, st)| {
+                        let start = worker * frames_per_job;
+                        st.acc_ph.fill(0.0);
+                        st.acc_11.fill(0.0);
+                        st.acc_12.fill(Complex::new(0.0, 0.0));
+                        st.acc_22.fill(0.0);
+                        st.fold = pulsar_runtime
+                            .as_ref()
+                            .map(|rt| FoldAccum::new(rt.bins(), half, need_phased_products));
+                        st.timing_decode_s = 0.0;
+                        st.timing_fft_s = 0.0;
+                        st.timing_accum_s = 0.0;
+                        st.timing_samples = 0;
                         let end = (start + frames_per_job).min(nf);
                         for i in start..end {
                             let d = frame_delays[i];
@@ -9148,10 +9112,7 @@ fn run_once(
                                 NormalCorrKernel::Ant1Grid => ba.a1s,
                                 NormalCorrKernel::Ant2Grid => ba.a2s,
                             };
-                            let direct_accumulated = if need_acf_products
-                                && need_xcf_products
-                                && !args.debug
-                            {
+                            let direct_accumulated = if need_xcf_products && !args.debug {
                                 if let (Some(src1), Some(src2)) = (direct_src1, direct_src2) {
                                     let (phase0, phase_step) = xcf_phase_start_and_step(
                                         df_hz,
@@ -9160,27 +9121,27 @@ fn run_once(
                                         ba.a1s as isize - rotation_bins1,
                                         ba.a2s as isize - rotation_bins2,
                                     );
-                                    match normal_corr_kernel {
-                                        NormalCorrKernel::Ant1Grid => accumulate_direct_acf_xcf(
+                                    let range = output_start..output_start + overlap_len;
+                                    if need_acf_products {
+                                        accumulate_direct_acf_xcf(
                                             &st.s1[src1..src1 + overlap_len],
                                             &st.s2[src2..src2 + overlap_len],
-                                            &mut st.acc_11[ba.a1s..ba.a1s + overlap_len],
-                                            &mut st.acc_12[ba.a1s..ba.a1s + overlap_len],
-                                            &mut st.acc_22[ba.a1s..ba.a1s + overlap_len],
+                                            &mut st.acc_11[range.clone()],
+                                            &mut st.acc_12[range.clone()],
+                                            &mut st.acc_22[range],
                                             fr_mix,
                                             phase0,
                                             phase_step,
-                                        ),
-                                        NormalCorrKernel::Ant2Grid => accumulate_direct_acf_xcf(
+                                        );
+                                    } else {
+                                        accumulate_direct_xcf(
                                             &st.s1[src1..src1 + overlap_len],
                                             &st.s2[src2..src2 + overlap_len],
-                                            &mut st.acc_11[ba.a2s..ba.a2s + overlap_len],
-                                            &mut st.acc_12[ba.a2s..ba.a2s + overlap_len],
-                                            &mut st.acc_22[ba.a2s..ba.a2s + overlap_len],
+                                            &mut st.acc_12[range],
                                             fr_mix,
                                             phase0,
                                             phase_step,
-                                        ),
+                                        );
                                     }
                                     true
                                 } else {
@@ -9259,18 +9220,20 @@ fn run_once(
                         }
                         st
                     })
-                    .reduce(init, |mut a, b| {
-                        if need_phased_products {
-                            for k in 0..half {
-                                a.acc_ph[k] += b.acc_ph[k];
-                            }
+                    .reduce_with(|a, b| {
+                        for (x, y) in a.acc_ph.iter_mut().zip(&b.acc_ph) {
+                            *x += y;
                         }
-                        for k in 0..half {
-                            a.acc_11[k] += b.acc_11[k];
-                            a.acc_12[k] += b.acc_12[k];
-                            a.acc_22[k] += b.acc_22[k];
+                        for (x, y) in a.acc_11.iter_mut().zip(&b.acc_11) {
+                            *x += y;
                         }
-                        if let (Some(a_fold), Some(b_fold)) = (a.fold.as_mut(), b.fold) {
+                        for (x, y) in a.acc_12.iter_mut().zip(&b.acc_12) {
+                            *x += y;
+                        }
+                        for (x, y) in a.acc_22.iter_mut().zip(&b.acc_22) {
+                            *x += y;
+                        }
+                        if let (Some(a_fold), Some(b_fold)) = (a.fold.as_mut(), b.fold.take()) {
                             a_fold.merge(b_fold);
                         }
                         a.timing_decode_s += b.timing_decode_s;
@@ -9278,7 +9241,8 @@ fn run_once(
                         a.timing_accum_s += b.timing_accum_s;
                         a.timing_samples += b.timing_samples;
                         a
-                    });
+                    })
+                    .expect("nonempty correlation block");
 
                 timing_sample_decode_s += out.timing_decode_s;
                 timing_sample_fft_s += out.timing_fft_s;
@@ -9299,10 +9263,10 @@ fn run_once(
                 }
 
                 (
-                    std::mem::take(&mut out.acc_ph),
-                    std::mem::take(&mut out.acc_11),
-                    std::mem::take(&mut out.acc_12),
-                    std::mem::take(&mut out.acc_22),
+                    out.acc_ph.clone(),
+                    out.acc_11.clone(),
+                    out.acc_12.clone(),
+                    out.acc_22.clone(),
                     out.fold.take(),
                 )
             };
@@ -9335,10 +9299,14 @@ fn run_once(
                 for (a, b) in acc.0.iter_mut().zip(&batch_ph) {
                     *a += b;
                 }
-                for k in 0..acc.1.len() {
-                    acc.1[k] += batch_11[k];
-                    acc.2[k] += batch_12[k];
-                    acc.3[k] += batch_22[k];
+                for (a, b) in acc.1.iter_mut().zip(&batch_11) {
+                    *a += b;
+                }
+                for (a, b) in acc.2.iter_mut().zip(&batch_12) {
+                    *a += b;
+                }
+                for (a, b) in acc.3.iter_mut().zip(&batch_22) {
+                    *a += b;
                 }
                 if let (Some(a), Some(b)) = (acc.4.as_mut(), batch_fold) {
                     a.merge(b);

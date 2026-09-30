@@ -736,6 +736,103 @@ fn automatic_gain_phasecal_runs_frinz_updates_l_and_synthesizes_every_scan() {
 }
 
 #[test]
+fn no_affinity_preserves_products_and_ignores_pinning_configuration() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    let home = root.join("home");
+    let cargo_home = root.join("cargo");
+    fs::create_dir_all(&raw_dir).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(cargo_home.join("tmp")).unwrap();
+    let schedule = root.join("test.xml");
+    write_schedule(&schedule, "ANT1", "ANT2");
+    let raw: Vec<u8> = (0..2048).map(|i| ((i * 53 + i / 7) % 256) as u8).collect();
+    for station in ["ANT1", "ANT2"] {
+        fs::write(raw_dir.join(format!("{station}_2000001000000.raw")), &raw).unwrap();
+    }
+    let config = cargo_home.join("tmp/yi-corr-affinity.txt");
+    let registry = home.join(".yi-corr");
+    for phased in [false, true] {
+        for cpu in ["1", "3"] {
+            let mut reference = std::collections::BTreeMap::new();
+            for unpinned in [false, true] {
+                let out = root.join(format!("out-{phased}-{cpu}-{unpinned}"));
+                let mut cmd = Command::new(if phased {
+                    env!("CARGO_BIN_EXE_yi-phasedarray")
+                } else {
+                    env!("CARGO_BIN_EXE_yi-corr")
+                });
+                cmd.args([
+                    "--sc",
+                    schedule.to_str().unwrap(),
+                    "--raw",
+                    raw_dir.to_str().unwrap(),
+                    "--cor",
+                    out.to_str().unwrap(),
+                    "--cpu",
+                    cpu,
+                    "--chunk-frames",
+                    "3",
+                    "--pipeline-depth",
+                    "1",
+                    "--usb",
+                ])
+                .env("HOME", &home)
+                .env("CARGO_HOME", &cargo_home)
+                .env_remove("YI_READER_CORE");
+                if unpinned {
+                    // Invalid inputs must not even be read in this mode.
+                    fs::write(&config, "invalid affinity specification").unwrap();
+                    fs::write(&registry, "registry must remain untouched").unwrap();
+                    cmd.arg("--no-affinity").env("YI_READER_CORE", "invalid");
+                }
+                let result = cmd.output().unwrap();
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                assert!(
+                    result.status.success(),
+                    "stdout:\n{stdout}\nstderr:\n{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(stdout.contains(if cpu == "1" {
+                    "compute-threads=1"
+                } else {
+                    "compute-threads=2"
+                }));
+                if unpinned {
+                    assert!(stdout.contains("affinity=disabled"));
+                    assert!(!stdout
+                        .lines()
+                        .any(|line| line.starts_with("[info] CPU allocation:")
+                            && line.contains("I/O CPU=")));
+                    assert!(!stdout.contains("Cross-process CPU reservation:"));
+                    assert_eq!(
+                        fs::read_to_string(&registry).unwrap(),
+                        "registry must remain untouched"
+                    );
+                    fs::remove_file(&config).unwrap();
+                    fs::remove_file(&registry).unwrap();
+                }
+                let products: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .filter(|p| {
+                        matches!(p.extension().and_then(|s| s.to_str()), Some("cor" | "raw"))
+                    })
+                    .map(|p| (p.file_name().unwrap().to_owned(), fs::read(&p).unwrap()))
+                    .collect();
+                assert!(!products.is_empty());
+                if unpinned {
+                    assert_eq!(products, reference, "phased={phased} cpu={cpu}");
+                } else {
+                    reference = products;
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn small_io_chunks_preserve_integration_and_phased_raw_with_delay_drift() {
     let root = unique_temp_dir();
     let raw_dir = root.join("raw");
@@ -806,6 +903,114 @@ fn small_io_chunks_preserve_integration_and_phased_raw_with_delay_drift() {
                     reference = products;
                 } else {
                     assert_eq!(products, reference, "rate={rate} phased={phased} usb={usb}");
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reused_workers_preserve_rotated_mixed_bit_products() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    fs::create_dir_all(&raw_dir).unwrap();
+    for (station, multiplier) in [("ANT1", 53), ("ANT2", 71)] {
+        let raw: Vec<u8> = (0..8192)
+            .map(|i| ((i * multiplier + i / 7 + 79) % 256) as u8)
+            .collect();
+        fs::write(raw_dir.join(format!("{station}_2000001000000.raw")), raw).unwrap();
+    }
+    for (bits1, bits2, rot1, rot2, sideband) in [
+        (2, 2, "512", "256", "LSB"),
+        (2, 4, "0", "-512", "USB"),
+        (4, 2, "-256", "0", "LSB"),
+    ] {
+        let schedule = root.join("test.xml");
+        write_schedule_with_clock_delay(&schedule, "ANT1", "ANT2", 13.25 / 8192.0);
+        let xml = fs::read_to_string(&schedule)
+            .unwrap()
+            .replacen("<terminal>term</terminal>", "<terminal>term1</terminal>", 1)
+            .replacen("<terminal>term</terminal>", "<terminal>term2</terminal>", 1);
+        let terminal = |name: &str, bits: usize| {
+            let count = 1usize << bits;
+            let levels = (0..count)
+                .map(|i| (i as f64 - (count - 1) as f64 / 2.0).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("<terminal name=\"{name}\"><speed>8192</speed><channel>1</channel><bit>{bits}</bit><level>{levels}</level></terminal>")
+        };
+        let xml = xml.replace(
+            "<terminal name=\"term\"><speed>8192</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,0.5,1.5</level></terminal>",
+            &(terminal("term1", bits1) + &terminal("term2", bits2)),
+        ).replace(
+            "<special key=\"A\"><rotation>0</rotation><sideband>LSB</sideband></special>",
+            &format!("<special key=\"A\"><rotation>{rot1}</rotation><sideband>{sideband}</sideband></special>"),
+        ).replace(
+            "<special key=\"B\"><rotation>0</rotation><sideband>LSB</sideband></special>",
+            &format!("<special key=\"B\"><rotation>{rot2}</rotation><sideband>{sideband}</sideband></special>"),
+        );
+        fs::write(&schedule, xml).unwrap();
+        for phased in [false, true] {
+            let binary = if phased { "yi-phasedarray" } else { "yi-corr" };
+            let current = if phased {
+                env!("CARGO_BIN_EXE_yi-phasedarray")
+            } else {
+                env!("CARGO_BIN_EXE_yi-corr")
+            };
+            let mut runs = vec![
+                (PathBuf::from(current), "1", "1000"),
+                (PathBuf::from(current), "4", "5"),
+            ];
+            // Optional comparison with a saved pre-change release build.
+            if let Some(directory) = std::env::var_os("FX_CORR_BASELINE_DIR") {
+                runs.push((PathBuf::from(directory).join(binary), "1", "1000"));
+            }
+            let mut reference = std::collections::BTreeMap::new();
+            for (run, (executable, cpu, chunk)) in runs.into_iter().enumerate() {
+                let out = root.join(format!("out-{bits1}-{bits2}-{phased}-{run}"));
+                let result = Command::new(executable)
+                    .args([
+                        "--sc",
+                        schedule.to_str().unwrap(),
+                        "--raw",
+                        raw_dir.to_str().unwrap(),
+                        "--output",
+                        out.to_str().unwrap(),
+                        "--cpu",
+                        cpu,
+                        "--no-affinity",
+                        "--chunk-frames",
+                        chunk,
+                        "--pipeline-depth",
+                        "1",
+                        "--phased-name",
+                        "ARRAY",
+                    ])
+                    .args(phased.then_some("--phased-diagnostics"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let products: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .filter(|p| {
+                        matches!(p.extension().and_then(|s| s.to_str()), Some("cor" | "raw"))
+                    })
+                    .map(|p| (p.file_name().unwrap().to_owned(), fs::read(p).unwrap()))
+                    .collect();
+                assert!(!products.is_empty());
+                if run == 0 {
+                    reference = products;
+                } else {
+                    assert_eq!(
+                        products, reference,
+                        "bits={bits1}/{bits2} phased={phased} run={run}"
+                    );
                 }
             }
         }
