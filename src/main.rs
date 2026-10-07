@@ -2220,7 +2220,7 @@ fn print_schedule_summary(
                 },
             ),
             ("stream fft".to_string(), fmt_opt(d.fft)),
-            ("stream output [s]".to_string(), fmt_opt_f64(d.output_sec)),
+            ("stream output [Hz]".to_string(), fmt_opt_f64(d.output_sec)),
             ("stream inband".to_string(), fmt_opt(d.inband)),
             (
                 "stream output rate".to_string(),
@@ -8018,6 +8018,7 @@ fn run_once(
         let output_sec = 1.0 / output_hz;
         let frames_per_sector = (output_sec / frame_sec).round().max(1.0) as usize;
         let actual_output_sec = frames_per_sector as f64 * frame_sec;
+        let data_duration_s = total_f as f64 * frame_sec;
         let mut sec_counts = Vec::new();
         let mut remaining = total_f;
         while remaining > 0 {
@@ -8026,11 +8027,18 @@ fn run_once(
             remaining -= nf;
         }
         println!(
-            "[info] Output integration: XML stream/output requested {:.9} Hz, actual {:.9} s, frames/sector {}, sectors {}",
+            "[info] Output integration: {} requested {:.9} Hz ({:.9} s), actual {:.9} s/sector, frames/sector {}, sectors {} (data duration {:.9} s)",
+            if args.integration_rate_override.is_some() {
+                "solution pass override"
+            } else {
+                "XML stream/output"
+            },
+            output_hz,
             output_sec,
             actual_output_sec,
             frames_per_sector,
-            sec_counts.len()
+            sec_counts.len(),
+            data_duration_s
         );
         let dp1 = Arc::new(build_decode_plan(bit1, sh1.as_ref(), levels1.as_ref())?);
         let dp2 = Arc::new(build_decode_plan(bit2, sh2.as_ref(), levels2.as_ref())?);
@@ -9352,14 +9360,18 @@ fn run_once(
             let sector_integ_s = nf as f64 * frame_sec;
             if is_phased_mode {
                 print!(
-                    "\r[info] Synthesised sector {}/{} ({:.2}%)",
+                    "\r[info] Synthesised observation time {:.3}/{:.3} s, sectors {}/{} ({:.2}%)",
+                    emitted as f64 * frame_sec,
+                    data_duration_s,
                     si + 1,
                     sec_counts.len(),
                     (emitted as f64 / total_f as f64) * 100.0
                 );
             } else {
                 print!(
-                    "\r[info] Processed sector {}/{} ({:.2}%)",
+                    "\r[info] Processed observation time {:.3}/{:.3} s, sectors {}/{} ({:.2}%)",
+                    emitted as f64 * frame_sec,
+                    data_duration_s,
                     si + 1,
                     sec_counts.len(),
                     (emitted as f64 / total_f as f64) * 100.0

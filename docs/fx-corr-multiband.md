@@ -1,6 +1,6 @@
 # Two-band correlation and calibrator transfer
 
-`yi-corr` 3.10.0 can jointly use the simultaneous 6600–7112 MHz and
+`yi-corr` 3.10.1 can jointly use the simultaneous 6600–7112 MHz and
 8192–8704 MHz observations. Each station/band has its own RAW file.
 The occupied bandwidth is 512 + 512 = 1024 MHz; the unobserved gap is
 1080 MHz and the RF extent is 2104 MHz. Each band retains its actual RF
@@ -93,6 +93,14 @@ The final output is **not forced to 20 Hz**. `<output>1</output>` writes
 calibrator solution pass (`--multiband-solve-integration 0.05`). Final
 correction is applied before integration, at each FFT. Targets with calibrator
 transfer have no short solution pass.
+
+For a 300-second calibrator, the default 0.05-second solution integration
+creates **6000 sectors**, covering the same 300 seconds. It does not extend
+the observation to 6000 seconds. The final 1 Hz correlation creates 300
+one-second sectors for this scan. Progress in 3.10.1 shows observation seconds
+separately from sector counts, and the integration log distinguishes the
+solution override from XML output. The 3.10.0 log incorrectly printed
+`requested 0.050000000 Hz` for a 20 Hz solution pass; that was a display error.
 
 ### Existing two-XML input
 
