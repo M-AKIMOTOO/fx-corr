@@ -49,7 +49,7 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
     let root = unique_temp_dir();
     fs::create_dir_all(&root).unwrap();
     let schedules = [root.join("low.xml"), root.join("high.xml")];
-    let raw_dirs = [root.join("low"), root.join("high")];
+    let raw_dirs = [root.join("c"), root.join("x")];
     for band in 0..2 {
         fs::create_dir_all(&raw_dirs[band]).unwrap();
         write_schedule_with_clock_delay(&schedules[band], "ANT1", "ANT2", 2e-6);
@@ -72,22 +72,48 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
             }
         }
     }
-    for debug in [false, true] {
-        let out = root.join(if debug { "mapped" } else { "direct" });
+    let low_xml = fs::read_to_string(&schedules[0]).unwrap();
+    let high_xml = fs::read_to_string(&schedules[1]).unwrap();
+    let low_doc = roxmltree::Document::parse(&low_xml).unwrap();
+    let high_doc = roxmltree::Document::parse(&high_xml).unwrap();
+    let stream = |doc: &roxmltree::Document<'_>| {
+        doc.root_element()
+            .children()
+            .find(|n| n.has_tag_name("stream"))
+            .unwrap()
+            .range()
+    };
+    let low_range = stream(&low_doc);
+    let cx_xml = root.join("cx.xml");
+    let mut cx = low_xml.clone();
+    cx.replace_range(low_range.clone(), &format!(
+        "<multiband calibrator=\"CAL\"><band name=\"x\">{}</band><band name=\"c\">{}</band></multiband>",
+        &high_xml[stream(&high_doc)], &low_xml[low_range]
+    ));
+    fs::write(&cx_xml, cx).unwrap();
+    let mut reference_joint = Vec::new();
+    for mode in ["direct", "mapped", "single-xml"] {
+        let out = root.join(mode);
         let mut command = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
         command.args([
             "--sc",
-            schedules[0].to_str().unwrap(),
+            if mode == "single-xml" {
+                &cx_xml
+            } else {
+                &schedules[0]
+            }
+            .to_str()
+            .unwrap(),
             "--raw",
-            raw_dirs[0].to_str().unwrap(),
+            if mode == "single-xml" {
+                &root
+            } else {
+                &raw_dirs[0]
+            }
+            .to_str()
+            .unwrap(),
             "--cor",
             out.to_str().unwrap(),
-            "--multiband-schedule",
-            schedules[1].to_str().unwrap(),
-            "--multiband-raw-directory",
-            raw_dirs[1].to_str().unwrap(),
-            "--multiband-calibrator",
-            "CAL",
             "--multiband-delay-window-ns",
             "10000",
             "--multiband-solve-integration",
@@ -97,7 +123,17 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
             "--cpu",
             "1",
         ]);
-        if debug {
+        if mode != "single-xml" {
+            command.args([
+                "--multiband-schedule",
+                schedules[1].to_str().unwrap(),
+                "--multiband-raw-directory",
+                raw_dirs[1].to_str().unwrap(),
+                "--multiband-calibrator",
+                "CAL",
+            ]);
+        }
+        if mode == "mapped" {
             command.arg("--debug");
         }
         let result = command.output().unwrap();
@@ -113,6 +149,11 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
             "target must not be fringe-fitted"
         );
         let bytes = fs::read(scan.join("joint.mbcor")).unwrap();
+        if mode == "direct" {
+            reference_joint = bytes.clone();
+        } else {
+            assert_eq!(bytes, reference_joint, "{mode}");
+        }
         assert_eq!(&bytes[..8], b"YIMBCOR\0");
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
         assert_eq!(
@@ -128,6 +169,59 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
             100016384.0
         );
         assert_eq!(bytes.len(), 544 + 2 * 2 * (128 + 64 * 8));
+        for station in [1, 2] {
+            let joint = fs::read(scan.join(format!("joint-acf{station}.mbcor"))).unwrap();
+            assert_eq!(joint.len(), bytes.len());
+            for band in 0..2 {
+                let h = &joint[32 + band * 256..288 + band * 256];
+                assert_eq!(&h[32..48], &h[80..96]);
+                let native = fs::read_dir(scan.join(format!("band{}", band + 1)))
+                    .unwrap()
+                    .map(|e| fs::read(e.unwrap().path()).unwrap())
+                    .find(|b| b.len() >= 256 && &b[..256] == h)
+                    .unwrap();
+                for row in 0..2 {
+                    let begin = 544 + (row * 2 + band) * (128 + 64 * 8);
+                    assert_eq!(
+                        &joint[begin..begin + 128 + 64 * 8],
+                        &native[256 + row * (128 + 64 * 8)..256 + (row + 1) * (128 + 64 * 8)]
+                    );
+                    for v in joint[begin + 128..begin + 128 + 64 * 8].chunks_exact(8) {
+                        assert!(f32::from_le_bytes(v[..4].try_into().unwrap()) >= 0.0);
+                        assert_eq!(f32::from_le_bytes(v[4..].try_into().unwrap()), 0.0);
+                    }
+                }
+            }
+        }
+        for graph in [
+            "solutions.png",
+            "applied.png",
+            "visibility.png",
+            "band-phase.png",
+            "spectrum.png",
+            "autocorrelation.png",
+        ] {
+            let png = fs::read(scan.join(graph)).unwrap();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        }
+        assert!(fs::read_to_string(scan.join("verification.txt"))
+            .unwrap()
+            .contains("mode=calibrator_transfer"));
+        let applied = fs::read_to_string(scan.join("applied.tsv")).unwrap();
+        let times = applied
+            .lines()
+            .skip(1)
+            .map(|s| s.split('\t').next().unwrap().parse::<f64>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            times,
+            vec![0.25, 0.75],
+            "target output times must use the target epoch"
+        );
+        assert!(out
+            .join("multiband/scan0000/uncorrected-spectrum.tsv")
+            .exists());
+        assert!(!scan.join("uncorrected-spectrum.tsv").exists());
         for row in 0..2 {
             for band in 0..2 {
                 let begin = 544 + (row * 2 + band) * (128 + 64 * 8) + 128;
@@ -186,6 +280,14 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
             String::from_utf8_lossy(&time_mean.stderr)
         );
         let means = fs::read_to_string(scan.join("average.tsv")).unwrap();
+        let qa = fs::read_to_string(scan.join("visibility-time.tsv")).unwrap();
+        for (export, diagnostic) in means.lines().skip(1).zip(qa.lines().skip(1)) {
+            let a: Vec<f64> = export.split('\t').map(|v| v.parse().unwrap()).collect();
+            let b: Vec<f64> = diagnostic.split('\t').map(|v| v.parse().unwrap()).collect();
+            assert!((a[3] - b[11]).abs() < 1e-9);
+            assert!((a[4] - b[12]).abs() < 1e-9);
+            assert_eq!(a[10], b[17]);
+        }
         let expected = means
             .lines()
             .skip(1)

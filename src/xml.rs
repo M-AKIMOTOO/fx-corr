@@ -285,7 +285,14 @@ pub fn parse_xml_schedule_for_process(
     selected_process_index: Option<usize>,
 ) -> Result<IFileData, DynError> {
     let xml = std::fs::read_to_string(path)?;
-    let doc = Document::parse(&xml)?;
+    parse_xml_schedule_text(&xml, selected_process_index)
+}
+
+pub fn parse_xml_schedule_text(
+    xml: &str,
+    selected_process_index: Option<usize>,
+) -> Result<IFileData, DynError> {
+    let doc = Document::parse(xml)?;
 
     let eop_node = doc
         .descendants()

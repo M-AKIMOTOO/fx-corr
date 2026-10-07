@@ -1440,6 +1440,22 @@ fn parse_ifile_cached(path: &PathBuf) -> Result<Arc<ifile::IFileData>, DynError>
     Ok(parsed)
 }
 
+fn parse_schedule_args(
+    args: &args::Args,
+    index: Option<usize>,
+) -> Result<Arc<ifile::IFileData>, DynError> {
+    if let Some(text) = args.schedule_xml.as_ref() {
+        Ok(Arc::new(xml::parse_xml_schedule_text(text, index)?))
+    } else if let Some(index) = index {
+        Ok(Arc::new(ifile::parse_ifile_for_process(
+            args.schedule.as_ref().ok_or("missing schedule")?,
+            Some(index),
+        )?))
+    } else {
+        parse_ifile_cached(args.schedule.as_ref().ok_or("missing schedule")?)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BandAlignment {
     shift_bins: isize,
@@ -2561,7 +2577,7 @@ mod mk_xml_handoff_tests {
 }
 
 fn run_cli() -> Result<(), DynError> {
-    let args = args::Args::parse();
+    let mut args = args::Args::parse();
     if args.mkxml {
         let out = PathBuf::from("example.xml");
         xml::write_example_xml(&out)?;
@@ -2569,6 +2585,7 @@ fn run_cli() -> Result<(), DynError> {
         return Ok(());
     }
     let run_mode = detect_run_mode_from_argv0();
+    multiband::configure_from_xml(&mut args)?;
     match run_mode {
         RunMode::PhasedArray => {
             if args.schedule.is_none() {
@@ -2630,21 +2647,21 @@ fn run_cli() -> Result<(), DynError> {
     } else {
         affinity::reader_core_from_env()?
     };
-    let (allocation, _cpu_reservation) =
-        if !args.no_affinity && args.cpu.is_some() && matches!(run_mode, RunMode::Corr) {
-            let (allocation, reservation) =
-                affinity::reserve_cpus(&allowed, &cpu_universe, requested, preferred_io)?;
-            println!(
-            "[info] Cross-process CPU reservation: {} (at least 2 visible CPUs left unassigned)",
+    let (allocation, _cpu_reservation) = if !args.no_affinity && cfg!(unix) {
+        let (allocation, reservation) =
+            affinity::reserve_cpus(&allowed, &cpu_universe, requested, preferred_io)?;
+        println!(
+            "[info] Cross-process CPU reservation: pid={} {} (physical cores isolated; at least 2 visible CPUs left unassigned)",
+            std::process::id(),
             reservation.info()
         );
-            (allocation, Some(reservation))
-        } else {
-            (
-                affinity::allocate_cpus(&allowed, requested, preferred_io)?,
-                None,
-            )
-        };
+        (allocation, Some(reservation))
+    } else {
+        (
+            affinity::allocate_cpus(&allowed, requested, preferred_io)?,
+            None,
+        )
+    };
     let cpu_threads = allocation.workers.len();
     let reader_core = (!args.no_affinity).then_some(allocation.io);
     if requested > allocation.total {
@@ -2653,6 +2670,11 @@ fn run_cli() -> Result<(), DynError> {
             requested, allocation.total
         );
     }
+    let _process_affinity = if args.no_affinity {
+        None
+    } else {
+        affinity::ThreadAffinityGuard::enter_cores(&allocation.used_cores())?
+    };
     if args.no_affinity {
         println!(
             "[info] CPU allocation: total={} compute-threads={} affinity=disabled (I/O and compute use inherited OS CPU mask; no cross-process CPU reservation)",
@@ -5319,10 +5341,7 @@ fn run_once(
         if !is_xml {
             return Err("--schedule must point to a .xml file".into());
         }
-        Some(Arc::new(ifile::parse_ifile_for_process(
-            p,
-            args.process_index,
-        )?))
+        Some(parse_schedule_args(&args, args.process_index)?)
     } else {
         None
     };

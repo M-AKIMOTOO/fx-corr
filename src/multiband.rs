@@ -13,6 +13,144 @@ use rustfft::FftPlanner;
 use crate::args::Args;
 use crate::utils::DynError;
 
+#[path = "multiband_diagnostics.rs"]
+mod diagnostics;
+
+/// Resolve one CX schedule into two native schedules in memory. Shared
+/// station/source/process definitions occur only once; each band supplies its
+/// stream and optional overrides (for example its clock). No temporary XMLs.
+pub fn configure_from_xml(args: &mut Args) -> Result<(), DynError> {
+    let Some(path) = args.schedule.clone() else {
+        return Ok(());
+    };
+    if !path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
+    {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let doc = roxmltree::Document::parse(&text)?;
+    let root = doc.root_element();
+    let is_tag = |n: roxmltree::Node<'_, '_>, tag: &str| {
+        n.is_element() && n.tag_name().name().eq_ignore_ascii_case(tag)
+    };
+    let definitions: Vec<_> = root
+        .children()
+        .filter(|n| is_tag(*n, "multiband"))
+        .collect();
+    if definitions.is_empty() {
+        if args.multiband_schedule.is_none()
+            && (args.multiband_raw_directory.is_some()
+                || args.multiband_ant1.is_some()
+                || args.multiband_ant2.is_some()
+                || !args.multiband_calibrator.is_empty())
+        {
+            return Err(
+                "multiband options require a <multiband> schedule or --multiband-schedule".into(),
+            );
+        }
+        return Ok(());
+    }
+    if definitions.len() != 1
+        || args.multiband_schedule.is_some()
+        || root.children().any(|n| is_tag(n, "stream"))
+    {
+        return Err("use one <multiband> element with two bands, without a root stream or --multiband-schedule".into());
+    }
+    let definition = definitions[0];
+    let bands: Vec<_> = definition
+        .children()
+        .filter(|n| is_tag(*n, "band"))
+        .collect();
+    if bands.len() != 2 {
+        return Err("<multiband> requires exactly two <band> elements".into());
+    }
+    let base = args
+        .raw_directory
+        .clone()
+        .ok_or("--raw is required for a multiband XML")?;
+    let mut resolved = Vec::new();
+    let mut names = Vec::new();
+    for band in bands {
+        let name = band
+            .attribute("name")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or("multiband band/name is required")?;
+        if name == "."
+            || name == ".."
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
+            || names.contains(&name)
+        {
+            return Err("multiband band names must be distinct directory-safe names".into());
+        }
+        names.push(name);
+        if band.children().filter(|n| is_tag(*n, "stream")).count() != 1 {
+            return Err("each multiband band requires exactly one <stream>".into());
+        }
+        let raw = band
+            .children()
+            .find(|n| is_tag(*n, "raw-directory"))
+            .and_then(|n| n.text())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(name);
+        let raw = base.join(raw);
+        let mut native = String::from("<schedule>\n");
+        for node in root
+            .children()
+            .filter(|n| n.is_element() && !is_tag(*n, "multiband"))
+        {
+            native.push_str(&text[node.range()]);
+            native.push('\n');
+        }
+        for node in band
+            .children()
+            .filter(|n| n.is_element() && !is_tag(*n, "raw-directory"))
+        {
+            native.push_str(&text[node.range()]);
+            native.push('\n');
+        }
+        native.push_str("</schedule>\n");
+        let meta = crate::xml::parse_xml_schedule_text(&native, None)?;
+        let frequency = meta.obsfreq_mhz.ok_or("multiband frequency missing")?;
+        if !frequency.is_finite() || frequency <= 0.0 {
+            return Err("invalid multiband RF frequency".into());
+        }
+        resolved.push((frequency, raw, Arc::new(native)));
+    }
+    resolved.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let high = resolved.pop().unwrap();
+    let low = resolved.pop().unwrap();
+    args.raw_directory = Some(low.1);
+    args.schedule_xml = Some(low.2);
+    args.multiband_schedule = Some(path);
+    args.multiband_schedule_xml = Some(high.2);
+    if args.multiband_raw_directory.is_none() {
+        args.multiband_raw_directory = Some(high.1);
+    }
+    if args.multiband_calibrator.is_empty() {
+        if let Some(names) = definition.attribute("calibrator") {
+            args.multiband_calibrator = names
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+    }
+    println!(
+        "[multiband] CX XML: band1 raw={} band2 raw={} calibrators={}",
+        args.raw_directory.as_ref().unwrap().display(),
+        args.multiband_raw_directory.as_ref().unwrap().display(),
+        args.multiband_calibrator.join(",")
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct Solution {
     pub start_s: f64,
@@ -569,7 +707,12 @@ fn write_solutions(
     Ok(())
 }
 
-fn pack_joint(paths: &[PathBuf; 2], output: &Path, reference_hz: f64) -> Result<(), DynError> {
+fn pack_joint(
+    paths: &[PathBuf; 2],
+    output: &Path,
+    reference_hz: f64,
+    mut inspect: impl FnMut(usize, &[u8; 128], &[Vec<Complex<f64>>; 2]) -> Result<(), DynError>,
+) -> Result<(), DynError> {
     let (mut readers, layout) = reader_pair(paths)?;
     let partial = output.with_extension("mbcor.part");
     let mut w = BufWriter::new(File::create(&partial)?);
@@ -582,14 +725,16 @@ fn pack_joint(paths: &[PathBuf; 2], output: &Path, reference_hz: f64) -> Result<
     for r in &readers {
         w.write_all(&r.header)?;
     }
-    for _ in 0..readers[0].sectors {
+    for row in 0..readers[0].sectors {
         let (ha, va) = readers[0].sector()?;
         let (hb, vb) = readers[1].sector()?;
         if ha[..16] != hb[..16] || ha[112..116] != hb[112..116] {
             return Err("cannot package multiband output with unequal time grids".into());
         }
-        for (header, values) in [(ha, va), (hb, vb)] {
-            w.write_all(&header)?;
+        let spectra = [va, vb];
+        inspect(row, &ha, &spectra)?;
+        for (header, values) in [(&ha, &spectra[0]), (&hb, &spectra[1])] {
+            w.write_all(header)?;
             for v in values {
                 w.write_all(&(v.re as f32).to_le_bytes())?;
                 w.write_all(&(v.im as f32).to_le_bytes())?;
@@ -606,6 +751,31 @@ fn pack_joint(paths: &[PathBuf; 2], output: &Path, reference_hz: f64) -> Result<
         (layout.low_hz[1] + layout.channels as f64 * layout.df_hz - layout.low_hz[0]) / 1e6
     );
     Ok(())
+}
+
+fn auto_products(directory: &Path, cross: &Path) -> Result<[PathBuf; 2], DynError> {
+    let x = CorReader::open(cross)?;
+    let stations = [&x.header[32..48], &x.header[80..96]];
+    let mut autos = [None, None];
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("cor") {
+            continue;
+        }
+        let r = CorReader::open(&path)?;
+        if r.header[32..48] != r.header[80..96] {
+            continue;
+        }
+        for (index, station) in stations.iter().enumerate() {
+            if &r.header[32..48] == *station && autos[index].replace(path.clone()).is_some() {
+                return Err(format!("duplicate ACF in {}", directory.display()).into());
+            }
+        }
+    }
+    Ok([
+        autos[0].take().ok_or("missing station 1 multiband ACF")?,
+        autos[1].take().ok_or("missing station 2 multiband ACF")?,
+    ])
 }
 
 fn only_cross_product(directory: &Path) -> Result<PathBuf, DynError> {
@@ -718,9 +888,12 @@ pub fn run(
         args.schedule.as_ref().unwrap(),
         args.multiband_schedule.as_ref().unwrap(),
     ];
+    let mut base_args = [args.clone(), args.clone()];
+    base_args[1].schedule = Some(schedules[1].clone());
+    base_args[1].schedule_xml = args.multiband_schedule_xml.clone();
     let metadata = [
-        crate::parse_ifile_cached(schedules[0])?,
-        crate::parse_ifile_cached(schedules[1])?,
+        crate::parse_schedule_args(&base_args[0], None)?,
+        crate::parse_schedule_args(&base_args[1], None)?,
     ];
     if metadata[0].processes.len() != metadata[1].processes.len() {
         return Err("multiband XMLs must contain the same simultaneous scans".into());
@@ -781,8 +954,8 @@ pub fn run(
             return Err("multiband process epoch, skip, length and source must match".into());
         }
         let meta = [
-            crate::ifile::parse_ifile_for_process(schedules[0], Some(index))?,
-            crate::ifile::parse_ifile_for_process(schedules[1], Some(index))?,
+            crate::parse_schedule_args(&base_args[0], Some(index))?,
+            crate::parse_schedule_args(&base_args[1], Some(index))?,
         ];
         if meta[0].sampling_hz != meta[1].sampling_hz
             || meta[0].fft != meta[1].fft
@@ -814,7 +987,7 @@ pub fn run(
         baseline = Some(current_baseline);
         let directory = root.join(format!("scan{index:04}"));
         std::fs::create_dir_all(&directory)?;
-        let mut band_args = [args.clone(), args.clone()];
+        let mut band_args = base_args.clone();
         for band in 0..2 {
             let v = &mut band_args[band];
             v.schedule = Some(schedules[band].clone());
@@ -848,6 +1021,7 @@ pub fn run(
             .as_ref()
             .is_some_and(|n| args.multiband_calibrator.contains(n));
         let transfer = !args.multiband_calibrator.is_empty() && !is_calibrator;
+        let mut solution_paths = None;
         let correction = if transfer {
             let layout = calibration_layout.ok_or("multiband calibration layout is missing")?;
             if meta.iter().enumerate().any(|(band, m)| {
@@ -894,6 +1068,7 @@ pub fn run(
                 a.skip_sec + args.skip,
                 calibration.as_ref().map(|c| c.band_phase_rad),
             )?;
+            solution_paths = Some(solve_paths.clone());
             if is_calibrator {
                 let (_, layout) = reader_pair(&solve_paths)?;
                 if let Some(previous) = calibration_layout {
@@ -929,16 +1104,24 @@ pub fn run(
             &correction,
             "seconds_since_XML_process_epoch",
         )?;
+        diagnostics::plot_solutions(&directory, &correction)?;
         if !indices.contains(&index) {
             continue;
         }
         let mut final_paths = [PathBuf::new(), PathBuf::new()];
+        let mut auto_paths = [
+            [PathBuf::new(), PathBuf::new()],
+            [PathBuf::new(), PathBuf::new()],
+        ];
         for band in 0..2 {
             let mut v = band_args[band].clone();
             let out = directory.join(format!("band{}", band + 1));
             v.cor_directory = Some(out.clone());
             v.multiband_correction = Some(Arc::clone(&correction));
             v.multiband_band_index = band;
+            // Final multiband products always include both station powers.
+            // Only the short solution pass uses the XCF-only fast path.
+            v.xcf_only = false;
             println!(
                 "[multiband] scan {} corrected correlation band {}",
                 index + 1,
@@ -946,11 +1129,20 @@ pub fn run(
             );
             crate::run_once(v, crate::RunMode::Corr, cpu_threads, reader_core)?;
             final_paths[band] = only_cross_product(&out)?;
+            let autos = auto_products(&out, &final_paths[band])?;
+            for station in 0..2 {
+                auto_paths[station][band] = autos[station].clone();
+            }
         }
-        pack_joint(
+        diagnostics::write(
+            &directory,
             &final_paths,
-            &directory.join("joint.mbcor"),
-            correction.reference_hz,
+            &auto_paths,
+            solution_paths.as_ref(),
+            &correction,
+            args,
+            epoch,
+            transfer,
         )?;
     }
     if let Some(mut c) = calibration {
@@ -964,6 +1156,61 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cx_schedule_keeps_shared_scans_and_each_bands_clock_and_raw_directory() {
+        use clap::Parser;
+        let path = std::env::temp_dir().join(format!("cx-schedule-{}.xml", std::process::id()));
+        let xml = include_str!("../examples/I26280X_all_KL_CX.xml");
+        std::fs::write(&path, xml).unwrap();
+        let mut args = Args::parse_from([
+            "yi-corr",
+            "--schedule",
+            path.to_str().unwrap(),
+            "--raw",
+            "/observations",
+        ]);
+        configure_from_xml(&mut args).unwrap();
+        assert_eq!(
+            args.raw_directory.as_deref(),
+            Some(Path::new("/observations/c"))
+        );
+        assert_eq!(
+            args.multiband_raw_directory.as_deref(),
+            Some(Path::new("/observations/x"))
+        );
+        assert_eq!(args.multiband_calibrator, vec!["NRAO530"]);
+        let low = crate::parse_schedule_args(&args, Some(0)).unwrap();
+        args.schedule_xml = args.multiband_schedule_xml.clone();
+        let high = crate::parse_schedule_args(&args, Some(0)).unwrap();
+        assert_eq!(low.processes.len(), 10);
+        assert_eq!(high.processes.len(), 10);
+        assert_eq!(low.obsfreq_mhz, Some(6600.0));
+        assert_eq!(high.obsfreq_mhz, Some(8192.0));
+        assert_eq!(low.output_sec, Some(1.0));
+        assert_eq!(low.ant2_clock_delay_s, Some(1.707118524609375e-6));
+        assert_eq!(high.ant2_clock_delay_s, Some(1.7176596209375e-6));
+        for (a, b) in low.processes.iter().zip(&high.processes) {
+            assert!(crate::same_validation_scan(a, b));
+        }
+        for bad in [
+            xml.replace("name=\"x\"", "name=\"c\""),
+            xml.replace("name=\"x\"", "name=\"../x\""),
+            xml.replace("<band name=\"x\">", "<other>")
+                .replace("</band>\n  </multiband>", "</other>\n  </multiband>"),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let mut args = Args::parse_from([
+                "yi-corr",
+                "--schedule",
+                path.to_str().unwrap(),
+                "--raw",
+                "/observations",
+            ]);
+            assert!(configure_from_xml(&mut args).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn fixture(offset: f64, delay: f64, rate: f64) -> (Layout, Vec<Row>) {
         let layout = Layout {

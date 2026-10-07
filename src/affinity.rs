@@ -250,6 +250,166 @@ pub struct CpuAllocation {
     pub total: usize,
 }
 
+impl CpuAllocation {
+    pub fn used_cores(&self) -> Vec<core_affinity::CoreId> {
+        let mut cores = self.workers.clone();
+        cores.push(self.io);
+        cores.sort_unstable_by_key(|c| c.id);
+        cores.dedup_by_key(|c| c.id);
+        cores
+    }
+}
+
+struct CpuTopology {
+    groups: Vec<Vec<usize>>,
+}
+
+impl CpuTopology {
+    fn discover(universe: &[core_affinity::CoreId]) -> Self {
+        let mut groups = Vec::new();
+        for cpu in universe {
+            #[cfg(target_os = "linux")]
+            let siblings = fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
+                cpu.id
+            ))
+            .ok()
+            .and_then(|text| parse_affinity_spec(&text).ok());
+            #[cfg(not(target_os = "linux"))]
+            let siblings: Option<Vec<usize>> = None;
+            let group = siblings
+                .filter(|g| g.contains(&cpu.id))
+                .unwrap_or_else(|| vec![cpu.id]);
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        groups.sort_unstable();
+        Self { groups }
+    }
+}
+
+// Keep live assignments fixed. Reserve all SMT siblings of each selected
+// physical core, while only the N used logical CPUs enter the thread masks.
+fn isolated_allocation(
+    available: &[core_affinity::CoreId],
+    universe: &[core_affinity::CoreId],
+    topology: &CpuTopology,
+    requested: usize,
+    preferred_io: Option<core_affinity::CoreId>,
+    occupied: &HashSet<usize>,
+) -> Result<(CpuAllocation, Vec<usize>), DynError> {
+    let universe_ids: HashSet<_> = universe.iter().map(|c| c.id).collect();
+    let allowed: HashSet<_> = available
+        .iter()
+        .map(|c| c.id)
+        .filter(|id| universe_ids.contains(id))
+        .collect();
+    let target = requested.min(allowed.len());
+    if target == 0 {
+        return Err("CPU reservation requires a nonzero request and available CPUs".into());
+    }
+    let mut blocked = occupied.clone();
+    for group in &topology.groups {
+        if group.iter().any(|id| occupied.contains(id)) {
+            blocked.extend(group);
+        }
+    }
+    let free_count = universe_ids
+        .iter()
+        .filter(|id| !blocked.contains(id))
+        .count();
+    let budget = free_count.saturating_sub(2);
+    let mut candidates: Vec<_> = topology
+        .groups
+        .iter()
+        .filter_map(|group| {
+            if group.iter().any(|id| blocked.contains(id)) {
+                return None;
+            }
+            let usable: Vec<_> = group
+                .iter()
+                .copied()
+                .filter(|id| allowed.contains(id))
+                .collect();
+            if usable.is_empty() {
+                None
+            } else {
+                Some((group, usable))
+            }
+        })
+        .collect();
+    if let Some(io) = preferred_io {
+        let index = candidates.iter().position(|(_, ids)| ids.contains(&io.id))
+            .ok_or_else(|| format!("YI_READER_CORE={} is outside the allowed set or shares a reserved physical core", io.id))?;
+        candidates.swap(0, index);
+    }
+    let mut selected = Vec::new();
+    let mut claimed_groups = Vec::new();
+    let mut cost = 0;
+    // First spread workers over physical cores, then use their SMT siblings
+    // only if the requested logical count needs them.
+    for (group, ids) in &candidates {
+        let extra = group.iter().filter(|id| universe_ids.contains(id)).count();
+        if cost + extra > budget {
+            continue;
+        }
+        let id = preferred_io
+            .filter(|io| ids.contains(&io.id))
+            .map_or(ids[0], |io| io.id);
+        selected.push(id);
+        claimed_groups.push((*group, ids));
+        cost += extra;
+        if selected.len() == target {
+            break;
+        }
+    }
+    if preferred_io.is_some_and(|io| !selected.contains(&io.id)) {
+        return Err("cannot reserve YI_READER_CORE while leaving two visible CPUs free".into());
+    }
+    if selected.len() < target {
+        for (_, ids) in &claimed_groups {
+            for &id in *ids {
+                if selected.len() == target {
+                    break;
+                }
+                if !selected.contains(&id) {
+                    selected.push(id);
+                }
+            }
+            if selected.len() == target {
+                break;
+            }
+        }
+    }
+    if selected.len() < target {
+        return Err(format!("cannot reserve {target} logical CPUs without sharing physical cores with running yi-corr processes and leaving two visible CPUs free (only {} can be assigned)", selected.len()).into());
+    }
+    let io = preferred_io.or_else(|| {
+        selected
+            .iter()
+            .rev()
+            .find(|id| {
+                topology.groups.iter().any(|g| {
+                    g.contains(id) && selected.iter().filter(|c| g.contains(c)).count() == 1
+                })
+            })
+            .map(|id| core_affinity::CoreId { id: *id })
+    });
+    let cores = selected
+        .iter()
+        .map(|id| core_affinity::CoreId { id: *id })
+        .collect::<Vec<_>>();
+    let allocation = allocate_cpus(&cores, target, io)?;
+    let mut reserved: Vec<_> = claimed_groups
+        .iter()
+        .flat_map(|(g, _)| g.iter().copied())
+        .collect();
+    reserved.sort_unstable();
+    reserved.dedup();
+    Ok((allocation, reserved))
+}
+
 pub fn allocate_cpus(
     available: &[core_affinity::CoreId],
     requested: usize,
@@ -332,7 +492,7 @@ pub struct CpuReservationGuard {
 impl CpuReservationGuard {
     pub fn info(&self) -> String {
         format!(
-            "registry={} CPUs={}",
+            "registry={} reserved CPU IDs (including SMT siblings)={}",
             self.registry_path.display(),
             self.cpus
                 .iter()
@@ -403,6 +563,27 @@ fn reserve_cpus_in(
     requested: usize,
     preferred_io: Option<core_affinity::CoreId>,
 ) -> Result<(CpuAllocation, CpuReservationGuard), DynError> {
+    reserve_cpus_with_topology_in(
+        state_path,
+        lock_path,
+        available,
+        universe,
+        requested,
+        preferred_io,
+        &CpuTopology::discover(universe),
+    )
+}
+
+#[cfg(unix)]
+fn reserve_cpus_with_topology_in(
+    state_path: &Path,
+    lock_path: &Path,
+    available: &[core_affinity::CoreId],
+    universe: &[core_affinity::CoreId],
+    requested: usize,
+    preferred_io: Option<core_affinity::CoreId>,
+    topology: &CpuTopology,
+) -> Result<(CpuAllocation, CpuReservationGuard), DynError> {
     if requested == 0 || available.is_empty() || universe.is_empty() {
         return Err("CPU reservation requires a nonzero request and available CPUs".into());
     }
@@ -413,79 +594,18 @@ fn reserve_cpus_in(
     let mut entries = read_cpu_reservations(state_path)?;
     entries.retain(reservation_is_live);
 
-    let mut universe_ids: Vec<_> = universe.iter().map(|core| core.id).collect();
-    universe_ids.sort_unstable();
-    universe_ids.dedup();
-    let universe_set: HashSet<_> = universe_ids.iter().copied().collect();
-    let mut allowed_ids: Vec<_> = available
-        .iter()
-        .map(|core| core.id)
-        .filter(|id| universe_set.contains(id))
-        .collect();
-    allowed_ids.sort_unstable();
-    allowed_ids.dedup();
-    if allowed_ids.is_empty() {
-        return Err("the allowed CPU set has no CPUs in the current affinity mask".into());
-    }
-
     let mut occupied = HashSet::<usize>::new();
     for entry in &entries {
-        occupied.extend(
-            entry
-                .cpus
-                .iter()
-                .copied()
-                .filter(|id| universe_set.contains(id)),
-        );
+        occupied.extend(entry.cpus.iter().copied());
     }
-    let free_universe = universe_ids
-        .iter()
-        .filter(|id| !occupied.contains(id))
-        .count();
-    let target = requested.min(allowed_ids.len());
-    if free_universe < target.saturating_add(2) {
-        return Err(format!(
-            "cannot reserve {target} CPUs while leaving 2 free: only {free_universe} visible CPUs are currently unreserved"
-        )
-        .into());
-    }
-    let free_allowed: Vec<_> = allowed_ids
-        .iter()
-        .copied()
-        .filter(|id| !occupied.contains(id))
-        .collect();
-    if free_allowed.len() < target {
-        return Err(format!(
-            "cannot reserve {target} CPUs from this allowed set: only {} are currently free",
-            free_allowed.len()
-        )
-        .into());
-    }
-
-    let mut selected = Vec::with_capacity(target);
-    if let Some(io) = preferred_io {
-        if !free_allowed.contains(&io.id) {
-            return Err(format!(
-                "YI_READER_CORE={} is unavailable or already reserved by another yi-corr process",
-                io.id
-            )
-            .into());
-        }
-        selected.push(io.id);
-    }
-    for id in free_allowed.iter().copied() {
-        if selected.len() == target {
-            break;
-        }
-        if !selected.contains(&id) {
-            selected.push(id);
-        }
-    }
-    let selected_cores: Vec<_> = selected
-        .iter()
-        .map(|id| core_affinity::CoreId { id: *id })
-        .collect();
-    let allocation = allocate_cpus(&selected_cores, target, preferred_io)?;
+    let (allocation, reserved) = isolated_allocation(
+        available,
+        universe,
+        topology,
+        requested,
+        preferred_io,
+        &occupied,
+    )?;
 
     let sequence = NEXT_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
     let token = format!("{current_pid}-{current_start}-{sequence}");
@@ -493,7 +613,7 @@ fn reserve_cpus_in(
         token: token.clone(),
         pid: current_pid,
         start_time: current_start,
-        cpus: selected,
+        cpus: reserved.clone(),
     });
     write_cpu_reservations(state_path, &entries, current_pid, sequence)?;
 
@@ -503,7 +623,7 @@ fn reserve_cpus_in(
             registry_path: state_path.to_path_buf(),
             lock_path: lock_path.to_path_buf(),
             token,
-            cpus: selected_cores.iter().map(|core| core.id).collect(),
+            cpus: reserved,
         },
     ))
 }
@@ -659,17 +779,25 @@ fn reservation_is_live(entry: &CpuReservationEntry) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-// Pin only the file-output section. Restoring the mask before workflows spawn
-// child processes prevents them from inheriting a one-CPU restriction.
+// Pin the calling thread only, and restore its previous mask on scope exit.
+// The outer guard bounds auxiliary threads; a nested output guard temporarily
+// selects I/O without leaking a one-CPU mask into later workflow children.
 #[cfg(target_os = "linux")]
-pub struct IoAffinityGuard(libc::cpu_set_t);
+pub struct ThreadAffinityGuard(libc::cpu_set_t);
 
 #[cfg(target_os = "linux")]
-impl IoAffinityGuard {
+impl ThreadAffinityGuard {
     pub fn enter(core: Option<core_affinity::CoreId>) -> Result<Option<Self>, DynError> {
         let Some(core) = core else {
             return Ok(None);
         };
+        Self::enter_cores(&[core])
+    }
+
+    pub fn enter_cores(cores: &[core_affinity::CoreId]) -> Result<Option<Self>, DynError> {
+        if cores.is_empty() {
+            return Err("cannot set an empty thread CPU mask".into());
+        }
         let mut previous = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
         let result = unsafe {
             libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut previous)
@@ -677,15 +805,29 @@ impl IoAffinityGuard {
         if result != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        if !set_current_thread_core(core) {
-            return Err("failed to pin output thread to I/O CPU".into());
+        let mut mask = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        for core in cores {
+            if core.id >= libc::CPU_SETSIZE as usize
+                || !unsafe { libc::CPU_ISSET(core.id, &previous) }
+            {
+                return Err(
+                    format!("CPU {} is outside this thread's inherited mask", core.id).into(),
+                );
+            }
+            unsafe {
+                libc::CPU_SET(core.id, &mut mask);
+            }
+        }
+        if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mask) } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
         }
         Ok(Some(Self(previous)))
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for IoAffinityGuard {
+impl Drop for ThreadAffinityGuard {
     fn drop(&mut self) {
         unsafe {
             libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.0);
@@ -694,17 +836,118 @@ impl Drop for IoAffinityGuard {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub struct IoAffinityGuard;
+pub struct ThreadAffinityGuard;
 #[cfg(not(target_os = "linux"))]
-impl IoAffinityGuard {
+impl ThreadAffinityGuard {
     pub fn enter(_core: Option<core_affinity::CoreId>) -> Result<Option<Self>, DynError> {
+        Ok(None)
+    }
+    pub fn enter_cores(_cores: &[core_affinity::CoreId]) -> Result<Option<Self>, DynError> {
         Ok(None)
     }
 }
 
+pub type IoAffinityGuard = ThreadAffinityGuard;
+
 #[cfg(test)]
 mod cpu_allocation_tests {
     use super::*;
+
+    // Original registry tests use synthetic single-threaded cores, independent
+    // of the machine executing the test.
+    #[cfg(unix)]
+    fn reserve_cpus_in(
+        state: &Path,
+        lock: &Path,
+        available: &[core_affinity::CoreId],
+        universe: &[core_affinity::CoreId],
+        requested: usize,
+        io: Option<core_affinity::CoreId>,
+    ) -> Result<(CpuAllocation, CpuReservationGuard), DynError> {
+        reserve_cpus_with_topology_in(
+            state,
+            lock,
+            available,
+            universe,
+            requested,
+            io,
+            &CpuTopology {
+                groups: universe.iter().map(|c| vec![c.id]).collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn different_processes_never_select_smt_siblings_even_with_partial_masks() {
+        let cpus: Vec<_> = (0..12).map(|id| core_affinity::CoreId { id }).collect();
+        let topology = CpuTopology {
+            groups: (0..6).map(|i| vec![2 * i, 2 * i + 1]).collect(),
+        };
+        let (first, reserved) =
+            isolated_allocation(&cpus, &cpus, &topology, 2, None, &HashSet::new()).unwrap();
+        assert_eq!(
+            first.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [0, 2]
+        );
+        assert_eq!(reserved, [0, 1, 2, 3]);
+        let occupied = reserved.into_iter().collect();
+        let (second, reserved2) =
+            isolated_allocation(&cpus, &cpus, &topology, 2, None, &occupied).unwrap();
+        assert_eq!(
+            second.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [4, 6]
+        );
+        assert_eq!(reserved2, [4, 5, 6, 7]);
+        assert_eq!(
+            first.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [0, 2]
+        );
+        let partial: Vec<_> = cpus.iter().copied().filter(|c| c.id % 2 == 1).collect();
+        let (third, _) =
+            isolated_allocation(&partial, &partial, &topology, 2, None, &HashSet::from([0]))
+                .unwrap();
+        assert_eq!(
+            third.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [3, 5]
+        );
+        assert!(isolated_allocation(
+            &cpus,
+            &cpus,
+            &topology,
+            2,
+            Some(core_affinity::CoreId { id: 1 }),
+            &occupied
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thread_mask_is_local_restored_and_inherited_by_own_children() {
+        let initial = core_affinity::get_core_ids().unwrap();
+        let selected: Vec<_> = initial.iter().copied().take(2).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            core_affinity::get_core_ids().unwrap()
+        });
+        let guard = ThreadAffinityGuard::enter_cores(&selected).unwrap();
+        assert_eq!(core_affinity::get_core_ids().unwrap(), selected);
+        tx.send(()).unwrap();
+        assert_eq!(observer.join().unwrap(), initial);
+        assert_eq!(
+            std::thread::spawn(|| core_affinity::get_core_ids().unwrap())
+                .join()
+                .unwrap(),
+            selected
+        );
+        let io = ThreadAffinityGuard::enter(Some(selected[0])).unwrap();
+        assert_eq!(core_affinity::get_core_ids().unwrap(), [selected[0]]);
+        drop(io);
+        assert_eq!(core_affinity::get_core_ids().unwrap(), selected);
+        drop(guard);
+        assert_eq!(core_affinity::get_core_ids().unwrap(), initial);
+    }
     #[test]
     fn reserves_one_of_requested_cpus_and_respects_allowed_mask() {
         let available: Vec<_> = [2, 4, 8, 10]

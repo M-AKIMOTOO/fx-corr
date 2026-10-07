@@ -1,0 +1,45 @@
+<schedule>
+  <!-- Common definitions from I26280X_all_KL_C.xml / I26280X_all_KL_X.xml. -->
+  <terminal name="VSREC"><speed>1024000000</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,+0.5,+1.5</level></terminal>
+  <station key="K"><name>YAMAGU32</name><pos-x>-3502544.587</pos-x><pos-y>+3950966.235</pos-y><pos-z>+3566381.192</pos-z><terminal>VSREC</terminal></station>
+  <station key="L"><name>YAMAGU34</name><pos-x>-3502567.576</pos-x><pos-y>+3950885.734</pos-y><pos-z>+3566449.115</pos-z><terminal>VSREC</terminal></station>
+  <shuffle key="K">24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7</shuffle>
+  <shuffle key="L">24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7</shuffle>
+  <source name="1744M312"><ra>17h44m23.57833</ra><dec>-31d16'36.2931</dec></source>
+  <source name="1750M327"><ra>17h50m02.95200</ra><dec>-32d42'44.2800</dec></source>
+  <source name="G353"><ra>17h26m01.59000</ra><dec>-34d15'14.9000</dec></source>
+  <source name="3C286"><ra>13h31m08.28800</ra><dec>+30d30'32.9600</dec></source>
+  <source name="3C48"><ra>01h37m41.29940</ra><dec>+33d09'35.1340</dec></source>
+  <source name="NRAO530"><ra>17h33m02.70579</ra><dec>-13d04'49.5482</dec></source>
+
+  <!-- The raw CLI option reads RAW_ROOT/c and RAW_ROOT/x. -->
+  <multiband calibrator="NRAO530">
+    <band name="c">
+      <stream>
+        <label>c</label><frequency>6600e6</frequency><channel>1</channel><fft>1024</fft><output>1</output>
+        <special key="K"><sideband>LSB</sideband></special>
+        <special key="L"><sideband>LSB</sideband></special>
+      </stream>
+      <clock key="L"><epoch>2026/280 08:10:00</epoch><delay>1.707118524609375e-06</delay><rate>0.0</rate></clock>
+    </band>
+    <band name="x">
+      <stream>
+        <label>x</label><frequency>8192e6</frequency><channel>1</channel><fft>1024</fft><output>1</output>
+        <special key="K"><sideband>LSB</sideband></special>
+        <special key="L"><sideband>LSB</sideband></special>
+      </stream>
+      <clock key="L"><epoch>2026/280 08:10:00</epoch><delay>1.7176596209375e-06</delay><rate>0.0</rate></clock>
+    </band>
+  </multiband>
+
+  <process><epoch>2026/280 08:10:00</epoch><skip>0</skip><length>300</length><object>NRAO530</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:17:00</epoch><skip>0</skip><length>120</length><object>1744M312</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:20:00</epoch><skip>0</skip><length>600</length><object>1750M327</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:31:00</epoch><skip>0</skip><length>120</length><object>1744M312</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:34:00</epoch><skip>0</skip><length>600</length><object>1750M327</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:45:00</epoch><skip>0</skip><length>120</length><object>1744M312</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:48:00</epoch><skip>0</skip><length>600</length><object>1750M327</object><stations>KL</stations></process>
+  <process><epoch>2026/280 08:59:00</epoch><skip>0</skip><length>120</length><object>1744M312</object><stations>KL</stations></process>
+  <process><epoch>2026/280 09:02:00</epoch><skip>0</skip><length>600</length><object>1750M327</object><stations>KL</stations></process>
+  <process><epoch>2026/280 09:13:00</epoch><skip>0</skip><length>120</length><object>1744M312</object><stations>KL</stations></process>
+</schedule>

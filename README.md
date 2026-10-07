@@ -70,18 +70,23 @@ cross-process CPU reservation registry, so concurrent runs may share CPUs.
 Repeat the comparison in alternating order with the same input, chunk size,
 and queue depth; input caching can otherwise obscure the effect of pinning.
 
-With pinning enabled, on Unix an explicit `yi-corr --cpu N` also reserves its CPU IDs for the
-process lifetime in `$HOME/.yi-corr`. Concurrent runs
-take the first free IDs in order, so with a full 0-31 affinity mask and no
-custom reader CPU, `--cpu 6`, another `--cpu 6`, and then `--cpu 12` receive
-IDs `0-5`, `6-11`, and `12-23`.
-At least two visible CPU IDs remain unreserved. If a request cannot fit while
-preserving that reserve, yi-corr exits with an explanatory error instead of
-sharing CPUs. The advisory lock in `$HOME/.yi-corr.lock` serializes updates;
-normal exit releases the entry and removes the registry when no claims remain.
-The next run removes entries left by dead processes. These are OS
-logical CPU IDs; SMT siblings may still share a physical core. The registry
-does not change the default allocation when `--cpu` is omitted.
+With pinning enabled, both programs reserve CPUs for their lifetime in
+`$HOME/.yi-corr`, including when `--cpu` is omitted. On Linux the allocator
+spreads work over physical cores first and reserves their SMT siblings so
+another cooperating process cannot share those physical cores. `--cpu N`
+still uses only N logical CPUs, including I/O; reserved siblings can make
+the registry entry larger than N. The main thread is restricted before
+spawning workers/readers so auxiliary threads inherit the same allowed set.
+Existing processes keep their assignments when another process starts.
+No other process's CPU mask or system CPU settings are changed.
+
+At least two visible logical CPUs remain unreserved. If the allocation cannot
+fit while respecting existing reservations and this reserve, the program
+exits with an explanatory error. An advisory lock serializes registry updates;
+normal exit releases the claim, and the next run removes dead-process entries.
+The reserve does not exclude other applications from these CPUs. Disk,
+memory bandwidth and power/thermal limits remain shared resources. See
+[CPU affinity and concurrent execution](docs/fx-corr-affinity.md).
 
 For normal correlation, add `--cpu-auto` to adapt the number of simultaneous
 compute jobs to measured input supply. `--cpu N` remains the total CPU limit,
@@ -2744,6 +2749,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.10.0` | Adds one CX XML with separate C/X RAW directories, native and joint multiband ACF outputs, and automatic QA PNG/TSV/parameter products. Final output follows the XML rate; 20 Hz is only the default calibrator solution pass. Restricts the main/auxiliary thread masks and reserves physical cores including SMT siblings across concurrent yi-corr/yi-phasedarray processes. |
 | `3.9.0` | Adds simultaneous two-band correlation with actual RF coordinates, shared residual delay/rate, and unknown IF-phase calibration. Strong-calibrator solutions can be applied across target scans before integration, without fitting faint-target noise. Outputs frequency-aware `.mbcor`, correction tables, and native band `.cor`; includes a streaming weighted complex-visibility exporter. See [multiband processing](docs/fx-corr-multiband.md). |
 | `3.8.0` | Reuses per-worker decode/FFT/accumulation buffers across input chunks, fuses phased spectrum mapping/correction/synthesis, skips unused diagnostics, and quantizes directly into packed output with precomputed bit-shuffle tables. Adds `--no-affinity` at unchanged worker counts and an ACF-free fast kernel for internal XCF-only workflows. Includes reproducible [throughput measurements](docs/fx-corr-performance.md) and mixed-bit/rotated-grid output regression tests. |
 | `3.7.0` | Adds coordinated CPU-core allocation for concurrent yi-corr processes and reuses partial correlation accumulators to improve compute throughput. |

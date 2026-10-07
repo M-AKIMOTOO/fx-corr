@@ -57,18 +57,12 @@ pub struct Args {
     )]
     pub multiband_schedule: Option<PathBuf>,
 
-    #[arg(
-        long,
-        value_name = "DIR",
-        requires = "multiband_schedule",
-        help = "Second RF-band raw directory"
-    )]
+    #[arg(long, value_name = "DIR", help = "Second RF-band raw directory")]
     pub multiband_raw_directory: Option<PathBuf>,
 
     #[arg(
         long,
         value_name = "FILE",
-        requires = "multiband_schedule",
         help = "Antenna 1 raw file for the second RF band"
     )]
     pub multiband_ant1: Option<PathBuf>,
@@ -76,7 +70,6 @@ pub struct Args {
     #[arg(
         long,
         value_name = "FILE",
-        requires = "multiband_schedule",
         help = "Antenna 2 raw file for the second RF band"
     )]
     pub multiband_ant2: Option<PathBuf>,
@@ -118,7 +111,6 @@ pub struct Args {
 
     #[arg(
         long,
-        requires = "multiband_schedule",
         value_delimiter = ',',
         help = "XML object names of strong calibrators; transfer their residual delay/rate/phase to targets without fitting targets"
     )]
@@ -146,6 +138,12 @@ pub struct Args {
 
     #[arg(skip)]
     pub multiband_band_index: usize,
+
+    #[arg(skip)]
+    pub schedule_xml: Option<std::sync::Arc<String>>,
+
+    #[arg(skip)]
+    pub multiband_schedule_xml: Option<std::sync::Arc<String>>,
 
     // Output files
     #[arg(
