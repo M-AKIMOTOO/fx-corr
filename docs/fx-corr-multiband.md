@@ -251,9 +251,32 @@ solution pass, `solutions.tsv` and `solutions.png` are produced. Normally all
 XML scans are selected and receive the complete output set above.
 
 The native files and joint file deliberately preserve spectral information.
-The existing `.cor` header cannot represent a gap between two IFs; ordinary
-`.cor`/frinZ readers cannot directly read `.mbcor`. Export with the included
-streaming Python tool (standard library only):
+The existing `.cor` header cannot represent a gap between two IFs. **frinZ
+5.4.0 or later** detects yi-corr's `.mbcor` format directly and searches one
+common delay/rate using the physical RF grids and reference frequency:
+
+```bash
+frinZ --in output/multiband/scan0001/joint.mbcor --cpu 6
+
+# A 300-sector scan split into thirty ten-sector windows:
+frinZ --in output/multiband/scan0001/joint.mbcor \
+  --length 10 --loop 30 --search peak --add-plot --npz --cpu 6
+```
+
+Outputs go to the input directory's `frinZ/mbcor/`: joint parameter TSV,
+physical-RF spectrum and timestamped complex time-series TSV, and phase,
+spectrum, delay and rate PNGs. The rate is Hz at the MBCOR reference RF;
+phase is referenced to each analysis window's midpoint. The gap contributes
+no noise weight, and no new per-target IF-phase fit is performed. Its
+`snr_diff` is a channel/time first-difference noise diagnostic, with a
+different definition from native frinZ's delay-plane SNR. See
+[frinZ MBCOR input documentation](https://github.com/M-AKIMOTOO/frinZ/blob/main/docs/mbcor.md)
+for supported flags, layout restrictions and statistical assumptions.
+Older COR-only readers cannot directly read MBCOR; changing the extension
+or simply joining the bands as a continuous COR spectrum loses the RF gap.
+
+For complex averaging or export, use the included streaming Python tool
+(standard library only):
 
 ```bash
 python3 tools/multiband_visibility.py \
