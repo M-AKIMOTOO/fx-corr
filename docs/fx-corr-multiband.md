@@ -32,14 +32,30 @@ keeps its original stream settings and L clock correction. `NRAO530` is the
 calibrator in this example. Copy this file as `cx.xml` and run:
 
 ```bash
-yi-corr --schedule cx.xml --raw /path/to/raw --cor cor --cpu 6
+yi-corr --schedule cx.xml --raw /path/to/observation --cor cor --cpu 6
 ```
 
-RAW files are found under `/path/to/raw/c` and `/path/to/raw/x`, using the
+This example has explicit `<raw-directory>c/raw</raw-directory>` and
+`<raw-directory>x/raw</raw-directory>` entries, matching observations where
+single-band runs use `--raw raw` inside each C/X directory.
+RAW files are found under `/path/to/observation/c/raw` and
+`/path/to/observation/x/raw`, using the
 usual station/epoch filenames. To use an existing different directory layout,
 set `<raw-directory>` inside each band. Relative paths are resolved from
 `--raw`; absolute paths are also accepted. These are input locations, not
 copies or moves of RAW data.
+
+From the common parent of C/X directories, the complete I26280X run is:
+
+```bash
+yi-corr --schedule /home/akimoto/cx.xml --raw . --cor cx/cor --cpu 6
+```
+
+All ten processes are selected when `--process-index` is omitted. NRAO530
+at 2026/280 08:10:00 supplies calibration for the subsequent target scans.
+Final integration remains one second (`<output>1</output>`).
+If `<raw-directory>` is omitted, the default is simply the band's name
+(for example `--raw RAW_ROOT` reads `RAW_ROOT/c` and `RAW_ROOT/x`).
 
 ```xml
 <multiband calibrator="NRAO530">

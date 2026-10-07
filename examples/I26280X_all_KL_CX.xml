@@ -12,9 +12,11 @@
   <source name="3C48"><ra>01h37m41.29940</ra><dec>+33d09'35.1340</dec></source>
   <source name="NRAO530"><ra>17h33m02.70579</ra><dec>-13d04'49.5482</dec></source>
 
-  <!-- The raw CLI option reads RAW_ROOT/c and RAW_ROOT/x. -->
+  <!-- Run from the observation parent directory with the raw CLI option set to a dot. -->
+  <!-- This example reads c/raw and x/raw relative to that directory. -->
   <multiband calibrator="NRAO530">
     <band name="c">
+      <raw-directory>c/raw</raw-directory>
       <stream>
         <label>c</label><frequency>6600e6</frequency><channel>1</channel><fft>1024</fft><output>1</output>
         <special key="K"><sideband>LSB</sideband></special>
@@ -23,6 +25,7 @@
       <clock key="L"><epoch>2026/280 08:10:00</epoch><delay>1.707118524609375e-06</delay><rate>0.0</rate></clock>
     </band>
     <band name="x">
+      <raw-directory>x/raw</raw-directory>
       <stream>
         <label>x</label><frequency>8192e6</frequency><channel>1</channel><fft>1024</fft><output>1</output>
         <special key="K"><sideband>LSB</sideband></special>

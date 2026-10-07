@@ -1173,11 +1173,11 @@ mod tests {
         configure_from_xml(&mut args).unwrap();
         assert_eq!(
             args.raw_directory.as_deref(),
-            Some(Path::new("/observations/c"))
+            Some(Path::new("/observations/c/raw"))
         );
         assert_eq!(
             args.multiband_raw_directory.as_deref(),
-            Some(Path::new("/observations/x"))
+            Some(Path::new("/observations/x/raw"))
         );
         assert_eq!(args.multiband_calibrator, vec!["NRAO530"]);
         let low = crate::parse_schedule_args(&args, Some(0)).unwrap();
