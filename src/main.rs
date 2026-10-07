@@ -12,6 +12,7 @@ mod input_pipeline;
 mod model_diag;
 mod model_diag_output;
 mod model_sweep;
+mod multiband;
 mod plot;
 mod pulsar;
 mod utils;
@@ -2688,6 +2689,12 @@ fn run_cli() -> Result<(), DynError> {
     tp_builder
         .build_global()
         .map_err(|e| format!("failed to configure rayon thread pool: {e}"))?;
+    if args.multiband_schedule.is_some() {
+        if !matches!(run_mode, RunMode::Corr) {
+            return Err("--multiband-schedule is supported only by yi-corr".into());
+        }
+        return multiband::run(&args, cpu_threads, reader_core);
+    }
     let if_d = if let Some(p) = &args.schedule {
         let is_xml = p
             .extension()
@@ -7976,7 +7983,10 @@ fn run_once(
             None
         };
         let frame_sec = fft_len as f64 / fs;
-        let output_hz = if_d.as_ref().and_then(|d| d.output_sec).unwrap_or(1.0);
+        let output_hz = args
+            .integration_rate_override
+            .or_else(|| if_d.as_ref().and_then(|d| d.output_sec))
+            .unwrap_or(1.0);
 
         if !output_hz.is_finite() || output_hz <= 0.0 {
             return Err(format!(
@@ -8402,6 +8412,30 @@ fn run_once(
         let normal_corr_kernel = NormalCorrKernel::from_output_grid(out_grid);
         let need_grid_buffers = pulsar_runtime.is_some() || fft_peak_debug;
         let overlap_len = ba.a1e - ba.a1s;
+        let xcf_frame_phase = |d: FrameDelayEntry| {
+            let (mut phase, mut step) = xcf_phase_start_and_step(
+                df_hz,
+                d.frac1,
+                d.frac2,
+                ba.a1s as isize - rotation_bins1,
+                ba.a2s as isize - rotation_bins2,
+            );
+            if let Some(correction) = args.multiband_correction.as_ref() {
+                let start = match out_grid {
+                    OutputGrid::Ant1 => ba.a1s,
+                    OutputGrid::Ant2 => ba.a2s,
+                };
+                let (extra_phase, extra_step) = correction.phase_start_and_step(
+                    args.multiband_band_index,
+                    d.t_mid_s,
+                    obs_mhz * 1e6 + start as f64 * df_hz,
+                    df_hz,
+                );
+                phase *= extra_phase;
+                step *= extra_step;
+            }
+            (phase, step)
+        };
         // Frequency-grid maps are constant for the whole process.  Building
         // them inside every output sector is especially expensive for very
         // large FFTs, where a map pair can occupy many MiB.
@@ -9044,15 +9078,7 @@ fn run_once(
                                 let t_since_process_s = d.t_mid_s - total_skip_sec;
                                 match out_grid {
                                     OutputGrid::Ant1 => {
-                                        let phase_delay1_s = d.frac1;
-                                        let phase_delay2_s = d.frac2;
-                                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
-                                            df_hz,
-                                            phase_delay1_s,
-                                            phase_delay2_s,
-                                            ba.a1s as isize - rotation_bins1,
-                                            ba.a2s as isize - rotation_bins2,
-                                        );
+                                        let (mut phase_corr, phase_step) = xcf_frame_phase(d);
                                         for k in 0..overlap_len {
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
@@ -9071,15 +9097,7 @@ fn run_once(
                                         }
                                     }
                                     OutputGrid::Ant2 => {
-                                        let phase_delay1_s = d.frac1;
-                                        let phase_delay2_s = d.frac2;
-                                        let (mut phase_corr, phase_step) = xcf_phase_start_and_step(
-                                            df_hz,
-                                            phase_delay1_s,
-                                            phase_delay2_s,
-                                            ba.a1s as isize - rotation_bins1,
-                                            ba.a2s as isize - rotation_bins2,
-                                        );
+                                        let (mut phase_corr, phase_step) = xcf_frame_phase(d);
                                         for k in 0..overlap_len {
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
@@ -9114,13 +9132,7 @@ fn run_once(
                             };
                             let direct_accumulated = if need_xcf_products && !args.debug {
                                 if let (Some(src1), Some(src2)) = (direct_src1, direct_src2) {
-                                    let (phase0, phase_step) = xcf_phase_start_and_step(
-                                        df_hz,
-                                        d.frac1,
-                                        d.frac2,
-                                        ba.a1s as isize - rotation_bins1,
-                                        ba.a2s as isize - rotation_bins2,
-                                    );
+                                    let (phase0, phase_step) = xcf_frame_phase(d);
                                     let range = output_start..output_start + overlap_len;
                                     if need_acf_products {
                                         accumulate_direct_acf_xcf(
@@ -9153,13 +9165,7 @@ fn run_once(
                             if !direct_accumulated {
                                 let mut phase_corr = None;
                                 if need_xcf_products {
-                                    let (phase0, step) = xcf_phase_start_and_step(
-                                        df_hz,
-                                        d.frac1,
-                                        d.frac2,
-                                        ba.a1s as isize - rotation_bins1,
-                                        ba.a2s as isize - rotation_bins2,
-                                    );
+                                    let (phase0, step) = xcf_frame_phase(d);
                                     phase_corr = Some((phase0, step));
                                 }
                                 for k in 0..overlap_len {

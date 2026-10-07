@@ -50,6 +50,103 @@ pub struct Args {
     #[arg(long, value_name = "FILE", help = "Input raw file for antenna 2")]
     pub ant2: Option<PathBuf>,
 
+    #[arg(
+        long,
+        value_name = "XML",
+        help = "Second simultaneous RF-band schedule; jointly solve and apply multiband delay/rate"
+    )]
+    pub multiband_schedule: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "multiband_schedule",
+        help = "Second RF-band raw directory"
+    )]
+    pub multiband_raw_directory: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "multiband_schedule",
+        help = "Antenna 1 raw file for the second RF band"
+    )]
+    pub multiband_ant1: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "multiband_schedule",
+        help = "Antenna 2 raw file for the second RF band"
+    )]
+    pub multiband_ant2: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value_t = 10.0,
+        value_name = "S",
+        help = "Multiband delay/rate solution interval"
+    )]
+    pub multiband_window: f64,
+
+    #[arg(
+        long,
+        default_value_t = 0.05,
+        value_name = "S",
+        help = "Short integration for the multiband solution pass; final output uses XML output rate"
+    )]
+    pub multiband_solve_integration: f64,
+
+    #[arg(
+        long,
+        default_value_t = 100.0,
+        value_name = "NS",
+        help = "Symmetric residual multiband delay search half-width"
+    )]
+    pub multiband_delay_window_ns: f64,
+
+    #[arg(
+        long,
+        default_value_t = 0.25,
+        value_name = "HZ",
+        help = "Symmetric residual fringe-rate search half-width at the joint reference RF"
+    )]
+    pub multiband_rate_window_hz: f64,
+
+    #[arg(long, default_value = "auto", value_parser = ["auto", "connected"], help = "auto: calibrate IF phase offsets in the first solution; connected: already phase calibrated")]
+    pub multiband_phase_mode: String,
+
+    #[arg(
+        long,
+        requires = "multiband_schedule",
+        value_delimiter = ',',
+        help = "XML object names of strong calibrators; transfer their residual delay/rate/phase to targets without fitting targets"
+    )]
+    pub multiband_calibrator: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        help = "Optional maximum time from a target to the nearest multiband calibrator solution"
+    )]
+    pub multiband_calibration_max_gap: Option<f64>,
+
+    #[arg(
+        long,
+        default_value_t = 0.05,
+        help = "Minimum fitted multiband coherence; reject unreliable solutions"
+    )]
+    pub multiband_min_coherence: f64,
+
+    #[arg(skip)]
+    pub integration_rate_override: Option<f64>,
+
+    #[arg(skip)]
+    pub multiband_correction: Option<std::sync::Arc<crate::multiband::Corrections>>,
+
+    #[arg(skip)]
+    pub multiband_band_index: usize,
+
     // Output files
     #[arg(
         long = "cor-directory",

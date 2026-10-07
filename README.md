@@ -32,6 +32,7 @@ This repository builds two operational binaries from the same codebase:
 - Per-antenna bit-depth/level/shuffle/sideband/rotation handling
 - Geometric delay + clock delay/rate + residual delay/rate model
 - Band alignment for different station center frequencies
+- Two separated RF bands with joint delay/rate/IF-phase calibration and transfer to faint targets ([multiband processing](docs/fx-corr-multiband.md))
 - ACF/XCF/Phased product generation in one executable
 - Throughput-oriented implementation:
   - rayon parallel compute
@@ -2743,6 +2744,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.9.0` | Adds simultaneous two-band correlation with actual RF coordinates, shared residual delay/rate, and unknown IF-phase calibration. Strong-calibrator solutions can be applied across target scans before integration, without fitting faint-target noise. Outputs frequency-aware `.mbcor`, correction tables, and native band `.cor`; includes a streaming weighted complex-visibility exporter. See [multiband processing](docs/fx-corr-multiband.md). |
 | `3.8.0` | Reuses per-worker decode/FFT/accumulation buffers across input chunks, fuses phased spectrum mapping/correction/synthesis, skips unused diagnostics, and quantizes directly into packed output with precomputed bit-shuffle tables. Adds `--no-affinity` at unchanged worker counts and an ACF-free fast kernel for internal XCF-only workflows. Includes reproducible [throughput measurements](docs/fx-corr-performance.md) and mixed-bit/rotated-grid output regression tests. |
 | `3.7.0` | Adds coordinated CPU-core allocation for concurrent yi-corr processes and reuses partial correlation accumulators to improve compute throughput. |
 | `3.6.0` | Release after validating the nominal troposphere correction on the 890 km YAMAGU32--HITACH32 VLBI baseline; residual short-timescale phase fluctuations remain as atmospheric variability. |

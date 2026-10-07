@@ -44,6 +44,172 @@ fn write_schedule(path: &Path, station1: &str, station2: &str) {
     write_schedule_with_clock_delay(path, station1, station2, 0.0);
 }
 
+#[test]
+fn multiband_calibrator_corrects_targets_without_fitting_them() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    let schedules = [root.join("low.xml"), root.join("high.xml")];
+    let raw_dirs = [root.join("low"), root.join("high")];
+    for band in 0..2 {
+        fs::create_dir_all(&raw_dirs[band]).unwrap();
+        write_schedule_with_clock_delay(&schedules[band], "ANT1", "ANT2", 2e-6);
+        let xml = fs::read_to_string(&schedules[band]).unwrap()
+            .replace("<frequency>100000000</frequency>", &format!("<frequency>{}</frequency>", 100000000 + band * 16384))
+            .replace("<output>8</output>", "<output>2</output>")
+            .replace("<source name=\"TARGET\">", "<source name=\"CAL\"><ra>00h00m00.0</ra><dec>+00d00'00.0</dec></source>\n<source name=\"TARGET\">")
+            .replace("<object>TARGET</object>", "<object>CAL</object>")
+            .replace("</schedule>", "<process><epoch>2000/001 00:00:10</epoch><length>1</length><object>TARGET</object><stations>AB</stations><baseline>AB</baseline></process>\n</schedule>");
+        fs::write(&schedules[band], xml).unwrap();
+        let mut state = 0x1234_5678_u32 + band as u32;
+        let mut raw = vec![0_u8; 2048];
+        for byte in &mut raw {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+        for tag in ["2000001000000", "2000001000010"] {
+            for station in ["ANT1", "ANT2"] {
+                fs::write(raw_dirs[band].join(format!("{station}_{tag}.raw")), &raw).unwrap();
+            }
+        }
+    }
+    for debug in [false, true] {
+        let out = root.join(if debug { "mapped" } else { "direct" });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
+        command.args([
+            "--sc",
+            schedules[0].to_str().unwrap(),
+            "--raw",
+            raw_dirs[0].to_str().unwrap(),
+            "--cor",
+            out.to_str().unwrap(),
+            "--multiband-schedule",
+            schedules[1].to_str().unwrap(),
+            "--multiband-raw-directory",
+            raw_dirs[1].to_str().unwrap(),
+            "--multiband-calibrator",
+            "CAL",
+            "--multiband-delay-window-ns",
+            "10000",
+            "--multiband-solve-integration",
+            "0.0625",
+            "--multiband-window",
+            "1",
+            "--cpu",
+            "1",
+        ]);
+        if debug {
+            command.arg("--debug");
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let scan = out.join("multiband/scan0001");
+        assert!(
+            !scan.join("solve-band1").exists(),
+            "target must not be fringe-fitted"
+        );
+        let bytes = fs::read(scan.join("joint.mbcor")).unwrap();
+        assert_eq!(&bytes[..8], b"YIMBCOR\0");
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(
+            f64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            8192.0
+        );
+        assert_eq!(
+            f64::from_le_bytes(bytes[48..56].try_into().unwrap()),
+            100000000.0
+        );
+        assert_eq!(
+            f64::from_le_bytes(bytes[304..312].try_into().unwrap()),
+            100016384.0
+        );
+        assert_eq!(bytes.len(), 544 + 2 * 2 * (128 + 64 * 8));
+        for row in 0..2 {
+            for band in 0..2 {
+                let begin = 544 + (row * 2 + band) * (128 + 64 * 8) + 128;
+                let sum = bytes[begin..begin + 64 * 8].chunks_exact(8).fold(
+                    (0.0_f64, 0.0_f64),
+                    |(r, i), z| {
+                        (
+                            r + f32::from_le_bytes(z[..4].try_into().unwrap()) as f64,
+                            i + f32::from_le_bytes(z[4..].try_into().unwrap()) as f64,
+                        )
+                    },
+                );
+                assert!(sum.0 > 0.0 && sum.1.abs() < sum.0 * 0.001, "{sum:?}");
+            }
+        }
+        let exported = Command::new("python3")
+            .args([
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tools/multiband_visibility.py"),
+                scan.join("joint.mbcor").to_str().unwrap(),
+                "--average",
+                scan.join("average.tsv").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            exported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(scan.join("average.tsv"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        let time_mean = Command::new("python3")
+            .args([
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tools/multiband_visibility.py"),
+                scan.join("joint.mbcor").to_str().unwrap(),
+                "--average",
+                scan.join("time-mean.tsv").to_str().unwrap(),
+                "--time-average",
+                "--band-scales",
+                "2",
+                "1",
+                "--band-weights",
+                "1",
+                "3",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            time_mean.status.success(),
+            "{}",
+            String::from_utf8_lossy(&time_mean.stderr)
+        );
+        let means = fs::read_to_string(scan.join("average.tsv")).unwrap();
+        let expected = means
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let values: Vec<f64> = line.split('\t').map(|v| v.parse().unwrap()).collect();
+                (2.0 * values[6] + 3.0 * values[8]) / 4.0
+            })
+            .sum::<f64>()
+            / 2.0;
+        let time_means = fs::read_to_string(scan.join("time-mean.tsv")).unwrap();
+        let values: Vec<f64> = time_means
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('\t')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert_eq!(time_means.lines().count(), 2);
+        assert!((values[1] - 1.0).abs() < 1e-6);
+        assert!((values[3] - expected).abs() < 1e-9);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn write_three_station_schedule(path: &Path) {
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <schedule>
