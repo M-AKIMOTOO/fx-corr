@@ -148,7 +148,26 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
             !scan.join("solve-band1").exists(),
             "target must not be fringe-fitted"
         );
-        let bytes = fs::read(scan.join("joint.mbcor")).unwrap();
+        let joint_path = scan.join("ANT1_ANT2_2000001000010_mbcx.cor");
+        let bytes = fs::read(&joint_path).unwrap();
+        let mut product_names = fs::read_dir(&scan)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("cor"))
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        product_names.sort();
+        assert_eq!(
+            product_names,
+            [
+                "ANT1_ANT1_2000001000010_mbcx.cor",
+                "ANT1_ANT2_2000001000010_mbcx.cor",
+                "ANT2_ANT2_2000001000010_mbcx.cor",
+            ]
+        );
+        assert!(out
+            .join("multiband/scan0000/ANT1_ANT2_2000001000000_mbcx.cor")
+            .is_file());
         if mode == "direct" {
             reference_joint = bytes.clone();
         } else {
@@ -170,7 +189,9 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
         );
         assert_eq!(bytes.len(), 544 + 2 * 2 * (128 + 64 * 8));
         for station in [1, 2] {
-            let joint = fs::read(scan.join(format!("joint-acf{station}.mbcor"))).unwrap();
+            let joint =
+                fs::read(scan.join(format!("ANT{station}_ANT{station}_2000001000010_mbcx.cor")))
+                    .unwrap();
             assert_eq!(joint.len(), bytes.len());
             for band in 0..2 {
                 let h = &joint[32 + band * 256..288 + band * 256];
@@ -240,7 +261,7 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
         let exported = Command::new("python3")
             .args([
                 concat!(env!("CARGO_MANIFEST_DIR"), "/tools/multiband_visibility.py"),
-                scan.join("joint.mbcor").to_str().unwrap(),
+                joint_path.to_str().unwrap(),
                 "--average",
                 scan.join("average.tsv").to_str().unwrap(),
             ])
@@ -261,7 +282,7 @@ fn multiband_calibrator_corrects_targets_without_fitting_them() {
         let time_mean = Command::new("python3")
             .args([
                 concat!(env!("CARGO_MANIFEST_DIR"), "/tools/multiband_visibility.py"),
-                scan.join("joint.mbcor").to_str().unwrap(),
+                joint_path.to_str().unwrap(),
                 "--average",
                 scan.join("time-mean.tsv").to_str().unwrap(),
                 "--time-average",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream yi-corr joint.mbcor v1 into frequency-aware spectra or complex means.
+"""Stream yi-corr *_mbcx.cor (YIMBCOR v1) into spectra or complex means.
 
 No third-party dependencies. Band weights are inverse per-channel noise
 variances after applying the band scales. Exact zero bins are excluded from
@@ -25,7 +25,7 @@ def export(args):
         stream = stack.enter_context(open(args.input, "rb"))
         magic, version, bands, bandwidth, reference = struct.unpack("<8sIIdd", read_exact(stream, 32))
         if magic != b"YIMBCOR\0" or version != 1 or bands != 2:
-            raise ValueError("expected yi-corr .mbcor version 1, two bands")
+            raise ValueError("expected yi-corr joint COR format version 1, two bands")
         layouts = []
         for _ in range(bands):
             header = read_exact(stream, 256)

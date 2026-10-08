@@ -398,17 +398,15 @@ fn collect(
     };
     if let Some(reference) = reference_hz {
         // QA and joint packaging share the same COR read pass.
+        // Native products already contain the full station names and scan tag.
+        let stem = paths[0]
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix("_multiband"))
+            .ok_or("unexpected native multiband product filename")?;
+        let output = directory.join(format!("{stem}_mbcx.cor"));
         drop(readers);
-        pack_joint(
-            paths,
-            &directory.join(if name == "visibility" {
-                "joint.mbcor".into()
-            } else {
-                format!("joint-{name}.mbcor")
-            }),
-            reference,
-            &mut inspect,
-        )?;
+        pack_joint(paths, &output, reference, &mut inspect)?;
     } else {
         for row in 0..rows {
             let (ha, va) = readers[0].sector()?;

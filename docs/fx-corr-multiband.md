@@ -203,10 +203,13 @@ Each `output/multiband/scanNNNN` contains:
 - `solutions.tsv`: applied residual delay/rate/common phase and fixed IF phases.
 - `band1/2`: corrected native `.cor` products, compatible with existing readers.
   Each directory includes XCF and both stations' ACF `.cor` files.
-- `joint.mbcor`: both corrected cross spectra, original frequency grids and time headers.
-- `joint-acf1.mbcor`, `joint-acf2.mbcor`: both bands' self spectra for station
+- `ANT1_ANT2_YYYYDDDHHMMSS_mbcx.cor`: both corrected cross spectra,
+  original frequency grids and time headers.
+- `ANT1_ANT1_YYYYDDDHHMMSS_mbcx.cor` and
+  `ANT2_ANT2_YYYYDDDHHMMSS_mbcx.cor`: both bands' self spectra for station
   1 and station 2, in the same joint format. Their embedded headers identify
   the station; no residual cross phase is applied to ACF powers.
+  The station names and scan timestamp match the native band products.
 - `verification.txt`: version, baseline, RF grids, occupied/gap bandwidth,
   calibration/search settings, IF phases, integration duration, coherent
   complex means and usable bandwidth.
@@ -251,15 +254,17 @@ solution pass, `solutions.tsv` and `solutions.png` are produced. Normally all
 XML scans are selected and receive the complete output set above.
 
 The native files and joint file deliberately preserve spectral information.
-The existing `.cor` header cannot represent a gap between two IFs. **frinZ
-5.4.0 or later** detects yi-corr's `.mbcor` format directly and searches one
-common delay/rate using the physical RF grids and reference frequency:
+The native single-band `.cor` header cannot represent a gap between two IFs.
+Joint files use the `*_mbcx.cor` filename convention and the frequency-aware
+`YIMBCOR` version 1 layout below. **frinZ 5.4.0 or later** detects this format
+by its header, regardless of the extension, and searches one common delay/rate
+using the physical RF grids and reference frequency:
 
 ```bash
-frinZ --in output/multiband/scan0001/joint.mbcor --cpu 6
+frinZ --in output/multiband/scan0000/YAMAGU32_YAMAGU34_2026280081000_mbcx.cor --cpu 6
 
 # A 300-sector scan split into thirty ten-sector windows:
-frinZ --in output/multiband/scan0001/joint.mbcor \
+frinZ --in output/multiband/scan0000/YAMAGU32_YAMAGU34_2026280081000_mbcx.cor \
   --length 10 --loop 30 --search peak --add-plot --npz --cpu 6
 ```
 
@@ -272,23 +277,23 @@ no noise weight, and no new per-target IF-phase fit is performed. Its
 different definition from native frinZ's delay-plane SNR. See
 [frinZ MBCOR input documentation](https://github.com/M-AKIMOTOO/frinZ/blob/main/docs/mbcor.md)
 for supported flags, layout restrictions and statistical assumptions.
-Older COR-only readers cannot directly read MBCOR; changing the extension
-or simply joining the bands as a continuous COR spectrum loses the RF gap.
+Older COR-only readers cannot directly read the joint layout. Legacy `.mbcor`
+files have the same layout and remain readable by frinZ and the exporter.
 
 For complex averaging or export, use the included streaming Python tool
 (standard library only):
 
 ```bash
 python3 tools/multiband_visibility.py \
-  output/multiband/scan0001/joint.mbcor --average combined.tsv
+  output/multiband/scan0000/YAMAGU32_YAMAGU34_2026280081000_mbcx.cor --average combined.tsv
 
 # Further coherent time averaging within this scan:
 python3 tools/multiband_visibility.py \
-  output/multiband/scan0001/joint.mbcor --average scan-mean.tsv --time-average
+  output/multiband/scan0000/YAMAGU32_YAMAGU34_2026280081000_mbcx.cor --average scan-mean.tsv --time-average
 
 # All spectral samples with their physical RF frequencies:
 python3 tools/multiband_visibility.py \
-  output/multiband/scan0001/joint.mbcor --spectra spectra.tsv
+  output/multiband/scan0000/YAMAGU32_YAMAGU34_2026280081000_mbcx.cor --spectra spectra.tsv
 ```
 
 The complex mean defaults to equal per-channel noise weights. It combines
@@ -304,7 +309,7 @@ are excluded; `usable_bandwidth_hz` reports the included width. No automatic
 RFI rejection, bandpass calibration or measured noise weighting is implied.
 TSV times retain the native `.cor` timestamp convention.
 
-### `.mbcor` version 1 layout
+### Joint COR layout (`YIMBCOR` version 1)
 
 All numeric fields are little endian. Fixed header is 544 bytes:
 

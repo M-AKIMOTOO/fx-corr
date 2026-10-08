@@ -2749,6 +2749,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.10.2` | Names joint C/X cross- and auto-correlation products `ANT1_ANT2_YYYYDDDHHMMSS_mbcx.cor` (repeating the station name for ACF), preserving both physical RF grids and the joint format. frinZ 5.4.0 detects the format by its header. |
 | `3.10.1` | Fixes integration-rate log units (20 Hz was displayed as 0.05 Hz), identifies the multiband solution override separately from XML output, and displays observation seconds alongside sector counts. Correlation timing and data products are unchanged. |
 | `3.10.0` | Adds one CX XML with separate C/X RAW directories, native and joint multiband ACF outputs, and automatic QA PNG/TSV/parameter products. Final output follows the XML rate; 20 Hz is only the default calibrator solution pass. Restricts the main/auxiliary thread masks and reserves physical cores including SMT siblings across concurrent yi-corr/yi-phasedarray processes. |
 | `3.9.0` | Adds simultaneous two-band correlation with actual RF coordinates, shared residual delay/rate, and unknown IF-phase calibration. Strong-calibrator solutions can be applied across target scans before integration, without fitting faint-target noise. Outputs frequency-aware `.mbcor`, correction tables, and native band `.cor`; includes a streaming weighted complex-visibility exporter. See [multiband processing](docs/fx-corr-multiband.md). |

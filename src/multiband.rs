@@ -714,7 +714,7 @@ fn pack_joint(
     mut inspect: impl FnMut(usize, &[u8; 128], &[Vec<Complex<f64>>; 2]) -> Result<(), DynError>,
 ) -> Result<(), DynError> {
     let (mut readers, layout) = reader_pair(paths)?;
-    let partial = output.with_extension("mbcor.part");
+    let partial = output.with_extension("cor.part");
     let mut w = BufWriter::new(File::create(&partial)?);
     w.write_all(b"YIMBCOR\0")?;
     w.write_all(&1u32.to_le_bytes())?;
