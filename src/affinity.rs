@@ -289,9 +289,9 @@ impl CpuTopology {
     }
 }
 
-// Keep live assignments fixed. Reserve all SMT siblings of each selected
-// physical core, while only the N used logical CPUs enter the thread masks.
-fn isolated_allocation(
+// Keep live assignments fixed and claim only the logical CPUs actually used.
+// Prefer untouched physical cores, but allow their free SMT siblings when needed.
+fn logical_allocation(
     available: &[core_affinity::CoreId],
     universe: &[core_affinity::CoreId],
     topology: &CpuTopology,
@@ -309,89 +309,69 @@ fn isolated_allocation(
     if target == 0 {
         return Err("CPU reservation requires a nonzero request and available CPUs".into());
     }
-    let mut blocked = occupied.clone();
-    for group in &topology.groups {
-        if group.iter().any(|id| occupied.contains(id)) {
-            blocked.extend(group);
-        }
-    }
-    let free_count = universe_ids
+    let free: HashSet<_> = allowed
         .iter()
-        .filter(|id| !blocked.contains(id))
-        .count();
-    let budget = free_count.saturating_sub(2);
-    let mut candidates: Vec<_> = topology
-        .groups
-        .iter()
-        .filter_map(|group| {
-            if group.iter().any(|id| blocked.contains(id)) {
-                return None;
-            }
-            let usable: Vec<_> = group
-                .iter()
-                .copied()
-                .filter(|id| allowed.contains(id))
-                .collect();
-            if usable.is_empty() {
-                None
-            } else {
-                Some((group, usable))
-            }
-        })
+        .copied()
+        .filter(|id| !occupied.contains(id))
         .collect();
+    if free.len() < target {
+        return Err(format!("cannot reserve {target} logical CPUs: only {} are free in the allowed CPU set ({} already reserved)", free.len(), allowed.len() - free.len()).into());
+    }
+    let mut selected = Vec::with_capacity(target);
     if let Some(io) = preferred_io {
-        let index = candidates.iter().position(|(_, ids)| ids.contains(&io.id))
-            .ok_or_else(|| format!("YI_READER_CORE={} is outside the allowed set or shares a reserved physical core", io.id))?;
-        candidates.swap(0, index);
-    }
-    let mut selected = Vec::new();
-    let mut claimed_groups = Vec::new();
-    let mut cost = 0;
-    // First spread workers over physical cores, then use their SMT siblings
-    // only if the requested logical count needs them.
-    for (group, ids) in &candidates {
-        let extra = group.iter().filter(|id| universe_ids.contains(id)).count();
-        if cost + extra > budget {
-            continue;
+        if !free.contains(&io.id) {
+            return Err(format!(
+                "YI_READER_CORE={} is outside the allowed CPU set or already reserved",
+                io.id
+            )
+            .into());
         }
-        let id = preferred_io
-            .filter(|io| ids.contains(&io.id))
-            .map_or(ids[0], |io| io.id);
-        selected.push(id);
-        claimed_groups.push((*group, ids));
-        cost += extra;
-        if selected.len() == target {
-            break;
-        }
+        selected.push(io.id);
     }
-    if preferred_io.is_some_and(|io| !selected.contains(&io.id)) {
-        return Err("cannot reserve YI_READER_CORE while leaving two visible CPUs free".into());
-    }
-    if selected.len() < target {
-        for (_, ids) in &claimed_groups {
-            for &id in *ids {
-                if selected.len() == target {
-                    break;
-                }
-                if !selected.contains(&id) {
-                    selected.push(id);
-                }
-            }
+    for shared in [false, true] {
+        for group in &topology.groups {
             if selected.len() == target {
                 break;
             }
+            if group.iter().any(|id| occupied.contains(id)) != shared
+                || group.iter().any(|id| selected.contains(id))
+            {
+                continue;
+            }
+            if let Some(id) = group.iter().find(|id| free.contains(id)) {
+                selected.push(*id);
+            }
         }
     }
-    if selected.len() < target {
-        return Err(format!("cannot reserve {target} logical CPUs without sharing physical cores with running yi-corr processes and leaving two visible CPUs free (only {} can be assigned)", selected.len()).into());
+    // Fill the remaining slots from any free logical CPUs, without reserving
+    // unused siblings or withholding CPUs beyond the user's --cpu budget.
+    let mut remaining: Vec<_> = free.iter().copied().collect();
+    remaining.sort_unstable();
+    for id in remaining {
+        if selected.len() == target {
+            break;
+        }
+        if !selected.contains(&id) {
+            selected.push(id);
+        }
     }
     let io = preferred_io.or_else(|| {
+        let isolated = |id: &&usize| {
+            topology.groups.iter().any(|g| {
+                g.contains(id)
+                    && !g.iter().any(|c| occupied.contains(c))
+                    && selected.iter().filter(|c| g.contains(c)).count() == 1
+            })
+        };
         selected
             .iter()
             .rev()
-            .find(|id| {
-                topology.groups.iter().any(|g| {
-                    g.contains(id) && selected.iter().filter(|c| g.contains(c)).count() == 1
+            .find(isolated)
+            .or_else(|| {
+                selected.iter().rev().find(|id| {
+                    topology.groups.iter().any(|g| {
+                        g.contains(id) && selected.iter().filter(|c| g.contains(c)).count() == 1
+                    })
                 })
             })
             .map(|id| core_affinity::CoreId { id: *id })
@@ -401,12 +381,7 @@ fn isolated_allocation(
         .map(|id| core_affinity::CoreId { id: *id })
         .collect::<Vec<_>>();
     let allocation = allocate_cpus(&cores, target, io)?;
-    let mut reserved: Vec<_> = claimed_groups
-        .iter()
-        .flat_map(|(g, _)| g.iter().copied())
-        .collect();
-    reserved.sort_unstable();
-    reserved.dedup();
+    let reserved = allocation.used_cores().iter().map(|c| c.id).collect();
     Ok((allocation, reserved))
 }
 
@@ -443,6 +418,58 @@ struct CpuReservationEntry {
     start_time: String,
     cpus: Vec<usize>,
 }
+
+#[cfg(target_os = "linux")]
+fn reconcile_legacy_reservation(entry: &mut CpuReservationEntry) {
+    if entry.token.ends_with("-logical") {
+        return;
+    }
+    // Older versions recorded unused SMT siblings. Read every thread's mask
+    // without changing any affinity, and retain the old claim if observation
+    // is incomplete or the process/thread set changes while being read.
+    fn observed_cpus(entry: &CpuReservationEntry) -> Option<HashSet<usize>> {
+        if process_start_time(entry.pid).ok()? != entry.start_time {
+            return None;
+        }
+        let task_dir = PathBuf::from(format!("/proc/{}/task", entry.pid));
+        let task_paths = || -> Option<Vec<PathBuf>> {
+            let mut paths = fs::read_dir(&task_dir)
+                .ok()?
+                .map(|task| task.ok().map(|task| task.path()))
+                .collect::<Option<Vec<_>>>()?;
+            paths.sort_unstable();
+            Some(paths)
+        };
+        let tasks = task_paths()?;
+        let mut observed = HashSet::new();
+        for task in &tasks {
+            let status = fs::read_to_string(task.join("status")).ok()?;
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+            observed.extend(parse_affinity_spec(mask).ok()?);
+        }
+        if tasks != task_paths()? || process_start_time(entry.pid).ok()? != entry.start_time {
+            return None;
+        }
+        Some(observed)
+    }
+    if let Some(observed) = observed_cpus(entry) {
+        let used: Vec<_> = entry
+            .cpus
+            .iter()
+            .copied()
+            .filter(|id| observed.contains(id))
+            .collect();
+        if !used.is_empty() && used.len() < entry.cpus.len() {
+            eprintln!("[info] Reconciled legacy CPU reservation for PID {}: {} -> {} logical CPUs (thread affinities unchanged)", entry.pid, entry.cpus.len(), used.len());
+            entry.cpus = used;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reconcile_legacy_reservation(_entry: &mut CpuReservationEntry) {}
 
 #[cfg(unix)]
 struct CpuReservationFileLock(File);
@@ -492,7 +519,7 @@ pub struct CpuReservationGuard {
 impl CpuReservationGuard {
     pub fn info(&self) -> String {
         format!(
-            "registry={} reserved CPU IDs (including SMT siblings)={}",
+            "registry={} reserved logical CPU IDs={}",
             self.registry_path.display(),
             self.cpus
                 .iter()
@@ -527,8 +554,8 @@ impl CpuReservationGuard {
 /// Reserve a requested CPU set across concurrent yi-corr processes.
 ///
 /// `available` is the CPU set this invocation may use (including any fixed
-/// affinity group); `universe` is the process-visible host CPU set. At least
-/// two IDs in `universe` are kept outside active reservations.
+/// affinity group); `universe` is the process-visible host CPU set. Only used
+/// logical CPU IDs are reserved; SMT siblings remain available to other jobs.
 pub fn reserve_cpus(
     available: &[core_affinity::CoreId],
     universe: &[core_affinity::CoreId],
@@ -593,12 +620,15 @@ fn reserve_cpus_with_topology_in(
     let current_start = process_start_time(current_pid)?;
     let mut entries = read_cpu_reservations(state_path)?;
     entries.retain(reservation_is_live);
+    for entry in &mut entries {
+        reconcile_legacy_reservation(entry);
+    }
 
     let mut occupied = HashSet::<usize>::new();
     for entry in &entries {
         occupied.extend(entry.cpus.iter().copied());
     }
-    let (allocation, reserved) = isolated_allocation(
+    let (allocation, reserved) = logical_allocation(
         available,
         universe,
         topology,
@@ -608,7 +638,10 @@ fn reserve_cpus_with_topology_in(
     )?;
 
     let sequence = NEXT_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
-    let token = format!("{current_pid}-{current_start}-{sequence}");
+    // Preserve the v1 registry layout for guards in already-running versions.
+    // The opaque token marks authoritative logical claims so they are never
+    // inferred from a temporary thread mask during startup/output/shutdown.
+    let token = format!("{current_pid}-{current_start}-{sequence}-logical");
     entries.push(CpuReservationEntry {
         token: token.clone(),
         pid: current_pid,
@@ -878,47 +911,100 @@ mod cpu_allocation_tests {
     }
 
     #[test]
-    fn different_processes_never_select_smt_siblings_even_with_partial_masks() {
+    fn prefers_free_physical_cores_but_reserves_only_used_logical_cpus() {
         let cpus: Vec<_> = (0..12).map(|id| core_affinity::CoreId { id }).collect();
         let topology = CpuTopology {
             groups: (0..6).map(|i| vec![2 * i, 2 * i + 1]).collect(),
         };
         let (first, reserved) =
-            isolated_allocation(&cpus, &cpus, &topology, 2, None, &HashSet::new()).unwrap();
+            logical_allocation(&cpus, &cpus, &topology, 2, None, &HashSet::new()).unwrap();
         assert_eq!(
             first.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
             [0, 2]
         );
-        assert_eq!(reserved, [0, 1, 2, 3]);
+        assert_eq!(reserved, [0, 2]);
         let occupied = reserved.into_iter().collect();
         let (second, reserved2) =
-            isolated_allocation(&cpus, &cpus, &topology, 2, None, &occupied).unwrap();
+            logical_allocation(&cpus, &cpus, &topology, 2, None, &occupied).unwrap();
         assert_eq!(
             second.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
             [4, 6]
         );
-        assert_eq!(reserved2, [4, 5, 6, 7]);
+        assert_eq!(reserved2, [4, 6]);
         assert_eq!(
             first.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
             [0, 2]
         );
         let partial: Vec<_> = cpus.iter().copied().filter(|c| c.id % 2 == 1).collect();
         let (third, _) =
-            isolated_allocation(&partial, &partial, &topology, 2, None, &HashSet::from([0]))
+            logical_allocation(&partial, &partial, &topology, 2, None, &HashSet::from([0]))
                 .unwrap();
         assert_eq!(
             third.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
             [3, 5]
         );
-        assert!(isolated_allocation(
+        let (with_io, _) = logical_allocation(
             &cpus,
             &cpus,
             &topology,
             2,
             Some(core_affinity::CoreId { id: 1 }),
+            &occupied,
+        )
+        .unwrap();
+        assert_eq!(with_io.io.id, 1);
+        assert!(logical_allocation(
+            &cpus,
+            &cpus,
+            &topology,
+            2,
+            Some(core_affinity::CoreId { id: 0 }),
             &occupied
         )
         .is_err());
+    }
+
+    #[test]
+    fn corr6_two_jobs_can_use_fifteen_plus_fifteen_or_seventeen_logical_cpus() {
+        let cpus: Vec<_> = (0..32).map(|id| core_affinity::CoreId { id }).collect();
+        let topology = CpuTopology {
+            groups: (0..16).map(|id| vec![id, id + 16]).collect(),
+        };
+        let (first, reserved) =
+            logical_allocation(&cpus, &cpus, &topology, 15, None, &HashSet::new()).unwrap();
+        assert_eq!(reserved, (0..15).collect::<Vec<_>>());
+        let occupied: HashSet<_> = reserved.into_iter().collect();
+        for count in [15, 17] {
+            let (second, reserved2) =
+                logical_allocation(&cpus, &cpus, &topology, count, None, &occupied).unwrap();
+            assert_eq!(second.total, count);
+            assert_eq!(reserved2.len(), count);
+            assert!(reserved2.iter().all(|id| !occupied.contains(id)));
+            assert_eq!(
+                first.used_cores().iter().map(|c| c.id).collect::<Vec<_>>(),
+                (0..15).collect::<Vec<_>>()
+            );
+            let all: HashSet<_> = occupied.iter().copied().chain(reserved2).collect();
+            assert_eq!(all.len(), 15 + count);
+            assert_eq!(
+                logical_allocation(&cpus, &cpus, &topology, 1, None, &all).is_err(),
+                count == 17
+            );
+        }
+        assert_eq!(
+            logical_allocation(&cpus, &cpus, &topology, 32, None, &HashSet::new())
+                .unwrap()
+                .1
+                .len(),
+            32
+        );
+        let only_one = [core_affinity::CoreId { id: 16 }];
+        assert_eq!(
+            logical_allocation(&only_one, &cpus, &topology, 1, None, &occupied)
+                .unwrap()
+                .1,
+            [16]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -948,6 +1034,82 @@ mod cpu_allocation_tests {
         drop(guard);
         assert_eq!(core_affinity::get_core_ids().unwrap(), initial);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_legacy_job_releases_unused_siblings_without_changing_its_mask() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let cpus = core_affinity::get_core_ids().unwrap();
+        if cpus.len() < 3 {
+            return;
+        }
+        let selected = &cpus[..2];
+        let affinity = ThreadAffinityGuard::enter_cores(selected).unwrap();
+        let child = ChildGuard(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        drop(affinity);
+        let pid = child.0.id();
+        let mut legacy = CpuReservationEntry {
+            token: format!("{pid}-legacy"),
+            pid,
+            start_time: process_start_time(pid).unwrap(),
+            cpus: cpus.iter().map(|c| c.id).collect(),
+        };
+        let original_status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let original_mask = original_status
+            .lines()
+            .find(|l| l.starts_with("Cpus_allowed_list:"))
+            .unwrap();
+        let mut authoritative = legacy.clone();
+        authoritative.token.push_str("-logical");
+        reconcile_legacy_reservation(&mut authoritative);
+        assert_eq!(authoritative.cpus, legacy.cpus);
+
+        let sequence = NEXT_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "yi-corr-legacy-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let registry = directory.join(CPU_RESERVATION_STATE);
+        let lock = directory.join(CPU_RESERVATION_LOCK);
+        write_cpu_reservations(&registry, &[legacy.clone()], std::process::id(), sequence).unwrap();
+        let (allocation, guard) =
+            reserve_cpus_in(&registry, &lock, &cpus, &cpus, cpus.len() - 2, None).unwrap();
+        assert_eq!(allocation.total, cpus.len() - 2);
+        assert!(allocation
+            .used_cores()
+            .iter()
+            .all(|c| !selected.contains(c)));
+        let entries = read_cpu_reservations(&registry).unwrap();
+        legacy.cpus = selected.iter().map(|c| c.id).collect();
+        assert_eq!(entries[0].token, legacy.token);
+        assert_eq!(entries[0].cpus, legacy.cpus);
+        assert!(entries[1].token.ends_with("-logical"));
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        assert_eq!(
+            status
+                .lines()
+                .find(|l| l.starts_with("Cpus_allowed_list:"))
+                .unwrap(),
+            original_mask
+        );
+        assert_eq!(core_affinity::get_core_ids().unwrap(), cpus);
+        drop(guard);
+        assert_eq!(read_cpu_reservations(&registry).unwrap().len(), 1);
+        drop(child);
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn reserves_one_of_requested_cpus_and_respects_allowed_mask() {
         let available: Vec<_> = [2, 4, 8, 10]
@@ -975,7 +1137,7 @@ mod cpu_allocation_tests {
 
     #[cfg(unix)]
     #[test]
-    fn concurrent_reservations_are_disjoint_keep_two_cpus_free_and_release() {
+    fn concurrent_reservations_are_disjoint_use_all_requested_cpus_and_release() {
         let sequence = NEXT_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "yi-corr-reservation-test-{}-{sequence}",
@@ -1011,7 +1173,11 @@ mod cpu_allocation_tests {
             third.workers.iter().map(|core| core.id).collect::<Vec<_>>(),
             (12..23).collect::<Vec<_>>()
         );
-        assert!(reserve_cpus_in(&registry, &lock, &cpus, &cpus, 8, None).is_err());
+        let (fourth, fourth_guard) =
+            reserve_cpus_in(&registry, &lock, &cpus, &cpus, 8, None).unwrap();
+        assert_eq!(fourth.io.id, 31);
+        assert!(reserve_cpus_in(&registry, &lock, &cpus, &cpus, 1, None).is_err());
+        drop(fourth_guard);
 
         drop(second_guard);
         let (reused, reused_guard) =
@@ -1030,8 +1196,8 @@ mod cpu_allocation_tests {
         let entries = read_cpu_reservations(&registry).unwrap();
         assert!(entries.is_empty());
         let (maximum, maximum_guard) =
-            reserve_cpus_in(&registry, &lock, &cpus, &cpus, 30, None).unwrap();
-        assert_eq!(maximum.total, 30);
+            reserve_cpus_in(&registry, &lock, &cpus, &cpus, 32, None).unwrap();
+        assert_eq!(maximum.total, 32);
         assert!(reserve_cpus_in(&registry, &lock, &cpus, &cpus, 1, None).is_err());
         drop(maximum_guard);
         fs::remove_dir_all(directory).unwrap();

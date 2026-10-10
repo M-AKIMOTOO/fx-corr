@@ -72,20 +72,24 @@ and queue depth; input caching can otherwise obscure the effect of pinning.
 
 With pinning enabled, both programs reserve CPUs for their lifetime in
 `$HOME/.yi-corr`, including when `--cpu` is omitted. On Linux the allocator
-spreads work over physical cores first and reserves their SMT siblings so
-another cooperating process cannot share those physical cores. `--cpu N`
-still uses only N logical CPUs, including I/O; reserved siblings can make
-the registry entry larger than N. The main thread is restricted before
-spawning workers/readers so auxiliary threads inherit the same allowed set.
+prefers physical cores unused by other cooperating processes, then uses free
+SMT siblings as needed. `--cpu N` reserves exactly N logical CPU IDs, including
+I/O, within the inherited allowed mask. Unused siblings remain available.
+On a 32-logical-CPU host, two jobs can use `--cpu 15` each, or 15 and 17.
+The main thread is restricted before spawning workers/readers so auxiliary
+threads inherit the same allowed set.
 Existing processes keep their assignments when another process starts.
 No other process's CPU mask or system CPU settings are changed.
 
-At least two visible logical CPUs remain unreserved. If the allocation cannot
-fit while respecting existing reservations and this reserve, the program
-exits with an explanatory error. An advisory lock serializes registry updates;
-normal exit releases the claim, and the next run removes dead-process entries.
-The reserve does not exclude other applications from these CPUs. Disk,
-memory bandwidth and power/thermal limits remain shared resources. See
+If the requested count exceeds the free CPUs in the allowed set, the program
+exits with an explanatory error. No extra CPUs are withheld. An advisory lock
+serializes registry updates; normal exit releases the claim, and the next run
+removes dead-process entries.
+On Linux, unused sibling claims from already-running older versions are
+reconciled against their thread masks without changing those masks. The
+registry does not exclude other applications from these CPUs. SMT execution
+resources, disk, memory bandwidth and power/thermal limits remain shared
+resources. See
 [CPU affinity and concurrent execution](docs/fx-corr-affinity.md).
 
 For normal correlation, add `--cpu-auto` to adapt the number of simultaneous
@@ -2749,6 +2753,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.10.3` | Fixes concurrent CPU allocation: reserves only the logical CPUs actually used, allows free SMT siblings, and removes the mandatory two-CPU reserve. Supports 15+15 and 15+17 jobs on 32 logical CPUs without changing the first job's affinity. Reconciles unused SMT claims from running older versions on Linux. |
 | `3.10.2` | Names joint C/X cross- and auto-correlation products `ANT1_ANT2_YYYYDDDHHMMSS_mbcx.cor` (repeating the station name for ACF), preserving both physical RF grids and the joint format. frinZ 5.4.0 detects the format by its header. |
 | `3.10.1` | Fixes integration-rate log units (20 Hz was displayed as 0.05 Hz), identifies the multiband solution override separately from XML output, and displays observation seconds alongside sector counts. Correlation timing and data products are unchanged. |
 | `3.10.0` | Adds one CX XML with separate C/X RAW directories, native and joint multiband ACF outputs, and automatic QA PNG/TSV/parameter products. Final output follows the XML rate; 20 Hz is only the default calibrator solution pass. Restricts the main/auxiliary thread masks and reserves physical cores including SMT siblings across concurrent yi-corr/yi-phasedarray processes. |

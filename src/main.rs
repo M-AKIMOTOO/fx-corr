@@ -2651,7 +2651,7 @@ fn run_cli() -> Result<(), DynError> {
         let (allocation, reservation) =
             affinity::reserve_cpus(&allowed, &cpu_universe, requested, preferred_io)?;
         println!(
-            "[info] Cross-process CPU reservation: pid={} {} (physical cores isolated; at least 2 visible CPUs left unassigned)",
+            "[info] Cross-process CPU reservation: pid={} {} (logical CPU IDs disjoint; free SMT siblings remain available)",
             std::process::id(),
             reservation.info()
         );
