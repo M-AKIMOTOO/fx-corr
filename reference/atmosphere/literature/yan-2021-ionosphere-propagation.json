@@ -1,0 +1,22 @@
+{
+  "id": "yan-2021-ionosphere-propagation",
+  "title": "Revisiting the light time correction in gravimetric missions like GRACE and GRACE follow-on",
+  "authors": "Y. Yan, V. Müller, G. Heinzel and M. Zhong",
+  "year": 2021,
+  "journal": "Journal of Geodesy 95, 48",
+  "publisher": "Springer Nature",
+  "doi": "10.1007/s00190-021-01498-5",
+  "role": "Published first-order plasma phase advancement and code/group delay sign, section 3.3; satellite geometry model is not used by yi-corr",
+  "urls": [
+    "https://link.springer.com/content/pdf/10.1007/s00190-021-01498-5.pdf"
+  ],
+  "file": "yan-2021-ionosphere-propagation.pdf",
+  "edition": "published article PDF (publisher or institutional archive)",
+  "bytes": 2830779,
+  "sha256": "23baae1bdce03b3d5a8fdd9136395b95d7567687b675f2685c653d3eac46bd2d",
+  "download_url": "https://link.springer.com/content/pdf/10.1007/s00190-021-01498-5.pdf",
+  "resolved_url": "https://link.springer.com/content/pdf/10.1007/s00190-021-01498-5.pdf?error=cookies_not_supported&code=d51df44f-5de5-4ae0-b7d1-5d88c0f219f0",
+  "downloaded_utc": "2026-11-10T05:50:20.977906+00:00",
+  "failures": [],
+  "status": "downloaded"
+}

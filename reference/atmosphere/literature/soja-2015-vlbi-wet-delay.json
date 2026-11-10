@@ -1,0 +1,22 @@
+{
+  "id": "soja-2015-vlbi-wet-delay",
+  "title": "Tropospheric delay determination by Kalman filtering VLBI data",
+  "authors": "B. Soja et al.",
+  "year": 2015,
+  "journal": "Earth, Planets and Space 67, 144",
+  "publisher": "Springer Nature / SpringerOpen",
+  "doi": "10.1186/s40623-015-0293-0",
+  "role": "Temporal variability of neutral-atmosphere wet delay and observational input; Kalman estimation is not implemented",
+  "urls": [
+    "https://link.springer.com/content/pdf/10.1186/s40623-015-0293-0.pdf"
+  ],
+  "file": "soja-2015-vlbi-wet-delay.pdf",
+  "edition": "published article PDF (publisher or institutional archive)",
+  "bytes": 4340387,
+  "sha256": "2a46424f38d4c572afee2f9e8efece2e0d33a03dd0a8b2d0197d9454b5cb3074",
+  "download_url": "https://link.springer.com/content/pdf/10.1186/s40623-015-0293-0.pdf",
+  "resolved_url": "https://link.springer.com/content/pdf/10.1186/s40623-015-0293-0.pdf?error=cookies_not_supported&code=7a564cb5-3806-4de3-ae2c-b4ff558c7d48",
+  "downloaded_utc": "2026-11-10T05:50:22.259582+00:00",
+  "failures": [],
+  "status": "downloaded"
+}

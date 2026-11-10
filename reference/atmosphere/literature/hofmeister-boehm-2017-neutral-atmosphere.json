@@ -1,0 +1,22 @@
+{
+  "id": "hofmeister-boehm-2017-neutral-atmosphere",
+  "title": "Application of ray-traced tropospheric slant delays to geodetic VLBI analysis",
+  "authors": "A. Hofmeister and J. Böhm",
+  "year": 2017,
+  "journal": "Journal of Geodesy 91, 945–964",
+  "publisher": "Springer Nature",
+  "doi": "10.1007/s00190-017-1000-7",
+  "role": "Neutral-atmosphere slant/zenith paths and limits of mapping approximations; future ray-tracing provider reference (ray tracing not implemented)",
+  "urls": [
+    "https://link.springer.com/content/pdf/10.1007/s00190-017-1000-7.pdf"
+  ],
+  "file": "hofmeister-boehm-2017-neutral-atmosphere.pdf",
+  "edition": "published article PDF (publisher or institutional archive)",
+  "bytes": 1347626,
+  "sha256": "260e3c82d86a1fbae0bf804fed9f21fd8e501647fe8d7ff8df82bf51847cc752",
+  "download_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1000-7.pdf",
+  "resolved_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1000-7.pdf?error=cookies_not_supported&code=94678762-1bbf-4368-86f9-c323a3501f67",
+  "downloaded_utc": "2026-11-10T05:50:21.585540+00:00",
+  "failures": [],
+  "status": "downloaded"
+}

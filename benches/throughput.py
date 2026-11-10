@@ -6,6 +6,7 @@ Each directory must contain yi-corr and yi-phasedarray. Runs alternate order,
 discard warm-up, report median wall/compute times, and compare RAW/.cor bytes.
 """
 import argparse
+import gzip
 import hashlib
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import statistics
 import subprocess
 import tempfile
 import time
+import zipfile
 
 
 def main():
@@ -79,7 +81,16 @@ def main():
                             elapsed = time.perf_counter() - begin
                             if result.returncode:
                                 raise RuntimeError(result.stdout + result.stderr)
-                            match = re.search(r"Synth timing summary:.*?compute=([0-9.]+)s", result.stdout)
+                            details = result.stdout
+                            for info in out.glob("*.info"):
+                                if zipfile.is_zipfile(info):
+                                    with zipfile.ZipFile(info) as log:
+                                        details += log.read("info.txt").decode("utf-8")
+                                else:
+                                    # Accept 3.10.4 comparison binaries as well.
+                                    with gzip.open(info, "rt", encoding="utf-8") as log:
+                                        details += log.read()
+                            match = re.search(r"Synth timing summary:.*?compute=([0-9.]+)s", details)
                             if round_no:
                                 wall[variant].append(elapsed)
                                 if match:

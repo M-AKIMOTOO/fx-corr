@@ -285,7 +285,26 @@ pub fn parse_xml_schedule_for_process(
     selected_process_index: Option<usize>,
 ) -> Result<IFileData, DynError> {
     let xml = std::fs::read_to_string(path)?;
-    parse_xml_schedule_text(&xml, selected_process_index)
+    let mut parsed = parse_xml_schedule_text(&xml, selected_process_index)?;
+    resolve_atmosphere_file(&mut parsed.atmosphere, path)?;
+    Ok(parsed)
+}
+
+pub(crate) fn resolve_atmosphere_file(
+    config: &mut crate::atmosphere::AtmosphereConfig,
+    schedule: &Path,
+) -> Result<(), DynError> {
+    if let Some(path) = config.file.as_mut() {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()?
+                .join(schedule.parent().unwrap_or(Path::new(".")))
+                .join(&*path)
+        };
+        *path = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+    }
+    Ok(())
 }
 
 pub fn parse_xml_schedule_text(
@@ -422,6 +441,7 @@ pub fn parse_xml_schedule_text(
     let ant2_station_name = child_text(station2, "name").map(|s| s.to_string());
     let ant1_ecef_m = parse_station_ecef(station1)?;
     let ant2_ecef_m = parse_station_ecef(station2)?;
+    let atmosphere = crate::atmosphere::parse_xml(doc.root_element(), station1, station2)?;
 
     let term1_name = child_text(station1, "terminal").map(|s| s.to_string());
     let term2_name = child_text(station2, "terminal").map(|s| s.to_string());
@@ -702,6 +722,7 @@ pub fn parse_xml_schedule_text(
         xp_arcsec,
         yp_arcsec,
         eop_file,
+        atmosphere,
     })
 }
 
@@ -745,7 +766,44 @@ pub fn write_schedule_with_clock_polynomial(
         }
     }
 
-    let text = std::fs::read_to_string(input)?;
+    let mut text = std::fs::read_to_string(input)?;
+    // A generated clock-calibrated XML may live in another directory. Preserve
+    // the atmosphere provider's original file rather than rebasing its path.
+    let atmosphere_file = {
+        let doc = Document::parse(&text)?;
+        doc.root_element()
+            .children()
+            .find(|n| n.has_tag_name("atmosphere"))
+            .and_then(|n| {
+                n.attribute("file")
+                    .map(|value| (n.range(), value.to_string()))
+            })
+    };
+    if let Some((range, file)) = atmosphere_file {
+        let path = Path::new(&file);
+        if path.is_relative() {
+            let resolved = std::env::current_dir()?
+                .join(input.parent().unwrap_or(Path::new(".")))
+                .join(path);
+            let absolute = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+            let escaped = absolute
+                .to_string_lossy()
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+                .replace('<', "&lt;");
+            let element = &text[range.clone()];
+            let doc = Document::parse(element)?;
+            let attr = doc
+                .root_element()
+                .attributes()
+                .find(|a| a.name() == "file")
+                .ok_or("atmosphere file attribute missing")?;
+            let mut updated_element = element.to_string();
+            updated_element.replace_range(attr.range_value(), &escaped);
+            text.replace_range(range, &updated_element);
+        }
+    }
     let range = {
         let doc = Document::parse(&text)?;
         let node = doc
@@ -847,6 +905,11 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
   <eop file="data/eop/finals2000A.data"/>
   <delay-model><time-offset>0.0</time-offset></delay-model>
 
+  <!-- Optional atmosphere provider (CSV path relative to this XML): -->
+  <!-- <atmosphere file="atmosphere.csv" ionosphere="input" troposphere="input" shell-height-km="450" min-elevation-deg="5"/> -->
+  <!-- Or add constant attributes inside each station: -->
+  <!-- <atmosphere stec-tecu="10" zhd-m="2.3" zwd-m="0.1"/> -->
+
   <!-- EDIT: terminal settings -->
   <terminal name="term1"><speed>1024000000</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,+0.5,+1.5</level></terminal>
   <terminal name="term2"><speed>1024000000</speed><channel>1</channel><bit>2</bit><level>-1.5,-0.5,+0.5,+1.5</level></terminal>
@@ -874,4 +937,54 @@ pub fn write_example_xml(path: &PathBuf) -> Result<(), DynError> {
 "#;
     std::fs::write(path, template)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod atmosphere_path_tests {
+    use super::*;
+
+    #[test]
+    fn relocated_clock_schedule_preserves_atmosphere_file_and_xml_escaping() {
+        let root = std::env::temp_dir().join(format!(
+            "fx-corr-xml-atmosphere-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original_dir = root.join("original & ' observation");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        let input = original_dir.join("schedule.xml");
+        let output = root.join("calibrated/schedule.xml");
+        let csv = original_dir.join("weather.csv");
+        std::fs::write(&csv, "station,mjd_utc,stec_tecu\nA,,10\nB,,11\n").unwrap();
+        let original = "<schedule>\n  <atmosphere file='weather.csv' ionosphere='input'/>\n  <clock key='A'><delay>0</delay><rate>0</rate></clock>\n</schedule>\n";
+        std::fs::write(&input, original).unwrap();
+        write_schedule_with_clock_polynomial(
+            &input,
+            &output,
+            "A",
+            &ClockPolynomial {
+                epoch: "2024/028 00:00:00".into(),
+                delay_s: 1e-6,
+                rate_sps: 0.0,
+                accel_sps2: 0.0,
+                jerk_sps3: 0.0,
+                snap_sps4: 0.0,
+            },
+        )
+        .unwrap();
+        let updated = std::fs::read_to_string(&output).unwrap();
+        let doc = Document::parse(&updated).unwrap();
+        let value = doc
+            .descendants()
+            .find(|n| n.has_tag_name("atmosphere"))
+            .unwrap()
+            .attribute("file")
+            .unwrap();
+        assert_eq!(Path::new(value), std::fs::canonicalize(csv).unwrap());
+        assert_eq!(std::fs::read_to_string(input).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

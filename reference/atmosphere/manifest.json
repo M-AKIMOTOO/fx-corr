@@ -1,0 +1,196 @@
+{
+  "created_utc": "2026-11-10T05:58:39.186263+00:00",
+  "papers": [
+    {
+      "id": "degasperin-2018-ionosphere",
+      "title": "The effect of the ionosphere on ultra-low-frequency radio-interferometric observations",
+      "authors": "F. de Gasperin et al.",
+      "year": 2018,
+      "journal": "Astronomy & Astrophysics 615, A179",
+      "publisher": "EDP Sciences",
+      "doi": "10.1051/0004-6361/201833012",
+      "role": "First-order dispersive phase; limitations of neglecting higher orders and Faraday rotation",
+      "urls": [
+        "https://www.aanda.org/articles/aa/pdf/2018/07/aa33012-18.pdf",
+        "https://www.aanda.org/10.1051/0004-6361/201833012/pdf",
+        "https://arxiv.org/pdf/1804.07947"
+      ],
+      "file": "degasperin-2018-ionosphere.pdf",
+      "edition": "author manuscript of a journal-published paper",
+      "bytes": 7907287,
+      "sha256": "0449469da375bc43d00855c5f743e7b96ae830318ade270c3777a158ebed0e84",
+      "download_url": "https://arxiv.org/pdf/1804.07947",
+      "resolved_url": "https://arxiv.org/pdf/1804.07947",
+      "downloaded_utc": "2026-11-10T05:37:36.257168+00:00",
+      "failures": [
+        {
+          "url": "https://www.aanda.org/articles/aa/pdf/2018/07/aa33012-18.pdf",
+          "error": "HTTP Error 403: Forbidden"
+        },
+        {
+          "url": "https://www.aanda.org/10.1051/0004-6361/201833012/pdf",
+          "error": "HTTP Error 403: Forbidden"
+        }
+      ],
+      "status": "downloaded"
+    },
+    {
+      "id": "niell-1996-mapping",
+      "title": "Global mapping functions for the atmosphere delay at radio wavelengths",
+      "authors": "A. E. Niell",
+      "year": 1996,
+      "journal": "Journal of Geophysical Research: Solid Earth 101(B2), 3227–3246",
+      "publisher": "American Geophysical Union / Wiley",
+      "doi": "10.1029/95JB03048",
+      "role": "Niell hydrostatic/wet mapping coefficients and season/height dependence; use corrected equations (4)/(5)",
+      "urls": [
+        "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/95JB03048",
+        "https://agupubs.onlinelibrary.wiley.com/doi/pdfdirect/10.1029/95JB03048",
+        "https://articles.adsabs.harvard.edu/pdf/1996JGR...101.3227N",
+        "https://www.haystack.mit.edu/geo/pubs/NMF_JGR.pdf",
+        "https://safe.nrao.edu/wiki/pub/Main/RefBendDelayCalc/Niell_Global.pdf"
+      ],
+      "status": "unavailable",
+      "failures": [
+        {
+          "url": "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/95JB03048",
+          "error": "HTTP Error 403: Forbidden"
+        },
+        {
+          "url": "https://agupubs.onlinelibrary.wiley.com/doi/pdfdirect/10.1029/95JB03048",
+          "error": "HTTP Error 403: Forbidden"
+        },
+        {
+          "url": "https://articles.adsabs.harvard.edu/pdf/1996JGR...101.3227N",
+          "error": "HTTP Error 403: Forbidden"
+        },
+        {
+          "url": "https://www.haystack.mit.edu/geo/pubs/NMF_JGR.pdf",
+          "error": "HTTP Error 404: Not Found"
+        },
+        {
+          "url": "https://safe.nrao.edu/wiki/pub/Main/RefBendDelayCalc/Niell_Global.pdf",
+          "error": "HTTP Error 403: Forbidden"
+        }
+      ]
+    },
+    {
+      "id": "saastamoinen-1972-atmosphere",
+      "title": "Atmospheric Correction for the Troposphere and Stratosphere in Radio Ranging Satellites",
+      "authors": "J. Saastamoinen",
+      "year": 1972,
+      "journal": "The Use of Artificial Satellites for Geodesy, Geophysical Monograph Series 15, 247–251",
+      "publisher": "American Geophysical Union / Wiley",
+      "doi": "10.1029/GM015p0247",
+      "role": "Pressure/temperature/water-vapour neutral atmosphere delay",
+      "urls": [
+        "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/GM015p0247",
+        "https://onlinelibrary.wiley.com/wol1/doi/10.1029/GM015p0247/fullpdf",
+        "https://articles.adsabs.harvard.edu/pdf/1972GMS....15..247S"
+      ],
+      "status": "unavailable",
+      "failures": [
+        {
+          "url": "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/GM015p0247",
+          "error": "HTTP Error 403: Forbidden"
+        },
+        {
+          "url": "https://onlinelibrary.wiley.com/wol1/doi/10.1029/GM015p0247/fullpdf",
+          "error": "HTTP Error 403: Forbidden"
+        },
+        {
+          "url": "https://articles.adsabs.harvard.edu/pdf/1972GMS....15..247S",
+          "error": "HTTP Error 403: Forbidden"
+        }
+      ]
+    },
+    {
+      "id": "landskron-boehm-2018-vmf3-gpt3",
+      "title": "VMF3/GPT3: refined discrete and empirical troposphere mapping functions",
+      "authors": "D. Landskron and J. Böhm",
+      "year": 2018,
+      "journal": "Journal of Geodesy 92, 349–360",
+      "publisher": "Springer Nature",
+      "doi": "10.1007/s00190-017-1066-2",
+      "role": "Modern neutral-atmosphere reference, revised hydrostatic zenith formula and future VMF/GPT provider extension (VMF3/GPT3 not implemented)",
+      "urls": [
+        "https://link.springer.com/content/pdf/10.1007/s00190-017-1066-2.pdf"
+      ],
+      "file": "landskron-boehm-2018-vmf3-gpt3.pdf",
+      "bytes": 4560925,
+      "sha256": "ac739c9c05460ac6dc837e5efd0f50703afba90d36710ddf18f4b8419b398950",
+      "download_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1066-2.pdf",
+      "resolved_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1066-2.pdf?error=cookies_not_supported&code=74b87f7e-6b90-4b6e-bb32-e60f04250d02",
+      "downloaded_utc": "2026-11-10T05:34:34.665162+00:00",
+      "failures": [],
+      "status": "downloaded",
+      "edition": "published article PDF (publisher or institutional archive)"
+    },
+    {
+      "id": "yan-2021-ionosphere-propagation",
+      "title": "Revisiting the light time correction in gravimetric missions like GRACE and GRACE follow-on",
+      "authors": "Y. Yan, V. Müller, G. Heinzel and M. Zhong",
+      "year": 2021,
+      "journal": "Journal of Geodesy 95, 48",
+      "publisher": "Springer Nature",
+      "doi": "10.1007/s00190-021-01498-5",
+      "role": "Published first-order plasma phase advancement and code/group delay sign, section 3.3; satellite geometry model is not used by yi-corr",
+      "urls": [
+        "https://link.springer.com/content/pdf/10.1007/s00190-021-01498-5.pdf"
+      ],
+      "file": "yan-2021-ionosphere-propagation.pdf",
+      "edition": "published article PDF (publisher or institutional archive)",
+      "bytes": 2830779,
+      "sha256": "23baae1bdce03b3d5a8fdd9136395b95d7567687b675f2685c653d3eac46bd2d",
+      "download_url": "https://link.springer.com/content/pdf/10.1007/s00190-021-01498-5.pdf",
+      "resolved_url": "https://link.springer.com/content/pdf/10.1007/s00190-021-01498-5.pdf?error=cookies_not_supported&code=d51df44f-5de5-4ae0-b7d1-5d88c0f219f0",
+      "downloaded_utc": "2026-11-10T05:50:20.977906+00:00",
+      "failures": [],
+      "status": "downloaded"
+    },
+    {
+      "id": "hofmeister-boehm-2017-neutral-atmosphere",
+      "title": "Application of ray-traced tropospheric slant delays to geodetic VLBI analysis",
+      "authors": "A. Hofmeister and J. Böhm",
+      "year": 2017,
+      "journal": "Journal of Geodesy 91, 945–964",
+      "publisher": "Springer Nature",
+      "doi": "10.1007/s00190-017-1000-7",
+      "role": "Neutral-atmosphere slant/zenith paths and limits of mapping approximations; future ray-tracing provider reference (ray tracing not implemented)",
+      "urls": [
+        "https://link.springer.com/content/pdf/10.1007/s00190-017-1000-7.pdf"
+      ],
+      "file": "hofmeister-boehm-2017-neutral-atmosphere.pdf",
+      "edition": "published article PDF (publisher or institutional archive)",
+      "bytes": 1347626,
+      "sha256": "260e3c82d86a1fbae0bf804fed9f21fd8e501647fe8d7ff8df82bf51847cc752",
+      "download_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1000-7.pdf",
+      "resolved_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1000-7.pdf?error=cookies_not_supported&code=94678762-1bbf-4368-86f9-c323a3501f67",
+      "downloaded_utc": "2026-11-10T05:50:21.585540+00:00",
+      "failures": [],
+      "status": "downloaded"
+    },
+    {
+      "id": "soja-2015-vlbi-wet-delay",
+      "title": "Tropospheric delay determination by Kalman filtering VLBI data",
+      "authors": "B. Soja et al.",
+      "year": 2015,
+      "journal": "Earth, Planets and Space 67, 144",
+      "publisher": "Springer Nature / SpringerOpen",
+      "doi": "10.1186/s40623-015-0293-0",
+      "role": "Temporal variability of neutral-atmosphere wet delay and observational input; Kalman estimation is not implemented",
+      "urls": [
+        "https://link.springer.com/content/pdf/10.1186/s40623-015-0293-0.pdf"
+      ],
+      "file": "soja-2015-vlbi-wet-delay.pdf",
+      "edition": "published article PDF (publisher or institutional archive)",
+      "bytes": 4340387,
+      "sha256": "2a46424f38d4c572afee2f9e8efece2e0d33a03dd0a8b2d0197d9454b5cb3074",
+      "download_url": "https://link.springer.com/content/pdf/10.1186/s40623-015-0293-0.pdf",
+      "resolved_url": "https://link.springer.com/content/pdf/10.1186/s40623-015-0293-0.pdf?error=cookies_not_supported&code=7a564cb5-3806-4de3-ae2c-b4ff558c7d48",
+      "downloaded_utc": "2026-11-10T05:50:22.259582+00:00",
+      "failures": [],
+      "status": "downloaded"
+    }
+  ]
+}

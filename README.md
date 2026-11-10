@@ -25,6 +25,8 @@ This repository builds two operational binaries from the same codebase:
 - `yi-corr`: auto + cross correlation (A1xA1, A1xA2, A2xA2)
 - `yi-phasedarray`: phased-array synthesis (`.raw`, phased `.cor`, plots)
 
+3.11.0 の [電離層・対流圏補正](docs/atmosphere.md) は、局別 TEC と天頂遅延・気象値を XML 定数または UTC 時系列 CSV で指定できる。群遅延と分散位相を分けて適用する。出版論文と取得状況は [reference/atmosphere/](reference/atmosphere/README.md) に保存する。観測 `.raw` は複製せず、元パスと SHA-256 で参照する。
+
 ## Features
 
 - XML schedule driven operation (`--sc <schedule.xml>`)
@@ -273,7 +275,11 @@ Automatic all-process mode is enabled only when all of these are unset/default:
 - `--length`
 - `--skip` must be `0`
 
-For process 2+ logs:
+For `yi-corr`, every scan prints a short source/baseline/parameter summary and
+progress. Full parameter tables and diagnostics for **all** scans are saved in
+the run's compressed `.info` file, including scans after the first.
+
+For `yi-phasedarray` process 2+ logs:
 
 - compact logs are used
 - `Antenna Parameters` are still printed for each process
@@ -288,6 +294,40 @@ For process 2+ logs:
 - `<ANT1>_<ANT1>_<TAG>_<LABEL>.cor`
 - `<ANT1>_<ANT2>_<TAG>_<LABEL>.cor`
 - `<ANT2>_<ANT2>_<TAG>_<LABEL>.cor`
+- `yi-corr_<START_TAG>_<NANOSECONDS>_<PID>.info` (ZIP/Deflate run details, containing UTF-8 `info.txt`)
+
+The console shows the source, baseline, epoch, skip/duration, FFT, sampling,
+input bits/sidebands, observing frequency/bandwidth, integration, delay/rate
+settings, model, CPU allocation, output location, progress and completion.
+Integration is shown as the actual seconds per sector together with the
+requested rate in Hz. Redirected output uses complete lines; progress is
+throttled to once per 10 seconds plus the final update.
+
+Detailed `[info]` records, XML/antenna parameter tables, model diagnostics,
+timing, warnings and errors are saved automatically in the `.info` file under
+`--cor`. One invocation creates one file covering every scan and multiband
+pass; filenames include nanoseconds and PID to avoid overwriting concurrent
+runs. The ZIP central directory is finalized on normal completion and handled
+errors. After completion, read it without changing the `.info` extension:
+
+```bash
+zipcat cor/yi-corr_<START_TAG>_<NANOSECONDS>_<PID>.info | less
+zedit cor/yi-corr_<START_TAG>_<NANOSECONDS>_<PID>.info
+# A standard ZIP reader also works:
+unzip -p cor/yi-corr_<START_TAG>_<NANOSECONDS>_<PID>.info info.txt | less
+```
+
+The archive uses ordinary ZIP32 with one non-encrypted Deflate member, so
+`zipcat` does not need a member argument. In zedit's Open dialog, select
+"All files" to see `.info`; passing the path on the command line also works.
+The current zipcat Bash completion lists `.zip` only, so enter `.info` paths
+explicitly. While a correlation is still running, use its concise console
+progress; the ZIP becomes readable when it is finalized.
+
+Version `3.10.4` produced gzip `.info` files. They remain readable with
+`gzip -dc old.info`. To create a ZIP copy for zipcat/zedit while preserving
+the original, use `python3 tools/info_to_zip.py old.info --output old.zip.info`.
+The saved frequency-validation references retain their original gzip files.
 
 ### yi-phasedarray
 
@@ -914,13 +954,9 @@ Where:
 - `TAG`: `YYYYDDDhhmmss` from process epoch (+ effective skip)
 - `LABEL`: stream label from XML (`<stream><label>`), sanitized for file safety
 
-Additionally, a run summary log is appended to:
-
-- `<schedule.xml>.stdout.txt`
-
-For `yi-corr`, full runtime stdout is also streamed when `--stdout` is specified:
-
-- `./stdout/stdout_<yyyydddhhmmss>.log` (created at command start time)
+For `yi-corr`, `--stdout` additionally saves the concise console output to
+`./stdout/stdout_<START_TAG>_<NANOSECONDS>_<PID>.log`. Detailed information is
+always saved in the ZIP `.info` file, with or without this flag.
 
 ## Key CLI options
 
@@ -953,7 +989,7 @@ Model diagnostics:
 
 - `--model-diagnostics` (one correlation run plus model-only comparisons)
 - `--model-sweep` (five unattended full-correlation runs)
-- `--stdout` (save runtime stdout under `./stdout/`)
+- `--stdout` (also save concise console output under `./stdout/`; `.info` is automatic)
 
 ### Delay Compensation Model
 
@@ -1152,6 +1188,12 @@ The practical rule for future GPU and CPU implementations is:
 
 
 ### G9.62 Maser Validation and Station/Grid-Origin Correction in `3.0.1`
+
+> Reassessment (2026-11-10): the station-specific offset described below is an
+> empirical workaround; its interpretation as backend metadata is not established.
+> Improved correlation after an integer shift alone does not identify a hardware
+> frequency-origin convention. Delay and fringe-rotation handling must also be
+> verified. The following sections retain the historical interpretation.
 
 `fx-corr 3.0.1` adds and documents a station/backend frequency-grid-origin
 correction that was identified during validation with the narrow-band G9.62
@@ -2268,7 +2310,7 @@ target/release/yi-corr \
   --stdout
 ```
 
-The normal stdout contains detailed `geom-diag` records and up to five exact
+The compressed `.info` file contains detailed `geom-diag` records and up to five exact
 frame-midpoint checkpoints: start, one quarter, midpoint, three quarters, and
 end. The checkpoints report:
 
@@ -2300,7 +2342,7 @@ active model with DUT1/xp/yp forced to zero. `pnm-era-engineering` is included
 only as a transform/sign control; it is not the standard CIO-plus-ERA model.
 `--model-diagnostics` also enables the existing
 `delay_model_<ANT1>_<ANT2>_<EPOCH>.tsv` dump. Collect both TSV files and the
-`--stdout` log when comparing against `frinZ`; no additional correlation is
+`.info` file when comparing against `frinZ`; no additional correlation is
 needed for this model-only comparison.
 
 To keep the high derivatives stable against MJD `f64` rounding, diagnostic
@@ -2381,9 +2423,12 @@ sector count, and artifact fingerprint must still match its marker. A Unix
 `flock` inherited by the active child prevents overlapping sweeps even if the
 parent is terminated.
 
-These diagnostics do not add propagation or station-deformation corrections.
-In particular, `yi-corr` currently does **not** model troposphere, ionosphere,
-solid-Earth tide, ocean loading, pole tide, station velocity, antenna axis
+These diagnostics alone do not select propagation or station-deformation corrections.
+Troposphere and first-order ionosphere can be selected using
+the [atmosphere inputs](docs/atmosphere.md); `--vlbi` retains nominal troposphere
+when no measured neutral-atmosphere input is supplied. Geometric variant
+comparisons exclude atmosphere, while applied group delays include enabled
+corrections. `yi-corr` currently does **not** model solid-Earth tide, ocean loading, pole tide, station velocity, antenna axis
 offset, or gravitational delay. A changing differential tropospheric slant
 path at low elevation can produce a smooth nonlinear residual delay and an
 apparently quadratic or cubic fringe phase. The printed elevation and
@@ -2522,7 +2567,7 @@ Performance:
 
 Diagnostics:
 
-- `--stdout` (yi-corr only; write runtime stdout log to `./stdout/stdout_<yyyydddhhmmss>.log`)
+- `--stdout` (yi-corr only; also save concise stdout to `./stdout/stdout_<START_TAG>_<NANOSECONDS>_<PID>.log`; ZIP `.info` details are automatic under `--cor`)
 - `--debug` (writes full-frame debug log to `<schedule_dir>/debug_yi-corr/debug_<epoch>.log`)
 - `--model-diagnostics` (one correlation plus per-second 16-variant model comparison)
 - `--model-sweep` (five sequential full-correlation model cases)
@@ -2536,6 +2581,11 @@ Advanced hidden:
 
 <!-- yi-corr-v302-grid-origin-notes:start -->
 ### `3.0.2` validation update: HITACH32 frequency-grid origin is a Hz-level backend convention
+
+> This is the historical `3.0.2` interpretation. Expressing the empirical value in
+> Hz does not establish its physical origin. Its origin must be independently
+> verified before treating it as confirmed station/backend metadata or
+> transferring it to another implementation.
 
 Version `3.0.2` clarifies and generalizes the HITACH32 frequency-grid correction.  The correction must not be interpreted as a fixed `-1 bin` shift.  It is a small station/backend frequency-origin offset expressed in physical frequency units:
 
@@ -2753,6 +2803,9 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.10.5` | Writes `.info` as ordinary ZIP32/Deflate containing one UTF-8 `info.txt`, compatible with zipcat and zedit without renaming. Retains gzip reading in analysis/benchmark tools and provides a converter that preserves archived originals. |
+| `3.11.0` | Adds station XML/UTC CSV atmosphere providers: STEC/VTEC first-order ionosphere with separate group alignment and dispersive spectral phase, measured zenith paths or Saastamoinen weather delays with Niell mapping. Preserves default/legacy nominal processing and records models in ZIP `.info`. |
+| `3.10.4` | Saves full yi-corr diagnostics for every scan automatically as gzip-compressed `.info` in the correlation directory. Shows concise source/baseline/parameter summaries, throttled progress and completion on stdout; `--stdout` additionally saves that concise console output. |
 | `3.10.3` | Fixes concurrent CPU allocation: reserves only the logical CPUs actually used, allows free SMT siblings, and removes the mandatory two-CPU reserve. Supports 15+15 and 15+17 jobs on 32 logical CPUs without changing the first job's affinity. Reconciles unused SMT claims from running older versions on Linux. |
 | `3.10.2` | Names joint C/X cross- and auto-correlation products `ANT1_ANT2_YYYYDDDHHMMSS_mbcx.cor` (repeating the station name for ACF), preserving both physical RF grids and the joint format. frinZ 5.4.0 detects the format by its header. |
 | `3.10.1` | Fixes integration-rate log units (20 Hz was displayed as 0.05 Hz), identifies the multiband solution override separately from XML output, and displays observation seconds alongside sector counts. Correlation timing and data products are unchanged. |

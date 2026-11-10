@@ -1044,7 +1044,11 @@ pub fn run(
                 end,
                 args.multiband_calibration_max_gap.unwrap_or(f64::INFINITY),
             )?;
-            println!("[multiband] scan {} source {:?}: transfer calibrator solutions (no target fringe fit)", index + 1, a.object);
+            statusln!(
+                "[multiband] scan {} source {}: transfer calibrator solutions",
+                index + 1,
+                a.object.as_deref().unwrap_or("-")
+            );
             c
         } else {
             let mut solve_paths = [PathBuf::new(), PathBuf::new()];
@@ -1054,7 +1058,7 @@ pub fn run(
                 v.cor_directory = Some(out.clone());
                 v.xcf_only = true;
                 v.integration_rate_override = Some(1.0 / args.multiband_solve_integration);
-                println!(
+                statusln!(
                     "[multiband] scan {} solution pass band {}",
                     index + 1,
                     band + 1
@@ -1122,7 +1126,7 @@ pub fn run(
             // Final multiband products always include both station powers.
             // Only the short solution pass uses the XCF-only fast path.
             v.xcf_only = false;
-            println!(
+            statusln!(
                 "[multiband] scan {} corrected correlation band {}",
                 index + 1,
                 band + 1
@@ -1144,6 +1148,11 @@ pub fn run(
             epoch,
             transfer,
         )?;
+        statusln!(
+            "[multiband] source={} complete: {}",
+            a.object.as_deref().unwrap_or("-"),
+            directory.display()
+        );
     }
     if let Some(mut c) = calibration {
         c.solutions

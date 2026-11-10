@@ -1,0 +1,596 @@
+{
+  "reference": "T. Takasu RTKLIB, nmf() original C implementation",
+  "sources": [
+    {
+      "url": "https://raw.githubusercontent.com/tomojitakasu/RTKLIB/master/src/rtkcmn.c",
+      "sha256": "c1d7e9af54518733dc874fc64523114b4a77a45e80895d0bb8ff4fcecfea65c7"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/tomojitakasu/RTKLIB/master/src/rtklib.h",
+      "sha256": "5b61545cb703c781b206497040194efdc8b8a23cdac4c627283efd1260693653"
+    }
+  ],
+  "epochs_utc": [
+    "2024/028 00:00:00",
+    "2024/210 12:00:00",
+    "2024/366 23:59:59"
+  ],
+  "rows": [
+    {
+      "epoch_index": 0,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.100346890578477,
+      "wet_mapping": 10.750678455611014
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9924738897521368,
+      "wet_mapping": 1.9965493248581532
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.126713350336493,
+      "wet_mapping": 10.750678455611014
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.99265115593764,
+      "wet_mapping": 1.9965493248581532
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.134134019983287,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9926959953887053,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.160500479741303,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9928732615742086,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.101406329610157,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9924729288676313,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.127772789368173,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9926501950531346,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.19967611637019,
+      "wet_mapping": 10.719284104452896
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.993136417083502,
+      "wet_mapping": 1.996339505611913
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.226042576128206,
+      "wet_mapping": 10.719284104452896
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9933136832690053,
+      "wet_mapping": 1.996339505611913
+    },
+    {
+      "epoch_index": 0,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.100346890578477,
+      "wet_mapping": 10.750678455611014
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9924738897521368,
+      "wet_mapping": 1.9965493248581532
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.126713350336493,
+      "wet_mapping": 10.750678455611014
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.99265115593764,
+      "wet_mapping": 1.9965493248581532
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.101406367207135,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9924729291253898,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.12777282696515,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.992650195310893,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.134133981915532,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9926959951307568,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.160500441673548,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.99287326131626,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.132788674750614,
+      "wet_mapping": 10.719284104452896
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9926595738979451,
+      "wet_mapping": 1.996339505611913
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.15915513450863,
+      "wet_mapping": 10.719284104452896
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9928368400834484,
+      "wet_mapping": 1.996339505611913
+    },
+    {
+      "epoch_index": 1,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.100346890578477,
+      "wet_mapping": 10.750678455611014
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9924738897521368,
+      "wet_mapping": 1.9965493248581532
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 15.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.126713350336493,
+      "wet_mapping": 10.750678455611014
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.99265115593764,
+      "wet_mapping": 1.9965493248581532
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 15.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.132484079851785,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9926848120222014,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 37.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.158850539609801,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9928620782077047,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.103036881763638,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.992484104398968,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": -37.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.129403341521654,
+      "wet_mapping": 10.759806850782024
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9926613705844713,
+      "wet_mapping": 1.996586341979328
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": -37.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.196281491882758,
+      "wet_mapping": 10.719284104452896
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9931124921433312,
+      "wet_mapping": 1.996339505611913
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 75.0,
+      "height_m": 0.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 5.0,
+      "dry_mapping": 10.222647951640774,
+      "wet_mapping": 10.719284104452896
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 30.0,
+      "dry_mapping": 1.9932897583288345,
+      "wet_mapping": 1.996339505611913
+    },
+    {
+      "epoch_index": 2,
+      "latitude_deg": 75.0,
+      "height_m": 1200.0,
+      "elevation_deg": 90.0,
+      "dry_mapping": 1.0,
+      "wet_mapping": 1.0
+    }
+  ]
+}

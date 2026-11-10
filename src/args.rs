@@ -538,6 +538,41 @@ pub struct Args {
 
     #[arg(
         long,
+        value_name = "CSV",
+        help = "Station TEC/zenith paths/weather CSV; overrides XML atmosphere file/constants"
+    )]
+    pub atmosphere_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Ionosphere: off or input (auto: enable when TEC is supplied); group and dispersive phase correction"
+    )]
+    pub ionosphere: Option<crate::atmosphere::IonosphereMode>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Troposphere: off, nominal or input (auto: supplied paths/weather, otherwise nominal with --vlbi)"
+    )]
+    pub troposphere: Option<crate::atmosphere::TroposphereMode>,
+
+    #[arg(
+        long,
+        value_name = "KM",
+        help = "Thin-shell height for VTEC mapping (default 450 km; no effect on supplied STEC)"
+    )]
+    pub ionosphere_shell_height_km: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "DEG",
+        help = "Minimum elevation for VTEC/Niell mapping (default 5 deg, allowed 3..90)"
+    )]
+    pub atmosphere_min_elevation_deg: Option<f64>,
+
+    #[arg(
+        long,
         default_value_t = false,
         help = "Run an unattended five-case full-correlation model sweep into subdirectories"
     )]
@@ -546,7 +581,7 @@ pub struct Args {
     #[arg(
         long = "stdout",
         default_value_t = false,
-        help = "Write yi-corr runtime stdout log to ./stdout/stdout_<yyyydddhhmmss>.log"
+        help = "Also save concise yi-corr stdout under ./stdout/ (ZIP .info details are always saved in --cor)"
     )]
     pub stdout: bool,
 

@@ -21,7 +21,17 @@ debug_yi-corr/
 *.vdif
 *.cor
 *.log
+*.info
 *.tsv
+
+# Third-party Nobeyama/Takahagi observations and all derived evidence stay local.
+# Include schedules, manifests, arrays, reports and observation-derived ZIP tests.
+/reference/nobeyama-2024131/
+/docs/validation/nobeyama-2024131/
+/reference/zip-info-compatibility/
+/reference/atmosphere/validation/nobeyama-default-regression.json
+/reference/velocity-and-frequency.md
+/tools/archive_frequency_reference.py
 
 # temporary patches / backups
 *.before_*

@@ -491,7 +491,7 @@ fn itrs_to_celestial(
     ]
 }
 
-fn ecef_geodetic_lat_lon(ecef_m: [f64; 3]) -> (f64, f64) {
+pub(crate) fn ecef_geodetic_lat_lon(ecef_m: [f64; 3]) -> (f64, f64) {
     const WGS84_A_M: f64 = 6_378_137.0;
     const WGS84_F: f64 = 1.0 / 298.257_223_563;
     let e2 = WGS84_F * (2.0 - WGS84_F);

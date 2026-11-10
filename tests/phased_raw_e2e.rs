@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +43,495 @@ fn write_schedule_with_clock_delay(
 
 fn write_schedule(path: &Path, station1: &str, station2: &str) {
     write_schedule_with_clock_delay(path, station1, station2, 0.0);
+}
+
+#[test]
+fn ionosphere_corrects_injected_dispersive_voltage_without_changing_frequency_bins() {
+    use std::f64::consts::TAU;
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let schedule = root.join("test.xml");
+    let nfft = 1024;
+    let fs_hz = 32_768_000.0;
+    let rf_hz = 40_000_000.0;
+    let tones = [20usize, 73, 147, 212, 289, 371, 443];
+    // XML shuffle lists output bits MSB first; 31..0 is byte/sample identity.
+    let identity = (0..32)
+        .rev()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let levels = (0..256)
+        .map(|i| (i as f64 - 127.5).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    for (case, sideband, delta_tec, rot, tec_rate) in [
+        (0, "LSB", 1.0, 0.0, 0.0),
+        (1, "USB", -1.0, 0.0, 0.0),
+        (2, "USB", 1.0, 1_024_000.0, 0.0),
+        (3, "LSB", 1.0, 0.0, 20.0),
+    ] {
+        write_schedule(&schedule, "ANT1", "ANT2");
+        let xml = fs::read_to_string(&schedule).unwrap()
+            .replace("<speed>8192</speed>", "<speed>32768000</speed>")
+            .replace("<bit>2</bit>", "<bit>8</bit>")
+            .replace("<level>-1.5,-0.5,0.5,1.5</level>", &format!("<level>{levels}</level>"))
+            .replace("24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7", &identity)
+            .replace("<frequency>100000000</frequency>", "<frequency>40000000</frequency>")
+            .replace("<fft>128</fft>", "<fft>1024</fft>")
+            .replace("<output>8</output>", "<output>250</output>")
+            .replace("<length>1</length>", "<length>0.004</length>")
+            .replace("<sideband>LSB</sideband>", &format!("<sideband>{sideband}</sideband>"))
+            .replace("<special key=\"B\"><rotation>0</rotation>", &format!("<special key=\"B\"><rotation>{rot}</rotation>"))
+            .replace("<name>ANT1</name>", &format!("<name>ANT1</name><atmosphere stec-tecu=\"{}\"/>", if delta_tec > 0.0 { 0 } else { 1 }))
+            .replace("<name>ANT2</name>", &format!("<name>ANT2</name><atmosphere stec-tecu=\"{}\"/>", if delta_tec > 0.0 { 1 } else { 0 }));
+        let xml = if tec_rate != 0.0 {
+            let csv = root.join("tec.csv");
+            let last = 51544.0 + 0.004 / 86400.0;
+            fs::write(csv, format!("station,mjd_utc,stec_tecu\nA,51544,0\nB,51544,1\nA,{last:.12},0\nB,{last:.12},1.08\n")).unwrap();
+            xml.replace("<schedule>", "<schedule><atmosphere file=\"tec.csv\"/>")
+        } else {
+            xml
+        };
+        fs::write(&schedule, &xml).unwrap();
+        // Independent sky/voltage model. A positive TEC causes phase advance
+        // +2*pi*40.3*TEC/(c*f) in station 2, with frequency in physical RF.
+        let d = 40.3e16 * delta_tec / 299_792_458.0;
+        for (station, ionized, rotation) in [("ANT1", false, 0.0), ("ANT2", true, rot)] {
+            let sample_count = if tec_rate == 0.0 { nfft } else { nfft * 128 };
+            let frame: Vec<u8> = (0..sample_count)
+                .map(|sample| {
+                    let frame_mid_s =
+                        (sample / nfft) as f64 * nfft as f64 / fs_hz + 0.5 * nfft as f64 / fs_hz;
+                    let d = d + 40.3e16 / 299_792_458.0 * tec_rate * frame_mid_s;
+                    let mut value = 0.0;
+                    for (j, &bin) in tones.iter().enumerate() {
+                        let f = rf_hz + bin as f64 * fs_hz / nfft as f64;
+                        let native_bin = bin as f64 - rotation * nfft as f64 / fs_hz;
+                        if native_bin <= 0.0 {
+                            continue;
+                        }
+                        let phase = TAU * native_bin * sample as f64 / nfft as f64
+                            + j as f64 * 0.271
+                            + if ionized { TAU * d / f } else { 0.0 };
+                        value += 8.0 * phase.cos();
+                    }
+                    if sideband == "LSB" && sample % 2 == 1 {
+                        value = -value;
+                    }
+                    (value + 127.5).round().clamp(0.0, 255.0) as u8
+                })
+                .collect();
+            let raw = frame.repeat(if tec_rate == 0.0 { 128 } else { 1 });
+            fs::write(raw_dir.join(format!("{station}_2000001000000.raw")), raw).unwrap();
+        }
+        let mut corrected = Vec::new();
+        for mode in ["off", "on", "debug", "fold", "phased"] {
+            fs::write(
+                &schedule,
+                if mode == "fold" {
+                    xml.replace(
+                        "<schedule>",
+                        "<schedule><pulsar><period>1</period><bins>1</bins><dm>0</dm></pulsar>",
+                    )
+                } else {
+                    xml.clone()
+                },
+            )
+            .unwrap();
+            let phased = mode == "phased";
+            let out = root.join(format!("{case}-{mode}"));
+            let mut cmd = Command::new(if phased {
+                env!("CARGO_BIN_EXE_yi-phasedarray")
+            } else {
+                env!("CARGO_BIN_EXE_yi-corr")
+            });
+            cmd.args([
+                "--sc",
+                schedule.to_str().unwrap(),
+                "--raw",
+                raw_dir.to_str().unwrap(),
+                if phased { "--output" } else { "--cor" },
+                out.to_str().unwrap(),
+                "--cpu",
+                "1",
+                "--no-affinity",
+                "--ionosphere",
+                if mode == "off" { "off" } else { "input" },
+            ])
+            .env("YI_EOP_MODE", "none")
+            .env("YI_ANT2_GRID_OFFSET", "0")
+            .env("YI_FRINGE_STOP_FREQ_MODE", "low")
+            .env("YI_GEOM_DELAY_MODE", "anchored");
+            if mode == "debug" {
+                cmd.arg("--debug");
+            }
+            if phased {
+                cmd.args(["--phased-name", "ARRAY", "--phased-diagnostics"]);
+            }
+            let result = cmd.output().unwrap();
+            assert!(
+                result.status.success(),
+                "case={case} {mode}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let product = fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("ANT1_ANT2_")
+                        && p.extension().and_then(|s| s.to_str()) == Some("cor")
+                })
+                .unwrap();
+            let bytes = fs::read(product).unwrap();
+            let mut phases = Vec::new();
+            for bin in tones
+                .into_iter()
+                .filter(|bin| *bin as f64 * fs_hz / nfft as f64 > rot)
+            {
+                let start = 256 + 128 + bin * 8;
+                let re = f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as f64;
+                let im = f32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap()) as f64;
+                assert!(re.hypot(im) > 1e-8, "tone disappeared from bin {bin}");
+                phases.push(im.atan2(re));
+            }
+            if mode == "off" {
+                assert!(
+                    phases.iter().any(|p| p.abs() > 0.5),
+                    "injection must require correction"
+                );
+            } else {
+                assert!(
+                    phases.iter().all(|p| p.abs() < 0.015),
+                    "case={case} {mode} residual phases {phases:?}"
+                );
+                if mode == "on" {
+                    corrected = phases;
+                } else {
+                    assert!(
+                        phases
+                            .iter()
+                            .zip(&corrected)
+                            .all(|(a, b)| (a - b).abs() < 1e-6),
+                        "phased/mapped correction diverged"
+                    );
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn corr_info_paths(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("info"))
+        .collect()
+}
+
+#[test]
+fn atmosphere_xml_and_relative_csv_inputs_match_and_invalid_coverage_fails() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let schedule = root.join("test.xml");
+    write_schedule(&schedule, "ANT1", "ANT2");
+    let base_xml = fs::read_to_string(&schedule)
+        .unwrap()
+        .replace("00h00m00.0", "15h30m00.0")
+        .replace("+00d00'00.0", "+35d00'00.0");
+    let raw: Vec<u8> = (0..4096).map(|i| ((i * 53 + i / 7) % 256) as u8).collect();
+    for station in ["ANT1", "ANT2"] {
+        fs::write(raw_dir.join(format!("{station}_2000001000000.raw")), &raw).unwrap();
+    }
+    let mut reference = std::collections::BTreeMap::new();
+    for provider in [
+        "xml",
+        "csv-constant",
+        "csv-dated",
+        "cli-override",
+        "off",
+        "bare",
+        "bad-coverage",
+    ] {
+        let out = root.join(provider);
+        let csv = root.join("weather.csv");
+        let header = "station,mjd_utc,vtec_tecu,pressure_hpa,temperature_k,vapour_pressure_hpa\n";
+        let mut csv_text = header.to_string();
+        if provider == "csv-constant" || provider == "cli-override" {
+            csv_text += "A,,10,1000,288.15,10\nB,,10.1,990,289.15,11\n";
+        } else {
+            let end = 51544.0
+                + if provider == "bad-coverage" {
+                    0.25
+                } else {
+                    2.0
+                } / 86400.0;
+            for t in [51544.0, end] {
+                csv_text += &format!("A,{t:.12},10,1000,288.15,10\nB,{t:.12},10.1,990,289.15,11\n");
+            }
+        }
+        fs::write(&csv, csv_text).unwrap();
+        let xml = match provider {
+            "xml" | "off" => base_xml
+                .replace("<name>ANT1</name>", "<name>ANT1</name><atmosphere vtec-tecu=\"10\" pressure-hpa=\"1000\" temperature-k=\"288.15\" vapour-pressure-hpa=\"10\"/>")
+                .replace("<name>ANT2</name>", "<name>ANT2</name><atmosphere vtec-tecu=\"10.1\" pressure-hpa=\"990\" temperature-k=\"289.15\" vapour-pressure-hpa=\"11\"/>"),
+            "bare" => base_xml.clone(),
+            _ => base_xml.replace("<schedule>", &format!("<schedule><atmosphere file=\"{}\"/>", if provider == "cli-override" {"absent.csv"} else {"weather.csv"})),
+        };
+        fs::write(&schedule, xml).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
+        // Run outside the schedule directory: XML file references must remain
+        // relative to the original XML, rather than the process cwd.
+        command
+            .current_dir(&raw_dir)
+            .args([
+                "--sc",
+                schedule.to_str().unwrap(),
+                "--raw",
+                raw_dir.to_str().unwrap(),
+                "--cor",
+                out.to_str().unwrap(),
+                "--cpu",
+                "1",
+                "--no-affinity",
+                "--skip",
+                "0.125",
+            ])
+            .env("YI_EOP_MODE", "none")
+            .env("YI_GEOM_DELAY_MODE", "anchored")
+            .env("YI_FRINGE_STOP_FREQ_MODE", "low");
+        if provider == "cli-override" {
+            command.args(["--atmosphere-file", csv.to_str().unwrap()]);
+        }
+        if provider == "off" {
+            command.args(["--ionosphere", "off", "--troposphere", "off"]);
+        }
+        let result = command.output().unwrap();
+        if provider == "bad-coverage" {
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("outside input coverage"));
+            assert!(read_corr_info(&corr_info_paths(&out)[0]).ends_with("# status=error\n"));
+            continue;
+        }
+        assert!(
+            result.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let products: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("cor"))
+            .map(|p| (p.file_name().unwrap().to_owned(), fs::read(p).unwrap()))
+            .collect();
+        if provider == "xml" || provider == "off" {
+            reference = products;
+        } else {
+            assert_eq!(products, reference, "{provider}");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn read_corr_info(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "not ZIP: {}", path.display());
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .expect("complete ZIP including the central directory");
+    assert_eq!(
+        archive.len(),
+        1,
+        "zipcat must be able to omit the member name"
+    );
+    let mut member = archive.by_name("info.txt").unwrap();
+    assert_eq!(member.compression(), zip::CompressionMethod::Deflated);
+    assert!(!member.encrypted());
+    let mut text = String::new();
+    member
+        .read_to_string(&mut text)
+        .expect("UTF-8 text and valid ZIP CRC");
+    text
+}
+
+#[test]
+fn corr_saves_compressed_details_and_shows_each_scan_concisely() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    let out = root.join("cor");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let schedule = root.join("test.xml");
+    write_schedule(&schedule, "ANT1", "ANT2");
+    let xml = fs::read_to_string(&schedule).unwrap()
+        .replace("<source name=\"TARGET\">", "<source name=\"CAL\"><ra>00h00m00.0</ra><dec>+00d00'00.0</dec></source>\n<source name=\"TARGET\">")
+        .replace("</schedule>", "<process><epoch>2000/001 00:00:10</epoch><length>1</length><object>CAL</object><stations>AB</stations></process>\n</schedule>");
+    fs::write(&schedule, xml).unwrap();
+    let raw: Vec<u8> = (0..2048).map(|i| ((i * 53 + i / 7) % 256) as u8).collect();
+    for station in ["ANT1", "ANT2"] {
+        for tag in ["2000001000000", "2000001000010"] {
+            fs::write(raw_dir.join(format!("{station}_{tag}.raw")), &raw).unwrap();
+        }
+    }
+    let mut reference_products = std::collections::BTreeMap::new();
+    for save_stdout in [false, true] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
+        cmd.current_dir(&root)
+            .args([
+                "--sc",
+                schedule.to_str().unwrap(),
+                "--raw",
+                raw_dir.to_str().unwrap(),
+                "--cor",
+                out.to_str().unwrap(),
+                "--cpu",
+                "1",
+                "--no-affinity",
+                "--fft",
+                "256",
+                "--model-diagnostics",
+            ])
+            .env("YI_EOP_MODE", "none");
+        if save_stdout {
+            cmd.arg("--stdout");
+        }
+        let result = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            result.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(stdout.matches("[scan] source=").count(), 2, "{stdout}");
+        assert_eq!(stdout.matches("[done] source=").count(), 2, "{stdout}");
+        for expected in [
+            "source=TARGET baseline=ANT1-ANT2 epoch=2000/001 00:00:00",
+            "source=CAL baseline=ANT1-ANT2 epoch=2000/001 00:00:10",
+            "FFT=256 sampling=0.008192MS/s bits=2/2 sideband=LSB/LSB",
+            "RF=100.000000MHz BW=0.004096MHz df=32.000000Hz",
+            "integration=0.125000000s (requested 8.000000Hz; XML) sectors=8",
+            "compute-threads=1 affinity=disabled",
+            "100.0%",
+        ] {
+            assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
+        }
+        for hidden in ["[info]", "Antenna Parameters", "geom-diag", "[mk_xml-arg]"] {
+            assert!(
+                !stdout.contains(hidden),
+                "detail leaked: {hidden}\n{stdout}"
+            );
+        }
+        assert!(
+            !stdout.contains('\r'),
+            "redirected output must use complete lines"
+        );
+        assert!(stdout.lines().count() < 30, "{stdout}");
+        let paths = corr_info_paths(&out);
+        assert_eq!(
+            paths.len(),
+            if save_stdout { 2 } else { 1 },
+            "logs must not overwrite"
+        );
+        for path in paths {
+            let info = read_corr_info(&path);
+            for expected in [
+                "# schedule XML:",
+                "# resolved CLI arguments:",
+                "[info] CPU allocation:",
+                "[info] Parsed schedule XML parameters:",
+                "[mk_xml-arg] --scan=1",
+                "[mk_xml-arg] --scan=2",
+                "[geom-diag:source]",
+                "# status=ok",
+            ] {
+                assert!(
+                    info.contains(expected),
+                    "missing {expected:?} in {}",
+                    path.display()
+                );
+            }
+            assert_eq!(info.matches("[info] Synth timing summary:").count(), 2);
+        }
+        let products: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("cor"))
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(&path).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(products.len(), 6);
+        if save_stdout {
+            assert_eq!(
+                products, reference_products,
+                "logging must preserve correlation products"
+            );
+            let logs: Vec<_> = fs::read_dir(root.join("stdout")).unwrap().collect();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(
+                fs::read_to_string(logs[0].as_ref().unwrap().path()).unwrap(),
+                stdout
+            );
+        } else {
+            reference_products = products;
+            assert!(!root.join("stdout").exists());
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn corr_finalizes_info_even_after_a_processing_error() {
+    let root = unique_temp_dir();
+    let raw_dir = root.join("raw");
+    let out = root.join("cor");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let schedule = root.join("test.xml");
+    write_schedule(&schedule, "ANT1", "ANT2");
+    let xml = fs::read_to_string(&schedule)
+        .unwrap()
+        .replace("<output>8</output>", "<output>0</output>");
+    fs::write(&schedule, xml).unwrap();
+    for station in ["ANT1", "ANT2"] {
+        fs::write(
+            raw_dir.join(format!("{station}_2000001000000.raw")),
+            vec![0x39; 2048],
+        )
+        .unwrap();
+    }
+    let result = Command::new(env!("CARGO_BIN_EXE_yi-corr"))
+        .args([
+            "--sc",
+            schedule.to_str().unwrap(),
+            "--raw",
+            raw_dir.to_str().unwrap(),
+            "--cor",
+            out.to_str().unwrap(),
+            "--cpu",
+            "1",
+            "--no-affinity",
+        ])
+        .env("YI_EOP_MODE", "none")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("stream/output must be positive finite")
+    );
+    let paths = corr_info_paths(&out);
+    assert_eq!(paths.len(), 1);
+    let info = read_corr_info(&paths[0]);
+    assert!(info.contains("[error] stream/output must be positive finite"));
+    assert!(info.ends_with("# status=error\n"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1381,9 +1871,13 @@ fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
                 String::from_utf8_lossy(&result.stderr)
             );
             if run == 3 {
-                assert!(String::from_utf8_lossy(&result.stdout).contains("VLBI preset:"));
+                let paths = corr_info_paths(&out);
+                assert_eq!(paths.len(), 1);
+                let info = read_corr_info(&paths[0]);
+                assert!(info.contains("VLBI preset:"));
+                assert!(info.contains("VLBI atmosphere: nominal troposphere enabled"));
                 assert!(String::from_utf8_lossy(&result.stdout)
-                    .contains("VLBI atmosphere: nominal troposphere enabled"));
+                    .contains("atmosphere=nominal-troposphere"));
             }
             let files: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
                 .unwrap()

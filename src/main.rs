@@ -1,6 +1,35 @@
+// Define these before the modules so their diagnostics follow the same routing.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::runtime_log::detail(format_args!($($arg)*), false);
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        crate::runtime_log::detail(format_args!(""), true);
+    }};
+    ($($arg:tt)*) => {{
+        crate::runtime_log::detail(format_args!($($arg)*), true);
+    }};
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::runtime_log::stderr(format_args!($($arg)*));
+    }};
+}
+
+macro_rules! statusln {
+    ($($arg:tt)*) => {{
+        crate::emit_stdout_fmt(format_args!($($arg)*), true);
+    }};
+}
+
 mod acf;
 mod affinity;
 mod args;
+mod atmosphere;
 mod cor;
 mod corr_kernel;
 mod cpu_balance;
@@ -15,6 +44,7 @@ mod model_sweep;
 mod multiband;
 mod plot;
 mod pulsar;
+mod runtime_log;
 mod utils;
 mod xcf;
 mod xml;
@@ -27,7 +57,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use num_complex::Complex;
@@ -54,77 +84,33 @@ const DEFAULT_COARSE_DELAY_S: f64 = 0.0;
 // GICO3-compatible one-sided spectrum normalization factor:
 // .cor stores only positive-frequency bins for real-input FFT outputs.
 const COR_ONE_SIDED_POWER_FACTOR: f64 = 0.5;
-static STDOUT_LOG_WRITER: OnceLock<Mutex<Option<BufWriter<File>>>> = OnceLock::new();
-static STDOUT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn stdout_log_writer() -> &'static Mutex<Option<BufWriter<File>>> {
-    STDOUT_LOG_WRITER.get_or_init(|| Mutex::new(None))
-}
-
-fn stdout_log_lock() -> &'static Mutex<()> {
-    STDOUT_LOG_LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn emit_stdout_fmt(args: std::fmt::Arguments<'_>, newline: bool) {
-    let text = args.to_string();
-    let _guard = stdout_log_lock().lock().ok();
-    {
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(text.as_bytes());
-        if newline {
-            let _ = out.write_all(b"\n");
-        }
-        let _ = out.flush();
-    }
-    if let Ok(mut writer_guard) = stdout_log_writer().lock() {
-        if let Some(writer) = writer_guard.as_mut() {
-            let _ = writer.write_all(text.as_bytes());
-            if newline {
-                let _ = writer.write_all(b"\n");
-            }
-            let _ = writer.flush();
-        }
-    }
+    runtime_log::status(args, newline);
 }
 
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        crate::emit_stdout_fmt(format_args!($($arg)*), false);
-    }};
-}
-
-macro_rules! println {
-    () => {{
-        crate::emit_stdout_fmt(format_args!(""), true);
-    }};
-    ($($arg:tt)*) => {{
-        crate::emit_stdout_fmt(format_args!($($arg)*), true);
-    }};
-}
-
-fn init_stdout_log_for_yi_corr(run_mode: RunMode, enabled: bool) -> Result<(), DynError> {
-    if !enabled || !matches!(run_mode, RunMode::Corr) {
+fn init_logs_for_yi_corr(run_mode: RunMode, args: &args::Args) -> Result<(), DynError> {
+    if !matches!(run_mode, RunMode::Corr) {
         return Ok(());
     }
-    let now_sec = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system time error: {e}"))?
-        .as_secs() as i64;
-    let tag = unix_seconds_to_yyyydddhhmmss(now_sec)?;
-    let log_dir = std::env::current_dir()?.join("stdout");
-    std::fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!("stdout_{}.log", tag));
-    let mut writer = BufWriter::new(File::create(&log_path)?);
-    writeln!(writer, "# yi-corr stdout log started at {}", tag)?;
-    writer.flush()?;
-    {
-        let mut slot = stdout_log_writer()
-            .lock()
-            .map_err(|_| "stdout log lock poisoned")?;
-        *slot = Some(writer);
+    let directory = args
+        .cor_directory
+        .as_ref()
+        .ok_or("--cor-directory is required")?;
+    let (info_path, stdout_path) = runtime_log::init(directory, args.stdout)?;
+    statusln!("[log] info={} (ZIP/Deflate)", info_path.display());
+    if let Some(path) = stdout_path {
+        statusln!("[log] stdout={}", path.display());
     }
-    println!("[info] stdout log dir: {}", log_dir.display());
-    println!("[info] stdout log: {}", log_path.display());
+    for path in [&args.schedule, &args.multiband_schedule]
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "# schedule XML: {}\n{}",
+            path.display(),
+            read_to_string(path)?
+        );
+    }
     Ok(())
 }
 
@@ -1021,6 +1007,7 @@ struct FrameDelayEntry {
     frac2: f64,
     fr_lo1: Complex<f32>,
     fr_lo2: Complex<f32>,
+    ionosphere_s_hz2: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1039,6 +1026,8 @@ struct DelayEvalConfig {
     fs: f64,
     time_offset_s: f64,
     geom_delay_table_1s: Option<Arc<[GeomDelaySample]>>,
+    atmosphere_table_1s: Option<Arc<[atmosphere::AtmosphereKnot]>>,
+    ionosphere_reference_hz: f64,
     geom_poly_order: u8,
     coarse_delay_s: f64,
     delay_user_samples: f64,
@@ -1090,6 +1079,20 @@ fn compute_frame_delay_entry(
 ) -> FrameDelayEntry {
     let t_mid_local = (frame_idx as f64 + 0.5) * cfg.frame_dt + cfg.model_time_offset_s;
     let t_mid = t_mid_local + cfg.time_offset_s;
+    let atmospheric = cfg
+        .atmosphere_table_1s
+        .as_deref()
+        .map(|table| atmosphere::interpolate_table(table, t_mid_local))
+        .unwrap_or_default();
+    let atmosphere_group_s = atmospheric.troposphere_delay_s
+        + if atmospheric.ionosphere_s_hz2 == 0.0 {
+            0.0
+        } else {
+            atmosphere::ionosphere_group_delay(
+                atmospheric.ionosphere_s_hz2,
+                cfg.ionosphere_reference_hz,
+            )
+        };
     let (tau1, tau2, tau1_for_fringe, tau2_for_fringe, full_rel_dbg, residual_dbg) =
         if let Some(gd_table) = cfg.geom_delay_table_1s.as_deref() {
             let sec_idx = t_mid_local.floor().max(0.0) as usize;
@@ -1117,6 +1120,7 @@ fn compute_frame_delay_entry(
                     0.0
                 };
             let net_d_rel_no_clock_t = gd_t
+                + atmosphere_group_s
                 + cfg.coarse_delay_s
                 + cfg.delay_user_samples / cfg.fs
                 + cfg.extra_delay_rate_sps * t_mid
@@ -1243,6 +1247,7 @@ fn compute_frame_delay_entry(
         // only the residual fractional delay left after integer sample tracking.
         fr_lo1: carrier_phase_from_delay(cfg.lo1_hz, tau1_for_fringe),
         fr_lo2: carrier_phase_from_delay(cfg.lo2_hz, tau2_for_fringe),
+        ionosphere_s_hz2: atmospheric.ionosphere_s_hz2,
     }
 }
 
@@ -1445,7 +1450,12 @@ fn parse_schedule_args(
     index: Option<usize>,
 ) -> Result<Arc<ifile::IFileData>, DynError> {
     if let Some(text) = args.schedule_xml.as_ref() {
-        Ok(Arc::new(xml::parse_xml_schedule_text(text, index)?))
+        let mut parsed = xml::parse_xml_schedule_text(text, index)?;
+        xml::resolve_atmosphere_file(
+            &mut parsed.atmosphere,
+            args.schedule.as_deref().ok_or("missing schedule")?,
+        )?;
+        Ok(Arc::new(parsed))
     } else if let Some(index) = index {
         Ok(Arc::new(ifile::parse_ifile_for_process(
             args.schedule.as_ref().ok_or("missing schedule")?,
@@ -2585,7 +2595,6 @@ fn run_cli() -> Result<(), DynError> {
         return Ok(());
     }
     let run_mode = detect_run_mode_from_argv0();
-    multiband::configure_from_xml(&mut args)?;
     match run_mode {
         RunMode::PhasedArray => {
             if args.schedule.is_none() {
@@ -2608,13 +2617,18 @@ fn run_cli() -> Result<(), DynError> {
         }
     }
     if args.model_sweep {
+        multiband::configure_from_xml(&mut args)?;
         model_sweep::ensure_not_recursive_model_sweep(true)?;
         if !matches!(run_mode, RunMode::Corr) {
             return Err("--model-sweep is supported only by yi-corr".into());
         }
         return model_sweep::run_unattended_model_sweep(&args);
     }
-    init_stdout_log_for_yi_corr(run_mode, args.stdout)?;
+    init_logs_for_yi_corr(run_mode, &args)?;
+    multiband::configure_from_xml(&mut args)?;
+    if runtime_log::is_active() {
+        println!("# resolved CLI arguments: {args:#?}");
+    }
     if let Some(seconds) = args.buffer_seconds {
         if !seconds.is_finite() || seconds <= 0.0 {
             return Err("--buffer-seconds must be finite and > 0".into());
@@ -2697,6 +2711,19 @@ fn run_cli() -> Result<(), DynError> {
             } else {
                 ""
             }
+        );
+    }
+    if runtime_log::is_active() {
+        statusln!(
+            "[cpu] total={} compute-threads={} affinity={}{}",
+            allocation.total,
+            cpu_threads,
+            if args.no_affinity {
+                "disabled"
+            } else {
+                "enabled"
+            },
+            if args.cpu_auto { " auto" } else { "" }
         );
     }
     let mut tp_builder = rayon::ThreadPoolBuilder::new().num_threads(cpu_threads);
@@ -2785,8 +2812,8 @@ fn run_cli() -> Result<(), DynError> {
             && args.length.is_none()
             && args.skip == 0.0;
         if run_all_processes {
-            println!(
-                "[info] Processing all scans sequentially: {} process entries",
+            statusln!(
+                "[scan] Processing all scans sequentially: {} process entries",
                 meta.processes.len()
             );
             for (idx, p) in meta.processes.iter().enumerate() {
@@ -2847,13 +2874,17 @@ fn run_cli() -> Result<(), DynError> {
 }
 
 fn main() -> Result<(), DynError> {
-    match run_cli() {
+    let result = match run_cli() {
         Err(error) if error.is::<InputFilesNotFound>() => {
             println!("[error] {error}; skipping process");
             Ok(())
         }
         result => result,
-    }
+    };
+    let error_text = result.as_ref().err().map(ToString::to_string);
+    let log_result = runtime_log::finish(error_text.as_deref());
+    result?;
+    log_result.map_err(Into::into)
 }
 
 fn same_validation_scan(a: &ifile::ProcessEntry, b: &ifile::ProcessEntry) -> bool {
@@ -3046,7 +3077,8 @@ fn validate_gain_comparison_scan(
         && same_optional_f64(uncal.tt_utc_s, calibrated.tt_utc_s)
         && same_optional_f64(uncal.xp_arcsec, calibrated.xp_arcsec)
         && same_optional_f64(uncal.yp_arcsec, calibrated.yp_arcsec)
-        && uncal.eop_file == calibrated.eop_file;
+        && uncal.eop_file == calibrated.eop_file
+        && uncal.atmosphere == calibrated.atmosphere;
     if !invariant {
         return Err("gain comparison XMLs differ outside the station clock calibration".into());
     }
@@ -5305,11 +5337,17 @@ fn run_phased_validation_workflow(
 }
 
 fn run_once(
-    args: args::Args,
+    mut args: args::Args,
     run_mode: RunMode,
     cpu_threads: usize,
     reader_core: Option<core_affinity::CoreId>,
 ) -> Result<(), DynError> {
+    let run_started = Instant::now();
+    let concise_console = matches!(run_mode, RunMode::Corr) && runtime_log::is_active();
+    if concise_console {
+        // Console routing is independent of detail collection: keep every scan complete.
+        args.compact_logs = false;
+    }
     let fringe_interval_s = args.fringe;
     if let Some(v) = fringe_interval_s {
         if !v.is_finite() || v <= 0.0 {
@@ -5674,7 +5712,6 @@ fn run_once(
         }
     };
     if args.vlbi {
-        println!("[info] VLBI atmosphere: nominal troposphere enabled (height-dependent dry path + 0.1 m zenith wet path); applied to sample delay and fringe phase");
         println!("[info] VLBI preset: PNM06A+GAST, first-order VLBI minus; overrides YI_SOURCE_VECTOR_MODE/YI_GEOM_DELAY_MODE; EOP unchanged; integer delay before FFT, fractional delay and fringe-stop after FFT");
     }
     if let (Some(ra_s), Some(dec_s)) = (ra_in, dec_in) {
@@ -6088,6 +6125,140 @@ fn run_once(
     let c_tag = unix_seconds_to_yyyydddhhmmss(c_unix)?;
     let (o_dir, o_path) = resolve_output_layout(&args, &c_tag, run_mode)?;
     let process_window_sec = args.length.or(xml_length_sec);
+    let total_samples1 = (f1_m.len() * 8) / bit1 as u64;
+    let total_samples2 = (f2_m.len() * 8) / bit2 as u64;
+    let atmosphere_eval_first_s = total_skip_sec + model_time_offset_s.min(0.0);
+    let atmosphere_eval_last_s = process_window_sec
+        .unwrap_or(total_samples1.min(total_samples2) as f64 / fs)
+        .min(total_samples1.min(total_samples2) as f64 / fs)
+        .max(total_skip_sec)
+        + model_time_offset_s.max(0.0);
+
+    let mut atmosphere_config = if_d
+        .as_ref()
+        .map(|d| d.atmosphere.clone())
+        .unwrap_or_default();
+    if let Some(path) = args.atmosphere_file.as_ref() {
+        atmosphere_config.file = Some(path.clone());
+        atmosphere_config.stations = [None, None];
+    } else if let Some(path) = atmosphere_config.file.as_mut() {
+        if path.is_relative() {
+            if let Some(parent) = args.schedule.as_ref().and_then(|p| p.parent()) {
+                *path = parent.join(&*path);
+            }
+        }
+    }
+    atmosphere_config.ionosphere = args.ionosphere.or(atmosphere_config.ionosphere);
+    atmosphere_config.troposphere = args.troposphere.or(atmosphere_config.troposphere);
+    atmosphere_config.shell_height_km = args
+        .ionosphere_shell_height_km
+        .or(atmosphere_config.shell_height_km);
+    atmosphere_config.min_elevation_deg = args
+        .atmosphere_min_elevation_deg
+        .or(atmosphere_config.min_elevation_deg);
+    let atmosphere = atmosphere::AtmosphereRuntime::new(
+        &atmosphere_config,
+        [
+            if_d.as_ref()
+                .and_then(|d| d.ant1_station_key.clone())
+                .unwrap_or_else(|| "ant1".into()),
+            if_d.as_ref()
+                .and_then(|d| d.ant2_station_key.clone())
+                .unwrap_or_else(|| "ant2".into()),
+        ],
+        [ant1_ecef, ant2_ecef],
+        args.vlbi,
+    )?;
+    if atmosphere.has_input() && gdi.is_none() {
+        return Err(
+            "atmosphere input requires a source position and observation epoch for the delay model"
+                .into(),
+        );
+    }
+    let ionosphere_start_bin = match out_grid {
+        OutputGrid::Ant1 => ba.a1s,
+        OutputGrid::Ant2 => ba.a2s,
+    };
+    let ionosphere_end_bin = ionosphere_start_bin + ba.a1e - ba.a1s;
+    let ionosphere_reference_hz = obs_mhz * 1e6
+        + (ionosphere_start_bin as f64 + (ba.a1e - ba.a1s - 1) as f64 * 0.5) * fs / fft_len as f64;
+    let ionosphere_phase_basis = if atmosphere.ionosphere == atmosphere::IonosphereMode::Input {
+        if !matches!(fringe_stop_freq_mode, FringeStopFreqMode::Low) {
+            return Err(
+                "ionosphere input requires YI_FRINGE_STOP_FREQ_MODE=low (the physical RF carrier)"
+                    .into(),
+            );
+        }
+        if rotation_hermitian_mode {
+            return Err("ionosphere input is not supported with experimental rotation2/Hermitian frequency grids".into());
+        }
+        let mut basis = vec![0.0; fft_len / 2 + 1];
+        for (bin, value) in basis
+            .iter_mut()
+            .enumerate()
+            .take(ionosphere_end_bin)
+            .skip(ionosphere_start_bin)
+        {
+            let frequency = obs_mhz * 1e6 + bin as f64 * fs / fft_len as f64;
+            if !frequency.is_finite()
+                || frequency <= 0.0
+                || !ionosphere_reference_hz.is_finite()
+                || ionosphere_reference_hz <= 0.0
+            {
+                return Err("ionosphere correction requires positive finite physical RF throughout the overlap".into());
+            }
+            *value = atmosphere::ionosphere_phase_basis(frequency, ionosphere_reference_hz);
+        }
+        Some(basis)
+    } else {
+        None
+    };
+    let ionosphere_bin_phase = |d: FrameDelayEntry, bin: usize| {
+        ionosphere_phase_basis
+            .as_ref()
+            .map_or(Complex::new(1.0, 0.0), |basis| {
+                atmosphere::ionosphere_phase(d.ionosphere_s_hz2, basis[bin])
+            })
+    };
+    let eval_atmosphere_at_elapsed =
+        |elapsed_s: f64| -> Result<atmosphere::AtmosphereSample, DynError> {
+            if !atmosphere.has_input() {
+                return Ok(atmosphere::AtmosphereSample::default());
+            }
+            let v = gdi.as_ref().ok_or("atmosphere requires source geometry")?;
+            let mjd_t = v.mjd + elapsed_s / 86400.0;
+            let (ra_t, dec_t) = match source_vector_mode {
+                geom::SourceVectorMode::MeanGast => geom::precess_j2000_to_mean_of_date(
+                    v.ra_raw,
+                    v.dec_raw,
+                    mjd_t + tt_utc_s / 86400.0,
+                ),
+                _ => (v.ra_raw, v.dec_raw),
+            };
+            let elevation = if atmosphere.needs_elevation() {
+                [ant1_ecef, ant2_ecef].map(|xyz| {
+                    geom::source_az_el_with_eop_mode(
+                        xyz,
+                        ra_t,
+                        dec_t,
+                        mjd_t,
+                        earth_orientation,
+                        source_vector_mode,
+                    )
+                    .1
+                })
+            } else {
+                [0.0; 2]
+            };
+            atmosphere.evaluate(mjd_t, elevation)
+        };
+    atmosphere.log_inputs(geom::parse_epoch_to_mjd(&ep_i)? + total_skip_sec / 86400.0);
+    if atmosphere.troposphere == atmosphere::TroposphereMode::Nominal {
+        println!("[info] VLBI atmosphere: nominal troposphere enabled (height-dependent dry path + 0.1 m zenith wet path); applied to sample delay and fringe phase");
+    }
+    if atmosphere.ionosphere == atmosphere::IonosphereMode::Input {
+        println!("[atmosphere:ionosphere] first-order cold plasma; reference_RF_hz={:.9}; group_delay=+D/f_ref^2, phase_delay=-D/f^2; D=40.3*(STEC2-STEC1)*1e16/c; XCF extra_phase_rad=+2*pi*D*(1/f+f/f_ref^2); no bin shifts", ionosphere_reference_hz);
+    }
 
     let eval_geom_at_elapsed = |elapsed_s: f64| -> Result<(f64, f64, f64), DynError> {
         if let Some(v) = gdi.as_ref() {
@@ -6113,8 +6284,8 @@ fn run_once(
                     geom_delay_mode,
                     source_vector_mode,
                 );
-            let atmosphere = |m| {
-                if args.vlbi {
+            let neutral_delay = |m| {
+                if atmosphere.troposphere == atmosphere::TroposphereMode::Nominal {
                     geom::nominal_troposphere_delay(
                         ant1_ecef,
                         ant2_ecef,
@@ -6128,10 +6299,42 @@ fn run_once(
                     0.0
                 }
             };
-            let at = atmosphere(mjd_t);
-            let am = atmosphere(mjd_t - 1.0 / 86400.0);
-            let ap = atmosphere(mjd_t + 1.0 / 86400.0);
-            Ok((gd_t + at, gr_t + (ap - am) / 2.0, ga_t + ap - 2.0 * at + am))
+            let input_group = |t| -> Result<f64, DynError> {
+                let a = eval_atmosphere_at_elapsed(t)?;
+                Ok(a.troposphere_delay_s
+                    + if a.ionosphere_s_hz2 == 0.0 {
+                        0.0
+                    } else {
+                        atmosphere::ionosphere_group_delay(
+                            a.ionosphere_s_hz2,
+                            ionosphere_reference_hz,
+                        )
+                    })
+            };
+            let at = neutral_delay(mjd_t);
+            let am = neutral_delay(mjd_t - 1.0 / 86400.0);
+            let ap = neutral_delay(mjd_t + 1.0 / 86400.0);
+            let input_at = input_group(elapsed_s)?;
+            // These derivatives describe the read-align/start diagnostics. The
+            // actual FX path evaluates the separate atmosphere knots per frame.
+            // Keep probes inside the requested observation, including short scans.
+            let h = ((atmosphere_eval_last_s - atmosphere_eval_first_s) * 0.5).min(1.0);
+            let (input_rate, input_accel) = if atmosphere.has_input() && h > 1e-9 {
+                let center =
+                    elapsed_s.clamp(atmosphere_eval_first_s + h, atmosphere_eval_last_s - h);
+                let gm = input_group(center - h)?;
+                let g0 = input_group(center)?;
+                let gp = input_group(center + h)?;
+                let accel = (gp - 2.0 * g0 + gm) / (h * h);
+                ((gp - gm) / (2.0 * h) + accel * (elapsed_s - center), accel)
+            } else {
+                (0.0, 0.0)
+            };
+            Ok((
+                gd_t + at + input_at,
+                gr_t + (ap - am) / 2.0 + input_rate,
+                ga_t + ap - 2.0 * at + am + input_accel,
+            ))
         } else {
             Ok((
                 gd0 + gr0 * elapsed_s + 0.5 * ga0 * elapsed_s * elapsed_s,
@@ -6144,9 +6347,6 @@ fn run_once(
         eval_geom_at_elapsed(total_skip_sec)?;
     let net_d_rel_no_clock0 = geom_delay_at_start_s + coarse_delay_s + delay_user_samples / fs;
     let net_d0 = net_d_rel_no_clock0 + clock_delay_s;
-
-    let total_samples1 = (f1_m.len() * 8) / bit1 as u64;
-    let total_samples2 = (f2_m.len() * 8) / bit2 as u64;
 
     // Choose a fixed read-align delay for the whole processed window.
     //
@@ -6280,6 +6480,17 @@ fn run_once(
     };
     // Keep only complete FFT frames.
     let total_f = complete_fft_frame_count(total_sec, fs, fft_len);
+    if atmosphere.has_input() {
+        let base_mjd = geom::parse_epoch_to_mjd(&ep_i)?;
+        atmosphere.validate_span(
+            base_mjd + (total_skip_sec + model_time_offset_s.min(0.0)) / 86400.0,
+            base_mjd
+                + (total_skip_sec
+                    + total_f as f64 * fft_len as f64 / fs
+                    + model_time_offset_s.max(0.0))
+                    / 86400.0,
+        )?;
+    }
     if total_sec > available_sec {
         let output_samples = (total_f as u64).saturating_mul(fft_len as u64);
         let eof_pad1 = start_s1
@@ -6983,20 +7194,21 @@ fn run_once(
                 geom_delay_mode,
                 source_vector_mode,
             );
-            let atmosphere = if args.vlbi {
-                geom::nominal_troposphere_delay(
-                    ant1_ecef,
-                    ant2_ecef,
-                    ra_t,
-                    dec_t,
-                    mjd_t,
-                    earth_orientation,
-                    source_vector_mode,
-                )
-            } else {
-                0.0
-            };
-            delay_grid.push(gd_t + atmosphere);
+            let nominal_atmosphere =
+                if atmosphere.troposphere == atmosphere::TroposphereMode::Nominal {
+                    geom::nominal_troposphere_delay(
+                        ant1_ecef,
+                        ant2_ecef,
+                        ra_t,
+                        dec_t,
+                        mjd_t,
+                        earth_orientation,
+                        source_vector_mode,
+                    )
+                } else {
+                    0.0
+                };
+            delay_grid.push(gd_t + nominal_atmosphere);
         }
 
         let sample = |i: usize, offset: isize| -> f64 {
@@ -7021,6 +7233,36 @@ fn run_once(
 
         Arc::from(table.into_boxed_slice())
     });
+    let atmosphere_table_1s = if atmosphere.has_input() {
+        let duration = total_f as f64 * frame_dt;
+        let first_s = model_time_offset_s.min(0.0);
+        let last_s = duration + model_time_offset_s.max(0.0);
+        let mut times = vec![first_s, last_s];
+        times.extend((first_s.ceil() as i64..last_s.ceil() as i64).map(|i| i as f64));
+        let epoch_mjd = geom::parse_epoch_to_mjd(&ep_i)?;
+        times.extend(
+            atmosphere
+                .input_epochs()
+                .into_iter()
+                .map(|mjd| (mjd - epoch_mjd) * 86400.0 - total_skip_sec)
+                .filter(|t| *t > first_s && *t < last_s),
+        );
+        times.sort_by(f64::total_cmp);
+        times.dedup();
+        let mut table = Vec::with_capacity(times.len());
+        for local_s in times {
+            let t = total_skip_sec + local_s;
+            let value = eval_atmosphere_at_elapsed(t)?;
+            println!("[atmosphere:table] elapsed_s={:+.9} troposphere_delay_s={:+.17e} ionosphere_D_s_hz2={:+.17e} ionosphere_group_s={:+.17e}", t, value.troposphere_delay_s, value.ionosphere_s_hz2, atmosphere::ionosphere_group_delay(value.ionosphere_s_hz2, ionosphere_reference_hz));
+            table.push(atmosphere::AtmosphereKnot {
+                elapsed_s: local_s,
+                sample: value,
+            });
+        }
+        Some(Arc::from(table.into_boxed_slice()))
+    } else {
+        None
+    };
     let extra_delay_rate_sps = (rotation_fringe_hz + rate_user_hz) / (obs_mhz * 1e6);
     let extra_delay_accel_sps2 = accel_user_sps2;
     let geom_poly_order = match std::env::var("YI_GEOM_POLY_ORDER") {
@@ -7067,6 +7309,8 @@ fn run_once(
         fs,
         time_offset_s: total_skip_sec,
         geom_delay_table_1s,
+        atmosphere_table_1s,
+        ionosphere_reference_hz,
         geom_poly_order,
         coarse_delay_s,
         delay_user_samples,
@@ -7263,11 +7507,13 @@ fn run_once(
                 "[geom-diag:phase-convention] correction_cycles=-frequency_hz*delay_s rate_hz=-f*tau1 accel_hz_s=-f*tau2 jerk_hz_s2=-f*tau3 polynomial_deg=c0+c1*dt+c2*dt2+c3*dt3+c4*dt4"
             );
             println!(
-                "[geom-diag:not-modeled] {}ionosphere solid-earth-tide ocean-loading pole-tide station-velocity axis-offset gravitational-delay",
-                if args.vlbi { "" } else { "troposphere " }
+                "[geom-diag:not-modeled] {}{}solid-earth-tide ocean-loading pole-tide station-velocity axis-offset gravitational-delay",
+                if atmosphere.troposphere == atmosphere::TroposphereMode::Off { "troposphere " } else { "" },
+                if atmosphere.ionosphere == atmosphere::IonosphereMode::Off { "ionosphere " } else { "" }
             );
-            if args.vlbi {
-                println!("[geom-diag:atmosphere] nominal troposphere included in correlation delay table; geometric variant comparisons exclude atmosphere");
+            if atmosphere.troposphere != atmosphere::TroposphereMode::Off || atmosphere.has_input()
+            {
+                println!("[geom-diag:atmosphere] {}; applied delays include atmosphere group delay at reference RF; geometric variant comparisons exclude atmosphere; ionospheric spectral phase is logged separately", atmosphere.label());
             }
             println!(
                 "[geom-diag:warning] pnm-era-engineering is a sign-control path, not standard CIO-plus-ERA"
@@ -7356,7 +7602,7 @@ fn run_once(
                     0.0
                 };
                 println!(
-                    "[geom-diag:azel] point={} ant1={} az_deg={:.9} el_deg={:.9} csc_el={:+.17e} csc_valid={} ant2={} az_deg={:.9} el_deg={:.9} csc_el={:+.17e} csc_valid={} csc_delta_2minus1={:+.17e} csc_delta_valid={} u_lambda={:+.17e} v_lambda={:+.17e} w_lambda={:+.17e} troposphere_mode=not-modeled",
+                    "[geom-diag:azel] point={} ant1={} az_deg={:.9} el_deg={:.9} csc_el={:+.17e} csc_valid={} ant2={} az_deg={:.9} el_deg={:.9} csc_el={:+.17e} csc_valid={} csc_delta_2minus1={:+.17e} csc_delta_valid={} u_lambda={:+.17e} v_lambda={:+.17e} w_lambda={:+.17e} troposphere_mode={}",
                     checkpoint.label,
                     a1_name,
                     checkpoint.ant1_az_deg,
@@ -7372,7 +7618,8 @@ fn run_once(
                     csc_delta_valid,
                     checkpoint.u_lambda,
                     checkpoint.v_lambda,
-                    checkpoint.w_lambda
+                    checkpoint.w_lambda,
+                    atmosphere.troposphere.label()
                 );
                 for variant in &checkpoint.variants {
                     let geom_phase = variant.geom.phase_derivatives(obs_mhz * 1.0e6);
@@ -7776,7 +8023,13 @@ fn run_once(
                         for k in 0..(ba.a1e - ba.a1s) {
                             let i1 = ba.a1s + k;
                             let i2 = ba.a2s + k;
-                            let v = (g1[i1] * g2[i2].conj()) * fr_mix * phase_to_f32(phase_corr);
+                            let output_bin = match out_grid {
+                                OutputGrid::Ant1 => i1,
+                                OutputGrid::Ant2 => i2,
+                            };
+                            let v = (g1[i1] * g2[i2].conj())
+                                * fr_mix
+                                * phase_to_f32(phase_corr * ionosphere_bin_phase(d, output_bin));
                             match out_grid {
                                 OutputGrid::Ant1 => {
                                     st.acc[i1] += Complex::new(v.re as f64, v.im as f64)
@@ -8109,6 +8362,56 @@ fn run_once(
             None
         };
         let pulsar_bin_count = pulsar_runtime.as_ref().map(|rt| rt.bins()).unwrap_or(1);
+        if concise_console {
+            statusln!(
+                "[scan] source={} baseline={}-{} epoch={}",
+                source_name,
+                a1_name,
+                a2_name,
+                ep_i
+            );
+            statusln!(
+                "       skip={:.6}s length={:.6}s FFT={} sampling={:.6}MS/s bits={}/{} sideband={}/{}",
+                total_skip_sec, processed_sec, fft_len, fs / 1e6, bit1, bit2, sb1_s, sb2_s
+            );
+            statusln!(
+                "       RF={:.6}MHz BW={:.6}MHz df={:.6}Hz rotation={:+.6}/{:+.6}MHz",
+                obs_mhz,
+                bw,
+                df_hz,
+                rot1 / 1e6,
+                rot2 / 1e6
+            );
+            statusln!(
+                "       integration={:.9}s (requested {:.6}Hz; {}) sectors={} inband={} pulse-bins={}",
+                actual_output_sec,
+                output_hz,
+                if args.integration_rate_override.is_some() { "solution override" } else { "XML" },
+                sec_counts.len(), inband, pulsar_bin_count
+            );
+            statusln!(
+                "       delay={:+.6}sample rate={:+.6}Hz accel={:+.6}Hz/s coarse={:+.6e}s",
+                delay_user_samples,
+                rate_user_hz,
+                accel_user_hzps,
+                coarse_delay_s
+            );
+            statusln!(
+                "       model={}/{} atmosphere={}",
+                source_vector_mode.label(),
+                geom_delay_mode.label(),
+                atmosphere.label()
+            );
+            if atmosphere.has_input() {
+                statusln!("       atmosphere-input={} reference-RF={:.6}MHz shell={:.1}km min-el={:.1}deg", atmosphere.input_label, ionosphere_reference_hz / 1e6, atmosphere.shell_height_km, atmosphere.min_elevation_deg);
+            }
+            statusln!(
+                "       output={} tag={} label={}",
+                o_dir.display(),
+                c_tag,
+                cor_label
+            );
+        }
         let pbin_tag = |pbin: usize| {
             format!(
                 "pbin{:0width$}",
@@ -8852,12 +9155,18 @@ fn run_once(
                         // Map, correct and combine each bin once, without intermediate spectra.
                         for k in 0..overlap_len {
                             let bin = output_start + k;
+                            let extra_phase = ionosphere_bin_phase(d, bin);
+                            let (iono1, iono2) = if residual_on_ant2 {
+                                (Complex::new(1.0, 0.0), extra_phase.conj())
+                            } else {
+                                (extra_phase, Complex::new(1.0, 0.0))
+                            };
                             let z1 = mapped_real_fft_bin(&st.s1, grid_map1, ba.a1s + k)
                                 * d.fr_lo1
-                                * phase_to_f32(phase1);
+                                * phase_to_f32(phase1 * iono1);
                             let z2 = mapped_real_fft_bin(&st.s2, grid_map2, ba.a2s + k)
                                 * d.fr_lo2
-                                * phase_to_f32(phase2);
+                                * phase_to_f32(phase2 * iono2);
                             let beam = z1 * w1 as f32 + z2 * w2 as f32;
                             st.cb[bin] = beam;
                             if need_phased_products {
@@ -9110,7 +9419,11 @@ fn run_once(
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
                                             let raw_xcf = st.g1[i1] * st.g2[i2].conj();
-                                            let v = raw_xcf * fr_mix * phase_to_f32(phase_corr);
+                                            let v = raw_xcf
+                                                * fr_mix
+                                                * phase_to_f32(
+                                                    phase_corr * ionosphere_bin_phase(d, i1),
+                                                );
                                             fold.add_values(
                                                 rt,
                                                 t_since_process_s,
@@ -9129,7 +9442,11 @@ fn run_once(
                                             let i1 = ba.a1s + k;
                                             let i2 = ba.a2s + k;
                                             let raw_xcf = st.g1[i1] * st.g2[i2].conj();
-                                            let v = raw_xcf * fr_mix * phase_to_f32(phase_corr);
+                                            let v = raw_xcf
+                                                * fr_mix
+                                                * phase_to_f32(
+                                                    phase_corr * ionosphere_bin_phase(d, i2),
+                                                );
                                             fold.add_values(
                                                 rt,
                                                 t_since_process_s,
@@ -9157,38 +9474,39 @@ fn run_once(
                                 NormalCorrKernel::Ant1Grid => ba.a1s,
                                 NormalCorrKernel::Ant2Grid => ba.a2s,
                             };
-                            let direct_accumulated = if need_xcf_products && !args.debug {
-                                if let (Some(src1), Some(src2)) = (direct_src1, direct_src2) {
-                                    let (phase0, phase_step) = xcf_frame_phase(d);
-                                    let range = output_start..output_start + overlap_len;
-                                    if need_acf_products {
-                                        accumulate_direct_acf_xcf(
-                                            &st.s1[src1..src1 + overlap_len],
-                                            &st.s2[src2..src2 + overlap_len],
-                                            &mut st.acc_11[range.clone()],
-                                            &mut st.acc_12[range.clone()],
-                                            &mut st.acc_22[range],
-                                            fr_mix,
-                                            phase0,
-                                            phase_step,
-                                        );
+                            let direct_accumulated =
+                                if need_xcf_products && !args.debug && d.ionosphere_s_hz2 == 0.0 {
+                                    if let (Some(src1), Some(src2)) = (direct_src1, direct_src2) {
+                                        let (phase0, phase_step) = xcf_frame_phase(d);
+                                        let range = output_start..output_start + overlap_len;
+                                        if need_acf_products {
+                                            accumulate_direct_acf_xcf(
+                                                &st.s1[src1..src1 + overlap_len],
+                                                &st.s2[src2..src2 + overlap_len],
+                                                &mut st.acc_11[range.clone()],
+                                                &mut st.acc_12[range.clone()],
+                                                &mut st.acc_22[range],
+                                                fr_mix,
+                                                phase0,
+                                                phase_step,
+                                            );
+                                        } else {
+                                            accumulate_direct_xcf(
+                                                &st.s1[src1..src1 + overlap_len],
+                                                &st.s2[src2..src2 + overlap_len],
+                                                &mut st.acc_12[range],
+                                                fr_mix,
+                                                phase0,
+                                                phase_step,
+                                            );
+                                        }
+                                        true
                                     } else {
-                                        accumulate_direct_xcf(
-                                            &st.s1[src1..src1 + overlap_len],
-                                            &st.s2[src2..src2 + overlap_len],
-                                            &mut st.acc_12[range],
-                                            fr_mix,
-                                            phase0,
-                                            phase_step,
-                                        );
+                                        false
                                     }
-                                    true
                                 } else {
                                     false
-                                }
-                            } else {
-                                false
-                            };
+                                };
                             if !direct_accumulated {
                                 let mut phase_corr = None;
                                 if need_xcf_products {
@@ -9207,7 +9525,9 @@ fn run_once(
                                     }
                                     if let Some((ref mut pc, step)) = phase_corr {
                                         let raw_xcf = z1 * z2.conj();
-                                        let v = raw_xcf * fr_mix * phase_to_f32(*pc);
+                                        let applied_phase =
+                                            *pc * ionosphere_bin_phase(d, output_bin);
+                                        let v = raw_xcf * fr_mix * phase_to_f32(applied_phase);
                                         maybe_dump_xcf_debug(
                                             args.debug,
                                             emitted + i,
@@ -9217,7 +9537,7 @@ fn run_once(
                                             output_bin,
                                             raw_xcf,
                                             fr_mix,
-                                            phase_to_f32(*pc),
+                                            phase_to_f32(applied_phase),
                                             v,
                                             d,
                                             fs,
@@ -9366,6 +9686,21 @@ fn run_once(
                     si + 1,
                     sec_counts.len(),
                     (emitted as f64 / total_f as f64) * 100.0
+                );
+            } else if concise_console {
+                runtime_log::progress(
+                    format_args!(
+                        "[progress] {} {}-{} {:.3}/{:.3}s ({:.1}%) sectors={}/{}",
+                        source_name,
+                        a1_name,
+                        a2_name,
+                        emitted as f64 * frame_sec,
+                        data_duration_s,
+                        (emitted as f64 / total_f as f64) * 100.0,
+                        si + 1,
+                        sec_counts.len()
+                    ),
+                    si + 1 == sec_counts.len(),
                 );
             } else {
                 print!(
@@ -9699,6 +10034,24 @@ fn run_once(
             writeln!(meta, "weight_ant1={:.17e}", w1)?;
             writeln!(meta, "weight_ant2={:.17e}", w2)?;
             writeln!(meta, "voltage_scale={:.17e}", beam_voltage_scale)?;
+            writeln!(
+                meta,
+                "atmosphere_ionosphere={}",
+                atmosphere.ionosphere.label()
+            )?;
+            writeln!(
+                meta,
+                "atmosphere_troposphere={}",
+                atmosphere.troposphere.label()
+            )?;
+            if atmosphere.has_input() {
+                writeln!(meta, "atmosphere_input={}", atmosphere.input_label)?;
+                writeln!(
+                    meta,
+                    "ionosphere_reference_hz={:.17e}",
+                    ionosphere_reference_hz
+                )?;
+            }
             if let Some(path) = args.gain_uncalibrated_schedule.as_ref() {
                 writeln!(meta, "gain_uncalibrated_schedule={}", path.display())?;
                 let comparison_dir = args
@@ -9833,6 +10186,16 @@ fn run_once(
                 None,
             )?;
         }
+    }
+    if concise_console {
+        statusln!(
+            "[done] source={} baseline={}-{} length={:.6}s elapsed={:.3}s",
+            source_name,
+            a1_name,
+            a2_name,
+            processed_sec,
+            run_started.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }

@@ -1,0 +1,22 @@
+{
+  "id": "landskron-boehm-2018-vmf3-gpt3",
+  "title": "VMF3/GPT3: refined discrete and empirical troposphere mapping functions",
+  "authors": "D. Landskron and J. Böhm",
+  "year": 2018,
+  "journal": "Journal of Geodesy 92, 349–360",
+  "publisher": "Springer Nature",
+  "doi": "10.1007/s00190-017-1066-2",
+  "role": "Modern neutral-atmosphere reference, revised hydrostatic zenith formula and future VMF/GPT provider extension (VMF3/GPT3 not implemented)",
+  "urls": [
+    "https://link.springer.com/content/pdf/10.1007/s00190-017-1066-2.pdf"
+  ],
+  "file": "landskron-boehm-2018-vmf3-gpt3.pdf",
+  "bytes": 4560925,
+  "sha256": "ac739c9c05460ac6dc837e5efd0f50703afba90d36710ddf18f4b8419b398950",
+  "download_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1066-2.pdf",
+  "resolved_url": "https://link.springer.com/content/pdf/10.1007/s00190-017-1066-2.pdf?error=cookies_not_supported&code=74b87f7e-6b90-4b6e-bb32-e60f04250d02",
+  "downloaded_utc": "2026-11-10T05:34:34.665162+00:00",
+  "failures": [],
+  "status": "downloaded",
+  "edition": "published article PDF (publisher or institutional archive)"
+}

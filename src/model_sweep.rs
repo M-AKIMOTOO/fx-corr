@@ -292,10 +292,23 @@ fn hash_cli_input_state(hash: &mut u64, args: &Args) -> Result<(), DynError> {
     if let Some(path) = args.schedule.as_deref() {
         hash_input_path(hash, path, true)?;
     }
+    if let Some(path) = args.atmosphere_file.as_deref() {
+        hash_input_path(hash, path, true)?;
+    }
     if let Some(schedule) = args.schedule.as_ref() {
         if let Ok(parsed) = crate::parse_ifile_cached(schedule) {
             if let Some(eop_file) = parsed.eop_file.as_deref() {
                 hash_input_path(hash, eop_file, true)?;
+            }
+            if args.atmosphere_file.is_none() {
+                if let Some(path) = parsed.atmosphere.file.as_deref() {
+                    let resolved = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        schedule.parent().unwrap_or(Path::new(".")).join(path)
+                    };
+                    hash_input_path(hash, &resolved, true)?;
+                }
             }
         }
     }

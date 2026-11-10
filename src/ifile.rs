@@ -83,6 +83,7 @@ pub struct IFileData {
     pub xp_arcsec: Option<f64>,
     pub yp_arcsec: Option<f64>,
     pub eop_file: Option<PathBuf>,
+    pub atmosphere: crate::atmosphere::AtmosphereConfig,
 }
 
 fn parse_optional_f64(
@@ -485,6 +486,7 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
             .get("eopfile")
             .or_else(|| params.get("eop_file"))
             .map(PathBuf::from),
+        atmosphere: crate::atmosphere::AtmosphereConfig::default(),
     })
 }
 

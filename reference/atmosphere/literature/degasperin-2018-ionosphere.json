@@ -1,0 +1,33 @@
+{
+  "id": "degasperin-2018-ionosphere",
+  "title": "The effect of the ionosphere on ultra-low-frequency radio-interferometric observations",
+  "authors": "F. de Gasperin et al.",
+  "year": 2018,
+  "journal": "Astronomy & Astrophysics 615, A179",
+  "publisher": "EDP Sciences",
+  "doi": "10.1051/0004-6361/201833012",
+  "role": "First-order dispersive phase; limitations of neglecting higher orders and Faraday rotation",
+  "urls": [
+    "https://www.aanda.org/articles/aa/pdf/2018/07/aa33012-18.pdf",
+    "https://www.aanda.org/10.1051/0004-6361/201833012/pdf",
+    "https://arxiv.org/pdf/1804.07947"
+  ],
+  "file": "degasperin-2018-ionosphere.pdf",
+  "edition": "author manuscript of a journal-published paper",
+  "bytes": 7907287,
+  "sha256": "0449469da375bc43d00855c5f743e7b96ae830318ade270c3777a158ebed0e84",
+  "download_url": "https://arxiv.org/pdf/1804.07947",
+  "resolved_url": "https://arxiv.org/pdf/1804.07947",
+  "downloaded_utc": "2026-11-10T05:37:36.257168+00:00",
+  "failures": [
+    {
+      "url": "https://www.aanda.org/articles/aa/pdf/2018/07/aa33012-18.pdf",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://www.aanda.org/10.1051/0004-6361/201833012/pdf",
+      "error": "HTTP Error 403: Forbidden"
+    }
+  ],
+  "status": "downloaded"
+}

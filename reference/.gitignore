@@ -1,0 +1,6 @@
+# Observation data and frozen executables live here locally, outside Git.
+**/inputs/raw/
+**/software/bin/
+**/software/*.tar.gz
+**/software/*.patch
+**/literature/*.html

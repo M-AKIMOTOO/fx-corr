@@ -1,0 +1,4 @@
+# Demonstration values only. Replace station keys and values with observations.
+station,mjd_utc,stec_tecu,zhd_m,zwd_m
+A,,10.0,2.30,0.10
+B,,10.2,2.28,0.12
