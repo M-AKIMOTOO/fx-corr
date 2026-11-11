@@ -452,11 +452,19 @@ pub fn parse_xml_schedule_text(
         .as_deref()
         .and_then(|name| terminal_by_name.get(name).copied());
 
-    let sampling_hz = term1
+    let speed1 = term1
         .and_then(|t| child_text(t, "speed"))
-        .or_else(|| term2.and_then(|t| child_text(t, "speed")))
         .map(|v| v.parse::<f64>())
         .transpose()?;
+    let speed2 = term2
+        .and_then(|t| child_text(t, "speed"))
+        .map(|v| v.parse::<f64>())
+        .transpose()?;
+    let ant1_sampling_hz = speed1.or(speed2);
+    let ant2_sampling_hz = speed2.or(speed1);
+    let sampling_hz = ant1_sampling_hz
+        .zip(ant2_sampling_hz)
+        .map(|(a, b)| a.min(b));
     let ant1_bit = term1
         .and_then(|t| child_text(t, "bit"))
         .map(|v| v.parse::<usize>())
@@ -647,15 +655,14 @@ pub fn parse_xml_schedule_text(
     let process_skip_sec = Some(selected_process.skip_sec);
     let process_length_sec = selected_process.length_sec;
 
-    let bw_mhz = sampling_hz.map(|fs| fs / 2e6);
-    let ant1_bw_mhz = bw_mhz;
-    let ant2_bw_mhz = bw_mhz;
-    let ant1_center_mhz = if let (Some(obs), Some(bw)) = (obsfreq_mhz, bw_mhz) {
+    let ant1_bw_mhz = ant1_sampling_hz.map(|fs| fs / 2e6);
+    let ant2_bw_mhz = ant2_sampling_hz.map(|fs| fs / 2e6);
+    let ant1_center_mhz = if let (Some(obs), Some(bw)) = (obsfreq_mhz, ant1_bw_mhz) {
         Some(obs + ant1_rotation_hz.unwrap_or(0.0) / 1e6 + 0.5 * bw)
     } else {
         None
     };
-    let ant2_center_mhz = if let (Some(obs), Some(bw)) = (obsfreq_mhz, bw_mhz) {
+    let ant2_center_mhz = if let (Some(obs), Some(bw)) = (obsfreq_mhz, ant2_bw_mhz) {
         Some(obs + ant2_rotation_hz.unwrap_or(0.0) / 1e6 + 0.5 * bw)
     } else {
         None
@@ -672,6 +679,8 @@ pub fn parse_xml_schedule_text(
         inband,
         pulsar,
         sampling_hz,
+        ant1_sampling_hz,
+        ant2_sampling_hz,
         ant1_bit,
         ant2_bit,
         ant1_level,

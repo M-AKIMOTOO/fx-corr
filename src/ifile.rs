@@ -33,6 +33,8 @@ pub struct IFileData {
     pub inband: Option<usize>,
     pub pulsar: Option<PulsarConfig>,
     pub sampling_hz: Option<f64>,
+    pub ant1_sampling_hz: Option<f64>,
+    pub ant2_sampling_hz: Option<f64>,
     pub ant1_bit: Option<usize>,
     pub ant2_bit: Option<usize>,
     pub ant1_level: Option<String>,
@@ -387,6 +389,8 @@ fn parse_ifile_kv(path: &PathBuf) -> Result<IFileData, DynError> {
             .or_else(|| params.get("fs"))
             .map(|v| v.parse())
             .transpose()?,
+        ant1_sampling_hz: None,
+        ant2_sampling_hz: None,
         ant1_bit: params.get("bit").map(|v| v.parse()).transpose()?,
         ant2_bit: params.get("bit").map(|v| v.parse()).transpose()?,
         ant1_level: params.get("level").cloned(),

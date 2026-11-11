@@ -30,6 +30,7 @@ mod acf;
 mod affinity;
 mod args;
 mod atmosphere;
+mod bandpass;
 mod cor;
 mod corr_kernel;
 mod cpu_balance;
@@ -1024,6 +1025,7 @@ struct DelayEvalConfig {
     frame_dt: f64,
     model_time_offset_s: f64,
     fs: f64,
+    native_fs: [f64; 2],
     time_offset_s: f64,
     geom_delay_table_1s: Option<Arc<[GeomDelaySample]>>,
     atmosphere_table_1s: Option<Arc<[atmosphere::AtmosphereKnot]>>,
@@ -1068,7 +1070,16 @@ struct DelayEvalConfig {
 impl DelayEvalConfig {
     #[inline]
     fn residual_s_for_start_seek(&self, _frame_idx: usize, full_rel_s: f64, d_seek_s: f64) -> f64 {
-        (full_rel_s - d_seek_s) * self.fs
+        let index = usize::from(self.residual_on_ant2);
+        (full_rel_s - d_seek_s) * self.input_fs(index)
+    }
+
+    fn input_fs(&self, index: usize) -> f64 {
+        if self.native_fs[index] > 0.0 {
+            self.native_fs[index]
+        } else {
+            self.fs
+        }
     }
 }
 
@@ -1197,7 +1208,7 @@ fn compute_frame_delay_entry(
     //
     // Correct invariant for every FFT frame:
     //
-    //     tau*_s == int*/fs + frac*
+    //     tau*_s == int*/native_fs* + frac*
     //     frac* in roughly [-0.5, +0.5] sample
     //
     // The previous geometric-delay-table path deliberately forced int=(0,0)
@@ -1210,25 +1221,25 @@ fn compute_frame_delay_entry(
         if cfg.residual_on_ant2 {
             let residual_samples = cfg.residual_s_for_start_seek(frame_idx, full_rel_dbg, d_seek_s);
             let seek_delta_samples = residual_samples.round() as i64;
-            let frac2_s = -(residual_samples - seek_delta_samples as f64) / cfg.fs;
+            let frac2_s = -(residual_samples - seek_delta_samples as f64) / cfg.input_fs(1);
             (0, 0.0, seek_delta_samples, frac2_s)
         } else {
             let residual_samples = cfg.residual_s_for_start_seek(frame_idx, full_rel_dbg, d_seek_s);
             let seek_delta_samples = residual_samples.round() as i64;
-            let frac1_s = (residual_samples - seek_delta_samples as f64) / cfg.fs;
+            let frac1_s = (residual_samples - seek_delta_samples as f64) / cfg.input_fs(0);
             (seek_delta_samples, frac1_s, 0, 0.0)
         }
     } else if cfg.fx_integer_delay {
-        let (i1, f1) = split_delay_to_integer_and_fractional(tau1, cfg.fs);
-        let (i2, f2) = split_delay_to_integer_and_fractional(tau2, cfg.fs);
+        let (i1, f1) = split_delay_to_integer_and_fractional(tau1, cfg.input_fs(0));
+        let (i2, f2) = split_delay_to_integer_and_fractional(tau2, cfg.input_fs(1));
         (i1, f1, i2, f2)
     } else if cfg.geom_delay_table_1s.is_some() {
         // Legacy fixed-process mode, enabled only by YI_FX_INT_DELAY=0.
         // This keeps the full residual delay in the post-FFT phase slope.
         (0, tau1, 0, tau2)
     } else {
-        let (i1, f1) = split_delay_to_integer_and_fractional(tau1, cfg.fs);
-        let (i2, f2) = split_delay_to_integer_and_fractional(tau2, cfg.fs);
+        let (i1, f1) = split_delay_to_integer_and_fractional(tau1, cfg.input_fs(0));
+        let (i2, f2) = split_delay_to_integer_and_fractional(tau2, cfg.input_fs(1));
         (i1, f1, i2, f2)
     };
 
@@ -3052,6 +3063,8 @@ fn validate_gain_comparison_scan(
         && uncal.inband.unwrap_or(1) == 1
         && calibrated.inband.unwrap_or(1) == 1
         && same_optional_f64(uncal.sampling_hz, calibrated.sampling_hz)
+        && same_optional_f64(uncal.ant1_sampling_hz, calibrated.ant1_sampling_hz)
+        && same_optional_f64(uncal.ant2_sampling_hz, calibrated.ant2_sampling_hz)
         && same_optional_f64(uncal.obsfreq_mhz, calibrated.obsfreq_mhz)
         && uncal.ant1_bit == calibrated.ant1_bit
         && uncal.ant2_bit == calibrated.ant2_bit
@@ -5498,10 +5511,27 @@ fn run_once(
     let (gain1, gain2) = resolve_per_antenna_config(&args.gain, 1.0, |s| Ok(s.parse()?))?;
     let (sefd1, sefd2) = resolve_per_antenna_config(&args.sefd, 0.0, |s| Ok(s.parse()?))?;
 
-    let fs = if_d
+    let common_fs = if_d
         .as_ref()
         .and_then(|d| d.sampling_hz)
         .unwrap_or(args.sampling * 1e6);
+    let fs1 = if_d
+        .as_ref()
+        .and_then(|d| d.ant1_sampling_hz)
+        .unwrap_or(common_fs);
+    let fs2 = if_d
+        .as_ref()
+        .and_then(|d| d.ant2_sampling_hz)
+        .unwrap_or(common_fs);
+    let band_plan = bandpass::BandPlan::new(fft_len, [fs1, fs2], [fs1 / 2.0, fs2 / 2.0])?;
+    let fs = band_plan.output_sampling_hz;
+    let [fft_len1, fft_len2] = band_plan.fft;
+    if band_plan.unequal() && matches!(run_mode, RunMode::PhasedArray) {
+        return Err("unequal station sampling is currently supported by yi-corr only; phased raw synthesis requires equal station sampling".into());
+    }
+    if band_plan.unequal() && ant2_grid_extra_offset() != 0 {
+        return Err("unequal sampling uses physical RF bins; YI_ANT2_GRID_OFFSET must be 0".into());
+    }
     let obs_mhz = if_d
         .as_ref()
         .and_then(|d| d.obsfreq_mhz)
@@ -5972,23 +6002,70 @@ fn run_once(
         }
     }
     let bw = fs / 2e6;
+    let bw1 = fs1 / 2e6;
+    let bw2 = fs2 / 2e6;
     let a1_data_low = obs_mhz + rot1 / 1e6;
     let a2_data_low = obs_mhz + rot2 / 1e6;
-    let raw_ba = compute_band_alignment(
-        fft_len,
-        fs,
-        a1_data_low + 0.5 * bw,
-        a2_data_low + 0.5 * bw,
-        bw,
-        bw,
-    )?;
-    let rotation_bins1 = (rot1 / (fs / fft_len as f64)).round() as isize;
-    let rotation_bins2 = (rot2 / (fs / fft_len as f64)).round() as isize;
+    // The narrower station defines the output RF origin. Rebase only the
+    // spectral grid; the XML/user rate reference and physical LO values remain unchanged.
+    let output_offset_hz = if band_plan.unequal() {
+        if fs1 <= fs2 {
+            rot1
+        } else {
+            rot2
+        }
+    } else {
+        0.0
+    };
+    let output_obs_mhz = obs_mhz + output_offset_hz / 1e6;
+    let raw_ba = if band_plan.unequal() {
+        // Native spectra can be larger than the output grid. Use RF lower
+        // edges, not centre-frequency differences, for unequal bandwidths.
+        let shift = ((a1_data_low - a2_data_low) * 1e6 / (fs / fft_len as f64)).round() as isize;
+        let first = 0isize.max(-shift);
+        let end = (fft_len1 as isize / 2).min(fft_len2 as isize / 2 - shift);
+        if end <= first {
+            return Err("No RF band overlap between unequal-rate inputs".into());
+        }
+        BandAlignment {
+            shift_bins: shift,
+            a1s: first as usize,
+            a1e: end as usize,
+            a2s: (first + shift) as usize,
+        }
+    } else {
+        compute_band_alignment(
+            fft_len,
+            fs,
+            a1_data_low + 0.5 * bw,
+            a2_data_low + 0.5 * bw,
+            bw,
+            bw,
+        )?
+    };
+    let rotation_bins1 = ((rot1 - output_offset_hz) / (fs / fft_len as f64)).round() as isize;
+    let rotation_bins2 = ((rot2 - output_offset_hz) / (fs / fft_len as f64)).round() as isize;
+    if band_plan.unequal() {
+        for (i, rotation) in [rot1 - output_offset_hz, rot2 - output_offset_hz]
+            .into_iter()
+            .enumerate()
+        {
+            let bins = rotation / (fs / fft_len as f64);
+            if (bins - bins.round()).abs() > 1e-7 {
+                return Err(format!("antenna {} RF edge is not on the common FFT grid: offset {rotation} Hz, df={} Hz. Choose an FFT giving integral RF offsets; fractional-frequency mixing is not implemented for unequal sampling", i+1, fs/fft_len as f64).into());
+            }
+        }
+    }
     let a1_corr_low = a1_data_low - rot1 / 1e6;
     let a2_corr_low = a2_data_low - rot2 / 1e6;
     let fringe_stop_freq_mode = FringeStopFreqMode::from_env()?;
-    let lo1_mhz = fringe_stop_freq_mode.carrier_mhz(a1_data_low, bw, obs_mhz, lsb1_raw);
-    let lo2_mhz = fringe_stop_freq_mode.carrier_mhz(a2_data_low, bw, obs_mhz, lsb2_raw);
+    if band_plan.unequal()
+        && (rotation_hermitian_mode || !matches!(fringe_stop_freq_mode, FringeStopFreqMode::Low))
+    {
+        return Err("unequal sampling requires the physical low-RF carrier and the normal frequency grid (rotation2 is unsupported)".into());
+    }
+    let lo1_mhz = fringe_stop_freq_mode.carrier_mhz(a1_data_low, bw1, obs_mhz, lsb1_raw);
+    let lo2_mhz = fringe_stop_freq_mode.carrier_mhz(a2_data_low, bw2, obs_mhz, lsb2_raw);
     let lo1_hz = lo1_mhz * 1e6;
     let lo2_hz = lo2_mhz * 1e6;
     let ba = if rotation_hermitian_mode {
@@ -6005,9 +6082,9 @@ fn run_once(
         let valid_start1 = rotation_bins1.max(0) as usize;
         let valid_start2 = rotation_bins2.max(0) as usize;
         let valid_end1 =
-            (rotation_bins1 + half_bins as isize).clamp(0, half_bins as isize) as usize;
+            (rotation_bins1 + (fft_len1 / 2) as isize).clamp(0, half_bins as isize) as usize;
         let valid_end2 =
-            (rotation_bins2 + half_bins as isize).clamp(0, half_bins as isize) as usize;
+            (rotation_bins2 + (fft_len2 / 2) as isize).clamp(0, half_bins as isize) as usize;
         let start = valid_start1.max(valid_start2);
         let end = valid_end1.min(valid_end2);
         if end <= start {
@@ -6020,7 +6097,9 @@ fn run_once(
             a2s: start,
         }
     };
-    let out_grid = if rot1.abs() <= rot2.abs() {
+    let out_grid = if (band_plan.unequal() && fs1 <= fs2)
+        || (!band_plan.unequal() && rot1.abs() <= rot2.abs())
+    {
         OutputGrid::Ant1
     } else {
         OutputGrid::Ant2
@@ -6061,9 +6140,14 @@ fn run_once(
         ),
     };
 
-    let bpf1 = (fft_len * bit1 + 7) / 8;
-    let bpf2 = (fft_len * bit2 + 7) / 8;
+    let bpf1 = (fft_len1 * bit1 + 7) / 8;
+    let bpf2 = (fft_len2 * bit2 + 7) / 8;
     let bpf_o = (fft_len * bit_out + 7) / 8;
+    let fft_cross_norm = if fft_len1 == fft_len2 {
+        (fft_len1 as f64).powi(2)
+    } else {
+        fft_len1 as f64 * fft_len2 as f64
+    };
     let bytes_per_frame_pair = bpf1 + bpf2;
     let io_chunk_frames = if args.razoku5bay {
         let forced = ((0.5_f64 * fs) / fft_len as f64).round().max(1.0) as usize;
@@ -6129,8 +6213,8 @@ fn run_once(
     let total_samples2 = (f2_m.len() * 8) / bit2 as u64;
     let atmosphere_eval_first_s = total_skip_sec + model_time_offset_s.min(0.0);
     let atmosphere_eval_last_s = process_window_sec
-        .unwrap_or(total_samples1.min(total_samples2) as f64 / fs)
-        .min(total_samples1.min(total_samples2) as f64 / fs)
+        .unwrap_or((total_samples1 as f64 / fs1).min(total_samples2 as f64 / fs2))
+        .min((total_samples1 as f64 / fs1).min(total_samples2 as f64 / fs2))
         .max(total_skip_sec)
         + model_time_offset_s.max(0.0);
 
@@ -6180,7 +6264,7 @@ fn run_once(
         OutputGrid::Ant2 => ba.a2s,
     };
     let ionosphere_end_bin = ionosphere_start_bin + ba.a1e - ba.a1s;
-    let ionosphere_reference_hz = obs_mhz * 1e6
+    let ionosphere_reference_hz = output_obs_mhz * 1e6
         + (ionosphere_start_bin as f64 + (ba.a1e - ba.a1s - 1) as f64 * 0.5) * fs / fft_len as f64;
     let ionosphere_phase_basis = if atmosphere.ionosphere == atmosphere::IonosphereMode::Input {
         if !matches!(fringe_stop_freq_mode, FringeStopFreqMode::Low) {
@@ -6199,7 +6283,7 @@ fn run_once(
             .take(ionosphere_end_bin)
             .skip(ionosphere_start_bin)
         {
-            let frequency = obs_mhz * 1e6 + bin as f64 * fs / fft_len as f64;
+            let frequency = output_obs_mhz * 1e6 + bin as f64 * fs / fft_len as f64;
             if !frequency.is_finite()
                 || frequency <= 0.0
                 || !ionosphere_reference_hz.is_finite()
@@ -6437,31 +6521,40 @@ fn run_once(
         read_align_residual_samples
     );
     let init_seek_s1 = if init_delay_samples < 0 {
-        (-init_delay_samples) as u64
+        if band_plan.unequal() {
+            (-read_align_delay_s * fs1).ceil() as u64
+        } else {
+            (-init_delay_samples) as u64
+        }
     } else {
         0
     };
     let init_seek_s2 = if init_delay_samples > 0 {
-        init_delay_samples as u64
+        if band_plan.unequal() {
+            (read_align_delay_s * fs2).ceil() as u64
+        } else {
+            init_delay_samples as u64
+        }
     } else {
         0
     };
     let total_skip_samples = (total_skip_sec * fs).round() as u64;
-    let start_s1 = init_seek_s1.saturating_add(total_skip_samples);
-    let start_s2 = init_seek_s2.saturating_add(total_skip_samples);
+    let skip_samples1 = (total_skip_sec * fs1).round() as u64;
+    let skip_samples2 = (total_skip_sec * fs2).round() as u64;
+    let start_s1 = init_seek_s1.saturating_add(skip_samples1);
+    let start_s2 = init_seek_s2.saturating_add(skip_samples2);
     let avail_samples1 = total_samples1.saturating_sub(start_s1);
     let avail_samples2 = total_samples2.saturating_sub(start_s2);
-    let avail_samples = avail_samples1.min(avail_samples2);
-    let available_sec = avail_samples as f64 / fs;
+    let available_sec = (avail_samples1 as f64 / fs1).min(avail_samples2 as f64 / fs2);
     // An explicitly requested process window remains on the original scan time
     // grid. Do not shorten it merely because coarse read-alignment starts one
     // physical input a few samples later. The readers already pad EOF, so only
     // the unavailable boundary samples are affected. With no explicit process
     // window, yi-corr retains the conservative common-overlap duration while a
     // phased raw keeps the nominal virtual-station scan duration.
-    let nominal_samples1 = total_samples1.saturating_sub(total_skip_samples);
-    let nominal_samples2 = total_samples2.saturating_sub(total_skip_samples);
-    let nominal_available_sec = nominal_samples1.min(nominal_samples2) as f64 / fs;
+    let nominal_samples1 = total_samples1.saturating_sub(skip_samples1);
+    let nominal_samples2 = total_samples2.saturating_sub(skip_samples2);
+    let nominal_available_sec = (nominal_samples1 as f64 / fs1).min(nominal_samples2 as f64 / fs2);
     let requested_sec = if let Some(window_sec) = process_window_sec {
         (window_sec - total_skip_sec).max(0.0)
     } else {
@@ -6492,12 +6585,13 @@ fn run_once(
         )?;
     }
     if total_sec > available_sec {
-        let output_samples = (total_f as u64).saturating_mul(fft_len as u64);
+        let output_samples1 = (total_f as u64).saturating_mul(fft_len1 as u64);
+        let output_samples2 = (total_f as u64).saturating_mul(fft_len2 as u64);
         let eof_pad1 = start_s1
-            .saturating_add(output_samples)
+            .saturating_add(output_samples1)
             .saturating_sub(total_samples1);
         let eof_pad2 = start_s2
-            .saturating_add(output_samples)
+            .saturating_add(output_samples2)
             .saturating_sub(total_samples2);
         println!(
             "[info] Requested scan-length preservation: mode={} {:.9}s output; EOF boundary padding ant1={} sample, ant2={} sample",
@@ -6643,7 +6737,7 @@ fn run_once(
                 key: a1_key,
                 path: &a1p,
                 size_bytes: f1_m.len(),
-                est_obs_sec: (f1_m.len() * 8) as f64 / bit1 as f64 / fs,
+                est_obs_sec: (f1_m.len() * 8) as f64 / bit1 as f64 / fs1,
                 ecef_m: ant1_ecef,
                 bit: bit1,
                 levels: &levels1,
@@ -6670,7 +6764,7 @@ fn run_once(
                 key: a2_key,
                 path: &a2p,
                 size_bytes: f2_m.len(),
-                est_obs_sec: (f2_m.len() * 8) as f64 / bit2 as f64 / fs,
+                est_obs_sec: (f2_m.len() * 8) as f64 / bit2 as f64 / fs2,
                 ecef_m: ant2_ecef,
                 bit: bit2,
                 levels: &levels2,
@@ -6724,14 +6818,14 @@ fn run_once(
             a1_name,
             a1p.display(),
             f1_m.len(),
-            (f1_m.len() * 8) as f64 / bit1 as f64 / fs
+            (f1_m.len() * 8) as f64 / bit1 as f64 / fs1
         );
         println!(
             "  {}:  {} (Size: {} bytes, Estimated Obs Time: {:.2}s)",
             a2_name,
             a2p.display(),
             f2_m.len(),
-            (f2_m.len() * 8) as f64 / bit2 as f64 / fs
+            (f2_m.len() * 8) as f64 / bit2 as f64 / fs2
         );
     }
     if !schedule_mode {
@@ -6915,7 +7009,11 @@ fn run_once(
                 "disabled (raw only)"
             }
         );
-        println!("  obs-band:   {:.3} .. {:.3} MHz", obs_mhz, obs_mhz + bw);
+        println!(
+            "  obs-band:   {:.3} .. {:.3} MHz",
+            output_obs_mhz,
+            output_obs_mhz + bw
+        );
     }
     if !schedule_mode {
         println!("  band-align: {band_align_desc}");
@@ -7076,10 +7174,26 @@ fn run_once(
             start_s1_residual_samples, start_s2_residual_samples
         );
     }
-    let d_seek_samples = start_s2_actual_samples as i128 - start_s1_actual_samples as i128;
-    let d_seek = d_seek_samples as f64 / fs;
+    let d_seek = band_plan.time_difference(start_s1_actual_samples, start_s2_actual_samples);
+    let d_seek_samples = if band_plan.unequal() {
+        (d_seek * fs).round() as i128
+    } else {
+        start_s2_actual_samples as i128 - start_s1_actual_samples as i128
+    };
 
     let helper = Arc::new(FftHelper::new(fft_len));
+    let helper1 = if fft_len1 == fft_len {
+        Arc::clone(&helper)
+    } else {
+        Arc::new(FftHelper::new(fft_len1))
+    };
+    let helper2 = if fft_len2 == fft_len1 {
+        Arc::clone(&helper1)
+    } else if fft_len2 == fft_len {
+        Arc::clone(&helper)
+    } else {
+        Arc::new(FftHelper::new(fft_len2))
+    };
     let frame_dt = fft_len as f64 / fs;
     // Keep integer/fractional shifts on baseline-relative delay only.
     let residual_on_ant2 = init_delay_samples >= 0;
@@ -7307,6 +7421,7 @@ fn run_once(
         frame_dt,
         model_time_offset_s: model_time_offset_s,
         fs,
+        native_fs: [fs1, fs2],
         time_offset_s: total_skip_sec,
         geom_delay_table_1s,
         atmosphere_table_1s,
@@ -8296,7 +8411,7 @@ fn run_once(
         let dp1 = Arc::new(build_decode_plan(bit1, sh1.as_ref(), levels1.as_ref())?);
         let dp2 = Arc::new(build_decode_plan(bit2, sh2.as_ref(), levels2.as_ref())?);
         let mut emitted = 0;
-        let cor_h_freq_hz = obs_mhz * 1e6;
+        let cor_h_freq_hz = output_obs_mhz * 1e6;
         let inband = if_d.as_ref().and_then(|d| d.inband).unwrap_or(1);
         if inband == 0 || !inband.is_power_of_two() {
             return Err(format!(
@@ -8345,7 +8460,7 @@ fn run_once(
                         .into(),
                 );
             }
-            let rt = PulsarRuntime::new(cfg, &ep_i, obs_mhz, df_hz, cor_bins_total)?;
+            let rt = PulsarRuntime::new(cfg, &ep_i, output_obs_mhz, df_hz, cor_bins_total)?;
             println!(
                 "[info] Pulsar folding: name={} bins={} period={:.12e}s pdot={:.6e} pddot={:.6e} dm={:.6e} dedisperse={} time-correction={}",
                 rt.config().name.as_deref().unwrap_or("-"),
@@ -8376,12 +8491,35 @@ fn run_once(
             );
             statusln!(
                 "       RF={:.6}MHz BW={:.6}MHz df={:.6}Hz rotation={:+.6}/{:+.6}MHz",
-                obs_mhz,
+                output_obs_mhz,
                 bw,
                 df_hz,
                 rot1 / 1e6,
                 rot2 / 1e6
             );
+            if band_plan.unequal() {
+                for (index, (name, low)) in [(a1_name, a1_data_low), (a2_name, a2_data_low)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    statusln!(
+                        "       input {} RF={:.6}..{:.6}MHz BW={:.6}MHz sampling={:.6}MS/s FFT={}",
+                        name,
+                        low,
+                        low + band_plan.bandwidth_hz[index] / 1e6,
+                        band_plan.bandwidth_hz[index] / 1e6,
+                        band_plan.sampling_hz[index] / 1e6,
+                        band_plan.fft[index]
+                    );
+                }
+                statusln!(
+                    "       common={:.6}..{:.6}MHz width={:.6}MHz FFT-window={:.9}s",
+                    output_obs_mhz + ba.a1s as f64 * df_hz / 1e6,
+                    output_obs_mhz + ba.a1e as f64 * df_hz / 1e6,
+                    overlap_mhz,
+                    frame_sec
+                );
+            }
             statusln!(
                 "       integration={:.9}s (requested {:.6}Hz; {}) sectors={} inband={} pulse-bins={}",
                 actual_output_sec,
@@ -8450,7 +8588,7 @@ fn run_once(
             observing_frequency_hz: if inband == 1 {
                 cor_h_freq_hz
             } else {
-                (obs_mhz + ch as f64 * inband_bw_mhz) * 1.0e6
+                (output_obs_mhz + ch as f64 * inband_bw_mhz) * 1.0e6
             },
             fft_point: if inband == 1 {
                 fft_len as i32
@@ -8668,14 +8806,23 @@ fn run_once(
                 0
             };
 
-            let common_samples = sector_start_frame as i128 * fft_len as i128;
-            let mut sector_s1 = start_s1_actual_samples as i128 + common_samples;
-            let mut sector_s2 = start_s2_actual_samples as i128 + common_samples;
+            let mut sector_s1 =
+                start_s1_actual_samples as i128 + sector_start_frame as i128 * fft_len1 as i128;
+            let mut sector_s2 =
+                start_s2_actual_samples as i128 + sector_start_frame as i128 * fft_len2 as i128;
             if use_sector_readalign {
                 if residual_on_ant2 {
-                    sector_s2 += delta_samples;
+                    sector_s2 += if band_plan.unequal() {
+                        ((sector_d_seek_samples as f64 / fs - d_seek) * fs2).round() as i128
+                    } else {
+                        delta_samples
+                    };
                 } else {
-                    sector_s1 -= delta_samples;
+                    sector_s1 -= if band_plan.unequal() {
+                        ((sector_d_seek_samples as f64 / fs - d_seek) * fs1).round() as i128
+                    } else {
+                        delta_samples
+                    };
                 }
             }
             if sector_s1 < 0 || sector_s2 < 0 {
@@ -8693,16 +8840,16 @@ fn run_once(
             // separation below, so the discarded prefix remains corrected.
             let read_s1 = logical_s1 / samples_per_word1 * samples_per_word1;
             let read_s2 = logical_s2 / samples_per_word2 * samples_per_word2;
-            let payload_samples = nf as u64 * fft_len as u64;
+            let payload_samples1 = nf as u64 * fft_len1 as u64;
+            let payload_samples2 = nf as u64 * fft_len2 as u64;
             // One trailing native word supplies the positive look-ahead used
             // when the residual integer delay selects samples after the
             // aligned read origin, including the final frame of a sector.
-            let read_n1 = payload_samples + samples_per_word1;
-            let read_n2 = payload_samples + samples_per_word2;
+            let read_n1 = payload_samples1 + samples_per_word1;
+            let read_n2 = payload_samples2 + samples_per_word2;
             sector_read_starts.push((read_s1, read_s2));
             sector_read_sample_counts.push((read_n1, read_n2));
-            let actual_sector_d_seek_samples = read_s2 as i128 - read_s1 as i128;
-            sector_d_seeks.push(actual_sector_d_seek_samples as f64 / fs);
+            sector_d_seeks.push(band_plan.time_difference(read_s1, read_s2));
             sector_start_frame += nf;
         }
         let io_sectors = sec_counts
@@ -8724,7 +8871,7 @@ fn run_once(
         let mut reader_pipeline = input_pipeline::Pipeline::start(
             [a1p.clone(), a2p.clone()],
             [bit1, bit2],
-            fft_len,
+            [fft_len1, fft_len2],
             io_sectors,
             delay_cfg.clone(),
             io_chunk_frames,
@@ -8758,7 +8905,7 @@ fn run_once(
                 let (extra_phase, extra_step) = correction.phase_start_and_step(
                     args.multiband_band_index,
                     d.t_mid_s,
-                    obs_mhz * 1e6 + start as f64 * df_hz,
+                    output_obs_mhz * 1e6 + start as f64 * df_hz,
                     df_hz,
                 );
                 phase *= extra_phase;
@@ -8771,13 +8918,20 @@ fn run_once(
         // large FFTs, where a map pair can occupy many MiB.
         let normal_grid_maps = {
             let half = fft_len / 2 + 1;
-            let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
-            let station_offset2 =
-                station_grid_origin_offset_bins(a2_name, fs, fft_len) + ant2_grid_extra_offset();
+            let station_offset1 = if band_plan.unequal() {
+                0
+            } else {
+                station_grid_origin_offset_bins(a1_name, fs, fft_len)
+            };
+            let station_offset2 = if band_plan.unequal() {
+                0
+            } else {
+                station_grid_origin_offset_bins(a2_name, fs, fft_len) + ant2_grid_extra_offset()
+            };
             let grid_map1 =
-                build_real_fft_xml_grid_map(fft_len, rotation_bins1, station_offset1, half);
+                build_real_fft_xml_grid_map(fft_len1, rotation_bins1, station_offset1, half);
             let grid_map2 =
-                build_real_fft_xml_grid_map(fft_len, rotation_bins2, station_offset2, half);
+                build_real_fft_xml_grid_map(fft_len2, rotation_bins2, station_offset2, half);
             let direct_src1 = contiguous_real_fft_src_start(&grid_map1, ba.a1s, overlap_len);
             let direct_src2 = contiguous_real_fft_src_start(&grid_map2, ba.a2s, overlap_len);
             Some((grid_map1, grid_map2, direct_src1, direct_src2))
@@ -8937,6 +9091,7 @@ fn run_once(
             g1: Vec<Complex<f32>>,
             g2: Vec<Complex<f32>>,
             fft_scratch: FftScratch,
+            fft_scratch2: FftScratch,
             dw1: DecodeWindowScratch,
             dw2: DecodeWindowScratch,
             timing_decode_s: f64,
@@ -8967,10 +9122,10 @@ fn run_once(
                 Vec::new()
             },
             fold: None,
-            f1: vec![0.0_f32; fft_len],
-            f2: vec![0.0_f32; fft_len],
-            s1: vec![Complex::new(0.0_f32, 0.0_f32); half],
-            s2: vec![Complex::new(0.0_f32, 0.0_f32); half],
+            f1: vec![0.0_f32; fft_len1],
+            f2: vec![0.0_f32; fft_len2],
+            s1: vec![Complex::new(0.0_f32, 0.0_f32); fft_len1 / 2 + 1],
+            s2: vec![Complex::new(0.0_f32, 0.0_f32); fft_len2 / 2 + 1],
             g1: if need_grid_buffers {
                 vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
             } else {
@@ -8981,7 +9136,8 @@ fn run_once(
             } else {
                 Vec::new()
             },
-            fft_scratch: helper.make_forward_scratch(),
+            fft_scratch: helper1.make_forward_scratch(),
+            fft_scratch2: helper2.make_forward_scratch(),
             dw1: DecodeWindowScratch::new(),
             dw2: DecodeWindowScratch::new(),
             timing_decode_s: 0.0,
@@ -9278,9 +9434,16 @@ fn run_once(
                     .expect("normal correlation grid maps");
                 let direct_src1 = *direct_src1;
                 let direct_src2 = *direct_src2;
-                let station_offset1 = station_grid_origin_offset_bins(a1_name, fs, fft_len);
-                let station_offset2 = station_grid_origin_offset_bins(a2_name, fs, fft_len)
-                    + ant2_grid_extra_offset();
+                let station_offset1 = if band_plan.unequal() {
+                    0
+                } else {
+                    station_grid_origin_offset_bins(a1_name, fs, fft_len)
+                };
+                let station_offset2 = if band_plan.unequal() {
+                    0
+                } else {
+                    station_grid_origin_offset_bins(a2_name, fs, fft_len) + ant2_grid_extra_offset()
+                };
                 let out = corr_workers[..active]
                     .par_iter_mut()
                     .enumerate()
@@ -9306,7 +9469,7 @@ fn run_once(
                                 raw1,
                                 chunk_abs_start1,
                                 i,
-                                fft_len,
+                                fft_len1,
                                 bit1,
                                 samples_per_word1,
                                 &dp1,
@@ -9324,7 +9487,7 @@ fn run_once(
                                 raw2,
                                 chunk_abs_start2,
                                 i,
-                                fft_len,
+                                fft_len2,
                                 bit2,
                                 samples_per_word2,
                                 &dp2,
@@ -9342,7 +9505,7 @@ fn run_once(
                                 st.timing_decode_s += t.elapsed().as_secs_f64();
                             }
                             let timing_fft_start = timing_frame_sampled.then(Instant::now);
-                            if helper
+                            if helper1
                                 .forward_r2c_process_with_scratch(
                                     &mut st.f1,
                                     &mut st.s1,
@@ -9353,11 +9516,11 @@ fn run_once(
                                 sector_failures.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            if helper
+                            if helper2
                                 .forward_r2c_process_with_scratch(
                                     &mut st.f2,
                                     &mut st.s2,
-                                    &mut st.fft_scratch,
+                                    &mut st.fft_scratch2,
                                 )
                                 .is_err()
                             {
@@ -9370,19 +9533,35 @@ fn run_once(
                             let timing_accum_start = timing_frame_sampled.then(Instant::now);
                             let fr_lo1 = d.fr_lo1;
                             let fr_lo2 = d.fr_lo2;
-                            let fr_mix = fr_lo1 * fr_lo2.conj();
+                            let mut fr_mix = fr_lo1 * fr_lo2.conj();
+                            if band_plan.unequal() && rotation_bins1 != rotation_bins2 {
+                                let reference_antenna = if residual_on_ant2 { 0 } else { 1 };
+                                let reference_start = if reference_antenna == 0 {
+                                    sector_read_starts[si].0
+                                } else {
+                                    sector_read_starts[si].1
+                                };
+                                let reference_sample = reference_start
+                                    + (block.frame + i) as u64
+                                        * band_plan.fft[reference_antenna] as u64;
+                                fr_mix *= band_plan.grid_phase(
+                                    reference_antenna,
+                                    reference_sample,
+                                    rotation_bins2 - rotation_bins1,
+                                );
+                            }
                             if need_grid_buffers {
                                 shift_real_fft_to_xml_grid_with_extra_offset(
                                     &st.s1,
                                     &mut st.g1,
-                                    fft_len,
+                                    fft_len1,
                                     rotation_bins1,
                                     station_offset1,
                                 );
                                 shift_real_fft_to_xml_grid_with_extra_offset(
                                     &st.s2,
                                     &mut st.g2,
-                                    fft_len,
+                                    fft_len2,
                                     rotation_bins2,
                                     station_offset2,
                                 );
@@ -9723,10 +9902,13 @@ fn run_once(
                 acc_22_total[k] += batch_22[k];
             }
             let norm_base = nf as f64 * (fft_len as f64).powi(2);
-            let inv_11 = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * norm_base);
-            let inv_22 = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power2 * norm_base);
+            let norm_base1 = nf as f64 * (fft_len1 as f64).powi(2);
+            let norm_base2 = nf as f64 * (fft_len2 as f64).powi(2);
+            let norm_cross = nf as f64 * fft_cross_norm;
+            let inv_11 = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * norm_base1);
+            let inv_22 = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power2 * norm_base2);
             let inv_12 = 1.0
-                / (COR_ONE_SIDED_POWER_FACTOR * (level_power1 * level_power2).sqrt() * norm_base);
+                / (COR_ONE_SIDED_POWER_FACTOR * (level_power1 * level_power2).sqrt() * norm_cross);
             let phased_power_ref = (w1 * w1 * level_power1 + w2 * w2 * level_power2).max(1e-12);
             let inv_ph = 1.0 / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * norm_base);
             if let (Some(interval_s), Some(acc)) = (fringe_interval_s, ql_fringe_acc.as_mut()) {
@@ -9743,7 +9925,7 @@ fn run_once(
                     let ql_norm = 1.0
                         / (COR_ONE_SIDED_POWER_FACTOR
                             * (level_power1 * level_power2).sqrt()
-                            * (fft_len as f64).powi(2)
+                            * fft_cross_norm
                             * ql_fringe_frames.max(1) as f64);
                     let ql_spec: Vec<Complex<f64>> = acc
                         .iter()
@@ -9757,7 +9939,7 @@ fn run_once(
                         ql_fringe_start_offset_s,
                         ql_integ_s,
                         &ql_spec,
-                        obs_mhz,
+                        output_obs_mhz,
                         df_hz,
                     )?;
                     acc.fill(Complex::new(0.0_f64, 0.0_f64));
@@ -9767,13 +9949,13 @@ fn run_once(
             }
             if let Some(fold) = batch_fold.as_ref() {
                 let norm_11_per_frame =
-                    1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * (fft_len as f64).powi(2));
+                    1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power1 * (fft_len1 as f64).powi(2));
                 let norm_22_per_frame =
-                    1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power2 * (fft_len as f64).powi(2));
+                    1.0 / (COR_ONE_SIDED_POWER_FACTOR * level_power2 * (fft_len2 as f64).powi(2));
                 let norm_12_per_frame = 1.0
                     / (COR_ONE_SIDED_POWER_FACTOR
                         * (level_power1 * level_power2).sqrt()
-                        * (fft_len as f64).powi(2));
+                        * fft_cross_norm);
                 let norm_ph_per_frame = 1.0
                     / (COR_ONE_SIDED_POWER_FACTOR * phased_power_ref * (fft_len as f64).powi(2));
                 for pbin in 0..pulsar_bin_count {

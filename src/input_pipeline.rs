@@ -208,7 +208,7 @@ impl Pipeline {
     pub fn start(
         paths: [PathBuf; 2],
         bits: [usize; 2],
-        fft: usize,
+        fft: [usize; 2],
         sectors: Vec<Sector>,
         cfg: DelayEvalConfig,
         chunk_frames: usize,
@@ -280,7 +280,7 @@ impl Pipeline {
                                 let (start, count, offset) = read_window(
                                     &block.delays,
                                     frame,
-                                    fft,
+                                    fft[ant],
                                     sector.samples[ant],
                                     32 / bits[ant] as u64,
                                     ant,
@@ -502,7 +502,7 @@ mod tests {
                     let mut p = Pipeline::start(
                         paths,
                         [2, 2],
-                        32,
+                        [32, 32],
                         vec![Sector {
                             frames: 100,
                             starts: [0; 2],
@@ -663,7 +663,7 @@ mod tests {
                     let mut p = Pipeline::start(
                         paths,
                         [2, 2],
-                        32,
+                        [32, 32],
                         vec![Sector {
                             frames: 100,
                             starts: [0; 2],
@@ -701,7 +701,7 @@ mod tests {
             let mut p = Pipeline::start(
                 [file.clone(), root.join("missing.raw")],
                 [2, 2],
-                32,
+                [32, 32],
                 vec![Sector {
                     frames: 1,
                     starts: [0; 2],

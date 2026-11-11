@@ -29,6 +29,8 @@ This repository builds two operational binaries from the same codebase:
 
 ## Features
 
+- [局ごとに帯域幅・サンプリング周波数が異なる相関](docs/unequal-bandwidth.md): 512 MHz / 16 MHz 等の包含帯域を、同じ時間幅・周波数刻みの局別 FFT で処理する（3.12.0）。
+
 - XML schedule driven operation (`--sc <schedule.xml>`)
 - Multi-process scan support (`<process>` entries in XML)
 - Per-antenna bit-depth/level/shuffle/sideband/rotation handling
@@ -2803,6 +2805,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `3.12.0` | Correlates unequal station sampling rates using equal-duration native FFTs and the common RF band. Adds native delay tracking, FFT-origin phase alignment, per-station power normalization, narrow-band output metadata and synthetic containment tests. |
 | `3.10.5` | Writes `.info` as ordinary ZIP32/Deflate containing one UTF-8 `info.txt`, compatible with zipcat and zedit without renaming. Retains gzip reading in analysis/benchmark tools and provides a converter that preserves archived originals. |
 | `3.11.0` | Adds station XML/UTC CSV atmosphere providers: STEC/VTEC first-order ionosphere with separate group alignment and dispersive spectral phase, measured zenith paths or Saastamoinen weather delays with Niell mapping. Preserves default/legacy nominal processing and records models in ZIP `.info`. |
 | `3.10.4` | Saves full yi-corr diagnostics for every scan automatically as gzip-compressed `.info` in the correlation directory. Shows concise source/baseline/parameter summaries, throttled progress and completion on stdout; `--stdout` additionally saves that concise console output. |
