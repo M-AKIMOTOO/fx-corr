@@ -174,50 +174,33 @@ fn synth_timing_sample_stride() -> usize {
     })
 }
 
-#[inline]
-fn map_real_fft_bin_to_xml_grid(
-    src: &[Complex<f32>],
-    fft_len: usize,
-    raw_idx: isize,
-) -> Complex<f32> {
-    let n = fft_len as isize;
-    let half = (fft_len / 2) as isize;
-    let idx = raw_idx.rem_euclid(n);
-    if idx <= half {
-        src.get(idx as usize)
-            .copied()
-            .unwrap_or_else(|| Complex::new(0.0, 0.0))
-    } else {
-        src.get((n - idx) as usize)
-            .map(|v| v.conj())
-            .unwrap_or_else(|| Complex::new(0.0, 0.0))
-    }
-}
-
 #[derive(Clone, Copy)]
-struct RealFftGridMap {
+struct FftGridBin {
     src_idx: usize,
     conjugate: bool,
 }
 
-fn build_real_fft_xml_grid_map(
+fn build_fft_xml_grid_map(
     fft_len: usize,
     rotation_bins: isize,
     bins: usize,
-) -> Vec<RealFftGridMap> {
+    complex_fft: bool,
+) -> Vec<FftGridBin> {
     let n = fft_len as isize;
     let half = (fft_len / 2) as isize;
     (0..bins)
         .map(|xml_bin| {
             let raw_idx = xml_bin as isize - rotation_bins;
             let idx = raw_idx.rem_euclid(n);
-            if idx <= half {
-                RealFftGridMap {
+            // Complex fringe rotation breaks the symmetry of the two sidebands.
+            // Use the actual negative-frequency bin for a full complex FFT.
+            if complex_fft || idx <= half {
+                FftGridBin {
                     src_idx: idx as usize,
                     conjugate: false,
                 }
             } else {
-                RealFftGridMap {
+                FftGridBin {
                     src_idx: (n - idx) as usize,
                     conjugate: true,
                 }
@@ -227,11 +210,7 @@ fn build_real_fft_xml_grid_map(
 }
 
 #[inline]
-fn mapped_real_fft_bin(
-    src: &[Complex<f32>],
-    map: &[RealFftGridMap],
-    xml_bin: usize,
-) -> Complex<f32> {
+fn mapped_fft_bin(src: &[Complex<f32>], map: &[FftGridBin], xml_bin: usize) -> Complex<f32> {
     let m = map[xml_bin];
     let z = src[m.src_idx];
     if m.conjugate {
@@ -245,11 +224,7 @@ fn mapped_real_fft_bin(
 /// non-conjugated, contiguous FFT range. This common case lets the accumulation
 /// hot loop read spectra directly instead of loading and branching on two map
 /// entries for every frequency bin of every frame.
-fn contiguous_real_fft_src_start(
-    map: &[RealFftGridMap],
-    xml_start: usize,
-    len: usize,
-) -> Option<usize> {
+fn contiguous_fft_src_start(map: &[FftGridBin], xml_start: usize, len: usize) -> Option<usize> {
     let xml_end = xml_start.checked_add(len)?;
     let range = map.get(xml_start..xml_end)?;
     let first = range.first()?;
@@ -368,12 +343,16 @@ mod correlation_hot_path_tests {
 
     #[test]
     fn contiguous_grid_map_detects_direct_and_wrapped_ranges() {
-        let direct = build_real_fft_xml_grid_map(16, -2, 9);
-        assert_eq!(contiguous_real_fft_src_start(&direct, 1, 5), Some(3));
+        let direct = build_fft_xml_grid_map(16, -2, 9, false);
+        assert_eq!(contiguous_fft_src_start(&direct, 1, 5), Some(3));
 
-        let wrapped = build_real_fft_xml_grid_map(16, 1, 9);
-        assert_eq!(contiguous_real_fft_src_start(&wrapped, 0, 5), None);
-        assert_eq!(contiguous_real_fft_src_start(&wrapped, 1, 5), Some(0));
+        let wrapped = build_fft_xml_grid_map(16, 1, 9, false);
+        assert_eq!(contiguous_fft_src_start(&wrapped, 0, 5), None);
+        assert_eq!(contiguous_fft_src_start(&wrapped, 1, 5), Some(0));
+
+        let complex = build_fft_xml_grid_map(16, 2, 9, true);
+        assert_eq!(contiguous_fft_src_start(&complex, 0, 2), Some(14));
+        assert_eq!(contiguous_fft_src_start(&complex, 0, 3), None);
     }
 
     #[test]
@@ -391,7 +370,7 @@ mod correlation_hot_path_tests {
             Complex::new(2.25, 0.125),
         ];
         let map = (0..spectrum1.len())
-            .map(|src_idx| RealFftGridMap {
+            .map(|src_idx| FftGridBin {
                 src_idx,
                 conjugate: false,
             })
@@ -419,8 +398,8 @@ mod correlation_hot_path_tests {
         let mut mapped22 = vec![0.0; spectrum1.len()];
         let mut phase_corr = phase0;
         for k in 0..spectrum1.len() {
-            let z1 = mapped_real_fft_bin(&spectrum1, &map, k);
-            let z2 = mapped_real_fft_bin(&spectrum2, &map, k);
+            let z1 = mapped_fft_bin(&spectrum1, &map, k);
+            let z2 = mapped_fft_bin(&spectrum2, &map, k);
             mapped11[k] += z1.norm_sqr() as f64;
             mapped22[k] += z2.norm_sqr() as f64;
             let raw_xcf = z1 * z2.conj();
@@ -559,16 +538,6 @@ mod correlation_hot_path_tests {
     }
 }
 
-fn shift_real_fft_to_xml_grid(
-    src: &[Complex<f32>],
-    dst: &mut [Complex<f32>],
-    fft_len: usize,
-    rotation_bins: isize,
-) {
-    for (k, bin) in dst.iter_mut().enumerate() {
-        *bin = map_real_fft_bin_to_xml_grid(src, fft_len, k as isize - rotation_bins);
-    }
-}
 #[inline]
 fn maybe_dump_xcf_debug(
     args_debug: bool,
@@ -658,11 +627,12 @@ fn fft_peak_dbg_range(default_start: usize, default_end: usize) -> (usize, usize
 
 #[inline]
 fn complex_peak_in_range(
-    xs: &[Complex<f32>],
+    len: usize,
     start: usize,
     end: usize,
+    bin: impl Fn(usize) -> Complex<f32>,
 ) -> Option<(usize, f64, f64)> {
-    let end = end.min(xs.len());
+    let end = end.min(len);
     let start = start.min(end);
     if start >= end {
         return None;
@@ -672,7 +642,7 @@ fn complex_peak_in_range(
     let mut best_abs = -1.0_f64;
 
     for i in start..end {
-        let z = xs[i];
+        let z = bin(i);
         let a = ((z.re as f64) * (z.re as f64) + (z.im as f64) * (z.im as f64)).sqrt();
         if a > best_abs {
             best_abs = a;
@@ -680,7 +650,7 @@ fn complex_peak_in_range(
         }
     }
 
-    let z = xs[best_i];
+    let z = bin(best_i);
     let phase_deg = (z.im as f64).atan2(z.re as f64).to_degrees();
     Some((best_i, best_abs, phase_deg))
 }
@@ -746,13 +716,14 @@ fn print_fft_peak_dbg(
     frame_local: usize,
     ant_name: &str,
     raw: &[Complex<f32>],
-    grid: &[Complex<f32>],
+    raw_positive_bins: usize,
+    grid: &[FftGridBin],
     rotation_bins: isize,
 ) {
     let (b0, b1) = fft_peak_dbg_range(69840, 69890);
 
-    let raw_peak = complex_peak_in_range(raw, b0, b1);
-    let grid_peak = complex_peak_in_range(grid, b0, b1);
+    let raw_peak = complex_peak_in_range(raw_positive_bins, b0, b1, |k| raw[k]);
+    let grid_peak = complex_peak_in_range(grid.len(), b0, b1, |k| mapped_fft_bin(raw, grid, k));
 
     match (raw_peak, grid_peak) {
         (Some((ri, ra, rp)), Some((gi, ga, gp))) => {
@@ -5551,55 +5522,36 @@ fn run_once(
         xp_arcsec,
         yp_arcsec,
     };
-    let geom_delay_mode = if args.vlbi {
-        geom::GeometricDelayMode::VlbiMinus
-    } else {
-        match std::env::var("YI_GEOM_DELAY_MODE") {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "" | "anchored" | "mixed" | "default" => geom::GeometricDelayMode::Anchored,
-            "bary" | "barycentric" | "absolute-barycentric" => {
-                geom::GeometricDelayMode::Barycentric
-            }
-            "vlbi-minus" | "barycentric-minus" | "first-order-minus" => {
-                geom::GeometricDelayMode::VlbiMinus
-            }
-            "vlbi-plus" | "barycentric-plus" | "first-order-plus" | "vlbi" => {
-                geom::GeometricDelayMode::VlbiPlus
-            }
-            "geo" | "geocentric" | "absolute-geocentric" => geom::GeometricDelayMode::Geocentric,
-            other => {
-                return Err(format!(
-                    "invalid YI_GEOM_DELAY_MODE='{other}' (use anchored, barycentric, vlbi-minus, vlbi-plus, or geocentric)"
-                )
-                .into())
-            }
-        },
-        Err(_) => geom::GeometricDelayMode::Anchored,
-    }
-    };
-    let source_vector_mode = if args.vlbi {
-        geom::SourceVectorMode::PnmGast
-    } else {
-        match std::env::var("YI_SOURCE_VECTOR_MODE") {
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "" | "mean" | "mean-gast" | "precess-gast" | "default" => {
-                    geom::SourceVectorMode::MeanGast
-                }
-                "pnm" | "pnm-gast" | "true-gast" => geom::SourceVectorMode::PnmGast,
-                "pnm-era" | "era" | "c2t" | "c2t-era" => geom::SourceVectorMode::PnmEra,
-                other => {
-                    return Err(format!(
-                    "invalid YI_SOURCE_VECTOR_MODE='{other}' (use mean-gast, pnm-gast, or pnm-era)"
-                )
-                    .into())
-                }
-            },
-            Err(_) => geom::SourceVectorMode::MeanGast,
+    let delay_model = std::env::var("YI_GEOM_DELAY_MODE").unwrap_or_default();
+    let geom_delay_mode = match delay_model.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "vlbi-minus" | "barycentric-minus" | "first-order-minus" => {
+            geom::GeometricDelayMode::VlbiMinus
+        }
+        "anchored" | "mixed" => geom::GeometricDelayMode::Anchored,
+        "bary" | "barycentric" | "absolute-barycentric" => geom::GeometricDelayMode::Barycentric,
+        "vlbi-plus" | "barycentric-plus" | "first-order-plus" | "vlbi" => {
+            geom::GeometricDelayMode::VlbiPlus
+        }
+        "geo" | "geocentric" | "absolute-geocentric" => geom::GeometricDelayMode::Geocentric,
+        other => {
+            return Err(format!(
+                "invalid YI_GEOM_DELAY_MODE='{other}' (use anchored, barycentric, vlbi-minus, vlbi-plus, or geocentric)"
+            )
+            .into());
         }
     };
-    if args.vlbi {
-        println!("[info] VLBI preset: PNM06A+GAST, first-order VLBI minus; overrides YI_SOURCE_VECTOR_MODE/YI_GEOM_DELAY_MODE; EOP unchanged; integer delay before FFT, fractional delay and fringe-stop after FFT");
-    }
+    let source_model = std::env::var("YI_SOURCE_VECTOR_MODE").unwrap_or_default();
+    let source_vector_mode = match source_model.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "pnm" | "pnm-gast" | "true-gast" => geom::SourceVectorMode::PnmGast,
+        "mean" | "mean-gast" | "precess-gast" => geom::SourceVectorMode::MeanGast,
+        "pnm-era" | "era" | "c2t" | "c2t-era" => geom::SourceVectorMode::PnmEra,
+        other => {
+            return Err(format!(
+                "invalid YI_SOURCE_VECTOR_MODE='{other}' (use mean-gast, pnm-gast, or pnm-era)"
+            )
+            .into());
+        }
+    };
     if let (Some(ra_s), Some(dec_s)) = (ra_in, dec_in) {
         let (ra_raw, dec_raw, mjd) = (
             geom::parse_ra(&ra_s)?,
@@ -5978,11 +5930,11 @@ fn run_once(
     };
     let common_low_hz = output_obs_mhz * 1e6 + ba.a1s as f64 * (fs / fft_len as f64);
     let common_end_hz = output_obs_mhz * 1e6 + ba.a1e as f64 * (fs / fft_len as f64);
-    let line_rf_hz = args
+    let fringe_reference_hz = args
         .line_frequency_hz
         .unwrap_or((common_low_hz + common_end_hz) * 0.5);
-    if args.spectral_line && !(common_low_hz..common_end_hz).contains(&line_rf_hz) {
-        return Err(format!("line frequency {line_rf_hz} Hz is outside the common RF band [{common_low_hz}, {common_end_hz}) Hz").into());
+    if args.spectral_line && !(common_low_hz..common_end_hz).contains(&fringe_reference_hz) {
+        return Err(format!("line frequency {fringe_reference_hz} Hz is outside the common RF band [{common_low_hz}, {common_end_hz}) Hz").into());
     }
     // The phased raw is returned to the native packed-data representation of
     // the selected output-grid antenna. Bit depth, levels, shuffle, sideband,
@@ -6133,7 +6085,7 @@ fn run_once(
                 .unwrap_or_else(|| "ant2".into()),
         ],
         [ant1_ecef, ant2_ecef],
-        args.vlbi,
+        gdi.is_some(),
     )?;
     if atmosphere.has_input() && gdi.is_none() {
         return Err(
@@ -6219,8 +6171,8 @@ fn run_once(
             atmosphere.evaluate(mjd_t, elevation)
         };
     atmosphere.log_inputs(geom::parse_epoch_to_mjd(&ep_i)? + total_skip_sec / 86400.0);
-    if atmosphere.troposphere == atmosphere::TroposphereMode::Nominal {
-        println!("[info] VLBI atmosphere: nominal troposphere enabled (height-dependent dry path + 0.1 m zenith wet path); applied to sample delay and fringe phase");
+    if gdi.is_some() && atmosphere.troposphere == atmosphere::TroposphereMode::Nominal {
+        println!("[info] Nominal troposphere enabled (height-dependent dry path + 0.1 m zenith wet path), applied to sample delay and fringe phase");
     }
     if atmosphere.ionosphere == atmosphere::IonosphereMode::Input {
         println!("[atmosphere:ionosphere] first-order cold plasma; reference_RF_hz={:.9}; group_delay=+D/f_ref^2, phase_delay=-D/f^2; D=40.3*(STEC2-STEC1)*1e16/c; XCF extra_phase_rad=+2*pi*D*(1/f+f/f_ref^2); no bin shifts", ionosphere_reference_hz);
@@ -6810,7 +6762,7 @@ fn run_once(
             a2_name
         );
         println!(
-            "  phase-freq: {:.3} MHz ({}) / {:.3} MHz ({}) mode={} (pre-FFT raw delay/rate carriers)",
+            "  phase-freq: {:.3} MHz ({}) / {:.3} MHz ({}) mode={} (carrier phase at FFT midpoint)",
             lo1_mhz,
             a1_name,
             lo2_mhz,
@@ -7086,18 +7038,6 @@ fn run_once(
     };
 
     let helper = Arc::new(FftHelper::new(fft_len));
-    let helper1 = if fft_len1 == fft_len {
-        Arc::clone(&helper)
-    } else {
-        Arc::new(FftHelper::new(fft_len1))
-    };
-    let helper2 = if fft_len2 == fft_len1 {
-        Arc::clone(&helper1)
-    } else if fft_len2 == fft_len {
-        Arc::clone(&helper)
-    } else {
-        Arc::new(FftHelper::new(fft_len2))
-    };
     let frame_dt = fft_len as f64 / fs;
     // Keep integer/fractional shifts on baseline-relative delay only.
     let residual_on_ant2 = init_delay_samples >= 0;
@@ -8440,10 +8380,20 @@ fn run_once(
         // them inside every output sector is especially expensive for very
         // large FFTs, where a map pair can occupy many MiB.
         let half = fft_len / 2 + 1;
-        let grid_map1 = build_real_fft_xml_grid_map(fft_len1, rotation_bins1, half);
-        let grid_map2 = build_real_fft_xml_grid_map(fft_len2, rotation_bins2, half);
-        let direct_src1 = contiguous_real_fft_src_start(&grid_map1, ba.a1s, overlap_len);
-        let direct_src2 = contiguous_real_fft_src_start(&grid_map2, ba.a2s, overlap_len);
+        let grid_map1 = build_fft_xml_grid_map(
+            fft_len1,
+            rotation_bins1,
+            half,
+            !write_raw && !residual_on_ant2,
+        );
+        let grid_map2 = build_fft_xml_grid_map(
+            fft_len2,
+            rotation_bins2,
+            half,
+            !write_raw && residual_on_ant2,
+        );
+        let direct_src1 = contiguous_fft_src_start(&grid_map1, ba.a1s, overlap_len);
+        let direct_src2 = contiguous_fft_src_start(&grid_map2, ba.a2s, overlap_len);
         match (direct_src1, direct_src2) {
             (Some(src1), Some(src2)) => println!(
                 "[info] Correlation grid path: direct contiguous FFT bins (src starts {}, {})",
@@ -8583,14 +8533,29 @@ fn run_once(
             None
         };
         let mut raw_encoded = Vec::new();
-        let line_fft_plan = args.spectral_line.then(|| {
-            let n = if residual_on_ant2 { fft_len2 } else { fft_len1 };
-            statusln!(
-                "[maser] pre-FFT complex fringe rotation at {line_rf_hz:.3} Hz, tracking {}",
-                if residual_on_ant2 { a2_name } else { a1_name }
-            );
-            rustfft::FftPlanner::<f32>::new().plan_fft_forward(n)
+        // Apply the baseline-relative phase to the antenna already tracking
+        // the delay. The reference antenna can use a real FFT at its own rate.
+        let tracked = usize::from(residual_on_ant2);
+        let reference = 1 - tracked;
+        let station_names = [a1_name, a2_name];
+        let tracked_fft_len = band_plan.fft[tracked];
+        let real_fft_len = band_plan.fft[reference];
+        let real_fft = (!write_raw).then(|| {
+            if real_fft_len == fft_len {
+                Arc::clone(&helper)
+            } else {
+                Arc::new(FftHelper::new(real_fft_len))
+            }
         });
+        let fringe_rate_scale_hz =
+            fringe_reference_hz + [lo1_hz - a1_data_low * 1e6, lo2_hz - a2_data_low * 1e6][tracked];
+        let fringe_ionosphere_cycles = if ionosphere_phase_basis.is_some() {
+            atmosphere::ionosphere_phase_basis(fringe_reference_hz, ionosphere_reference_hz)
+                / std::f64::consts::TAU
+        } else {
+            0.0
+        };
+        let signed_inverse_fft_len = [-1.0, 1.0][tracked] / tracked_fft_len as f64;
         struct ThreadAccum {
             acc_ph: Vec<f64>,
             acc_11: Vec<f64>,
@@ -8599,13 +8564,9 @@ fn run_once(
             fold: Option<FoldAccum>,
             f1: Vec<f32>,
             f2: Vec<f32>,
-            s1: Vec<Complex<f32>>,
-            s2: Vec<Complex<f32>>,
-            g1: Vec<Complex<f32>>,
-            g2: Vec<Complex<f32>>,
+            real_spectrum: Vec<Complex<f32>>,
             fft_scratch: FftScratch,
-            fft_scratch2: FftScratch,
-            line_fft: Option<utils::FringeFft>,
+            fringe_fft: utils::FringeFft,
             dw1: DecodeWindowScratch,
             dw2: DecodeWindowScratch,
             timing_decode_s: f64,
@@ -8614,57 +8575,52 @@ fn run_once(
             timing_samples: usize,
         }
         let half = fft_len / 2 + 1;
-        let init = || ThreadAccum {
-            acc_ph: if need_phased_products {
-                vec![0.0; half]
-            } else {
-                Vec::new()
-            },
-            acc_11: if need_acf_products {
-                vec![0.0; half]
-            } else {
-                Vec::new()
-            },
-            acc_12: if need_xcf_products {
-                vec![Complex::new(0.0_f64, 0.0_f64); half]
-            } else {
-                Vec::new()
-            },
-            acc_22: if need_acf_products {
-                vec![0.0; half]
-            } else {
-                Vec::new()
-            },
-            fold: None,
-            f1: vec![0.0_f32; fft_len1],
-            f2: vec![0.0_f32; fft_len2],
-            s1: vec![Complex::new(0.0_f32, 0.0_f32); fft_len1 / 2 + 1],
-            s2: vec![Complex::new(0.0_f32, 0.0_f32); fft_len2 / 2 + 1],
-            g1: if fft_peak_debug {
-                vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
-            } else {
-                Vec::new()
-            },
-            g2: if fft_peak_debug {
-                vec![Complex::new(0.0_f32, 0.0_f32); half + 1]
-            } else {
-                Vec::new()
-            },
-            fft_scratch: helper1.make_forward_scratch(),
-            fft_scratch2: helper2.make_forward_scratch(),
-            line_fft: line_fft_plan
-                .as_ref()
-                .map(|p| utils::FringeFft::new(Arc::clone(p))),
-            dw1: DecodeWindowScratch::new(),
-            dw2: DecodeWindowScratch::new(),
-            timing_decode_s: 0.0,
-            timing_fft_s: 0.0,
-            timing_accum_s: 0.0,
-            timing_samples: 0,
+        let mut corr_workers: Vec<_> = if let Some(real_fft) = real_fft.as_ref() {
+            statusln!(
+                "[corr] pre-FFT complex fringe rotation at {fringe_reference_hz:.3} Hz, tracking {}",
+                station_names[tracked]
+            );
+            let fringe_fft_plan =
+                rustfft::FftPlanner::<f32>::new().plan_fft_forward(tracked_fft_len);
+            (0..worker_count)
+                .map(|_| ThreadAccum {
+                    acc_ph: if need_phased_products {
+                        vec![0.0; half]
+                    } else {
+                        Vec::new()
+                    },
+                    acc_11: if need_acf_products {
+                        vec![0.0; half]
+                    } else {
+                        Vec::new()
+                    },
+                    acc_12: if need_xcf_products {
+                        vec![Complex::new(0.0_f64, 0.0_f64); half]
+                    } else {
+                        Vec::new()
+                    },
+                    acc_22: if need_acf_products {
+                        vec![0.0; half]
+                    } else {
+                        Vec::new()
+                    },
+                    fold: None,
+                    f1: vec![0.0_f32; fft_len1],
+                    f2: vec![0.0_f32; fft_len2],
+                    real_spectrum: vec![Complex::new(0.0_f32, 0.0_f32); real_fft_len / 2 + 1],
+                    fft_scratch: real_fft.make_forward_scratch(),
+                    fringe_fft: utils::FringeFft::new(Arc::clone(&fringe_fft_plan)),
+                    dw1: DecodeWindowScratch::new(),
+                    dw2: DecodeWindowScratch::new(),
+                    timing_decode_s: 0.0,
+                    timing_fft_s: 0.0,
+                    timing_accum_s: 0.0,
+                    timing_samples: 0,
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
-        let mut corr_workers: Vec<_> = (0..if write_raw { 0 } else { worker_count })
-            .map(|_| init())
-            .collect();
         for _ in 0..block_count {
             let timing_recv_start = Instant::now();
             let block = reader_pipeline.recv()?;
@@ -8825,10 +8781,10 @@ fn run_once(
                             } else {
                                 (extra_phase, Complex::new(1.0, 0.0))
                             };
-                            let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, ba.a1s + k)
+                            let z1 = mapped_fft_bin(&st.s1, &grid_map1, ba.a1s + k)
                                 * d.fr_lo1
                                 * phase_to_f32(phase1 * iono1);
-                            let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, ba.a2s + k)
+                            let z2 = mapped_fft_bin(&st.s2, &grid_map2, ba.a2s + k)
                                 * d.fr_lo2
                                 * phase_to_f32(phase2 * iono2);
                             let beam = z1 * w1 as f32 + z2 * w2 as f32;
@@ -8929,6 +8885,7 @@ fn run_once(
                 }
                 (batch_ph, batch_11, batch_12, batch_22, None)
             } else {
+                let real_fft = real_fft.as_ref().expect("real FFT for reference station");
                 let active = cpu_balance
                     .as_ref()
                     .map_or(corr_workers.len(), |b| b.active())
@@ -8937,7 +8894,10 @@ fn run_once(
                 let frames_per_job = nf.div_ceil(active);
                 let chunk_abs_start1 = sector_sample_start1;
                 let chunk_abs_start2 = sector_sample_start2;
-                let block_grid_phase = grid_phases.get(si).copied();
+                let grid_phase = grid_phases
+                    .get(si)
+                    .copied()
+                    .unwrap_or(Complex::new(1.0, 0.0));
                 let out = corr_workers[..active]
                     .par_iter_mut()
                     .enumerate()
@@ -8955,6 +8915,10 @@ fn run_once(
                         st.timing_accum_s = 0.0;
                         st.timing_samples = 0;
                         let end = (start + frames_per_job).min(nf);
+                        // A worker processes contiguous frames. Reuse the
+                        // continuous model evaluated at the previous FFT edge.
+                        let (_, mut edge_delay, mut edge_ionosphere) =
+                            baseline_delay_at_frame_time((emitted + start) as f64, &delay_cfg);
                         for i in start..end {
                             let d = frame_delays[i];
                             let timing_frame_sampled = i % timing_sample_stride == 0;
@@ -8995,93 +8959,63 @@ fn run_once(
                                 st.timing_decode_s += t.elapsed().as_secs_f64();
                             }
                             let timing_fft_start = timing_frame_sampled.then(Instant::now);
-                            let rate_hz = if st.line_fft.is_some() {
-                                // Use the continuous baseline delay at both FFT edges. Wrapped
-                                // angles and integer read shifts cannot supply a fringe rate.
-                                let start = (emitted + i) as f64;
-                                let (_, t0, _) = baseline_delay_at_frame_time(start, &delay_cfg);
-                                let (_, t1, _) =
-                                    baseline_delay_at_frame_time(start + 1.0, &delay_cfg);
-                                line_rf_hz * ((t1 - t0) / frame_dt)
+                            let (_, next_delay, next_ionosphere) =
+                                baseline_delay_at_frame_time((emitted + i + 1) as f64, &delay_cfg);
+                            let fringe_cycles = fringe_rate_scale_hz * (next_delay - edge_delay)
+                                - fringe_ionosphere_cycles * (next_ionosphere - edge_ionosphere);
+                            edge_delay = next_delay;
+                            edge_ionosphere = next_ionosphere;
+                            let (voltage, real_input, carrier) = if residual_on_ant2 {
+                                (&st.f2, &mut st.f1, d.fr_lo2)
                             } else {
-                                0.0
+                                (&st.f1, &mut st.f2, d.fr_lo1)
                             };
-                            if let Some(fft) = st.line_fft.as_mut().filter(|_| !residual_on_ant2) {
-                                fft.forward(&st.f1, d.fr_lo1, -rate_hz / fs1, &mut st.s1);
-                            } else {
-                                helper1
-                                    .forward_r2c_process_with_scratch(
-                                        &mut st.f1,
-                                        &mut st.s1,
-                                        &mut st.fft_scratch,
+                            real_fft
+                                .forward_r2c_process_with_scratch(
+                                    real_input,
+                                    &mut st.real_spectrum,
+                                    &mut st.fft_scratch,
+                                )
+                                .map_err(|e| {
+                                    format!(
+                                        "{} FFT failed at frame {}: {e}",
+                                        station_names[reference],
+                                        emitted + i
                                     )
-                                    .map_err(|e| {
-                                        format!(
-                                            "{a1_name} FFT failed at frame {}: {e}",
-                                            emitted + i
-                                        )
-                                    })?;
-                            }
-                            if let Some(fft) = st.line_fft.as_mut().filter(|_| residual_on_ant2) {
-                                fft.forward(&st.f2, d.fr_lo2, rate_hz / fs2, &mut st.s2);
+                                })?;
+                            let rotated = st.fringe_fft.forward(
+                                voltage,
+                                carrier,
+                                fringe_cycles * signed_inverse_fft_len,
+                            );
+                            let (s1, s2) = if residual_on_ant2 {
+                                (st.real_spectrum.as_slice(), rotated)
                             } else {
-                                helper2
-                                    .forward_r2c_process_with_scratch(
-                                        &mut st.f2,
-                                        &mut st.s2,
-                                        &mut st.fft_scratch2,
-                                    )
-                                    .map_err(|e| {
-                                        format!(
-                                            "{a2_name} FFT failed at frame {}: {e}",
-                                            emitted + i
-                                        )
-                                    })?;
-                            }
+                                (rotated, st.real_spectrum.as_slice())
+                            };
                             if let Some(t) = timing_fft_start {
                                 st.timing_fft_s += t.elapsed().as_secs_f64();
                             }
                             let timing_accum_start = timing_frame_sampled.then(Instant::now);
-                            let mut fr_mix = if st.line_fft.is_some() {
-                                Complex::new(1.0, 0.0)
-                            } else {
-                                d.fr_lo1 * d.fr_lo2.conj()
-                            };
-                            if let Some(phase) = block_grid_phase {
-                                fr_mix *= phase;
-                            }
-                            if fft_peak_debug {
-                                shift_real_fft_to_xml_grid(
-                                    &st.s1,
-                                    &mut st.g1,
-                                    fft_len1,
+                            if fft_peak_debug && i < fft_peak_dbg_max_frames() {
+                                print_fft_peak_dbg(
+                                    "fft_to_grid",
+                                    i,
+                                    a1_name,
+                                    s1,
+                                    fft_len1 / 2 + 1,
+                                    &grid_map1,
                                     rotation_bins1,
                                 );
-                                shift_real_fft_to_xml_grid(
-                                    &st.s2,
-                                    &mut st.g2,
-                                    fft_len2,
+                                print_fft_peak_dbg(
+                                    "fft_to_grid",
+                                    i,
+                                    a2_name,
+                                    s2,
+                                    fft_len2 / 2 + 1,
+                                    &grid_map2,
                                     rotation_bins2,
                                 );
-
-                                if i < fft_peak_dbg_max_frames() {
-                                    print_fft_peak_dbg(
-                                        "raw_to_grid",
-                                        i,
-                                        a1_name,
-                                        &st.s1,
-                                        &st.g1,
-                                        rotation_bins1,
-                                    );
-                                    print_fft_peak_dbg(
-                                        "raw_to_grid",
-                                        i,
-                                        a2_name,
-                                        &st.s2,
-                                        &st.g2,
-                                        rotation_bins2,
-                                    );
-                                }
                             }
                             if let (Some(rt), Some(fold)) =
                                 (pulsar_runtime.as_ref(), st.fold.as_mut())
@@ -9092,11 +9026,11 @@ fn run_once(
                                 let (mut phase, step) = xcf_frame_phase(d);
                                 for k in 0..overlap_len {
                                     let bin = output_start + k;
-                                    let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, ba.a1s + k);
-                                    let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, ba.a2s + k);
+                                    let z1 = mapped_fft_bin(s1, &grid_map1, ba.a1s + k);
+                                    let z2 = mapped_fft_bin(s2, &grid_map2, ba.a2s + k);
                                     let v = z1
                                         * z2.conj()
-                                        * fr_mix
+                                        * grid_phase
                                         * phase_to_f32(phase * ionosphere_bin_phase(d, bin));
                                     fold.add_values(
                                         common_bin.unwrap_or_else(|| rt.phase_bin(arrival_s, bin)),
@@ -9125,21 +9059,21 @@ fn run_once(
                                         let range = output_start..output_start + overlap_len;
                                         if need_acf_products {
                                             accumulate_direct_acf_xcf(
-                                                &st.s1[src1..src1 + overlap_len],
-                                                &st.s2[src2..src2 + overlap_len],
+                                                &s1[src1..src1 + overlap_len],
+                                                &s2[src2..src2 + overlap_len],
                                                 &mut st.acc_11[range.clone()],
                                                 &mut st.acc_12[range.clone()],
                                                 &mut st.acc_22[range],
-                                                fr_mix,
+                                                grid_phase,
                                                 phase0,
                                                 phase_step,
                                             );
                                         } else {
                                             accumulate_direct_xcf(
-                                                &st.s1[src1..src1 + overlap_len],
-                                                &st.s2[src2..src2 + overlap_len],
+                                                &s1[src1..src1 + overlap_len],
+                                                &s2[src2..src2 + overlap_len],
                                                 &mut st.acc_12[range],
-                                                fr_mix,
+                                                grid_phase,
                                                 phase0,
                                                 phase_step,
                                             );
@@ -9161,8 +9095,8 @@ fn run_once(
                                     let i1 = ba.a1s + k;
                                     let i2 = ba.a2s + k;
                                     let output_bin = output_start + k;
-                                    let z1 = mapped_real_fft_bin(&st.s1, &grid_map1, i1);
-                                    let z2 = mapped_real_fft_bin(&st.s2, &grid_map2, i2);
+                                    let z1 = mapped_fft_bin(s1, &grid_map1, i1);
+                                    let z2 = mapped_fft_bin(s2, &grid_map2, i2);
                                     if need_acf_products {
                                         st.acc_11[output_bin] += z1.norm_sqr() as f64;
                                         st.acc_22[output_bin] += z2.norm_sqr() as f64;
@@ -9171,7 +9105,7 @@ fn run_once(
                                         let raw_xcf = z1 * z2.conj();
                                         let applied_phase =
                                             *pc * ionosphere_bin_phase(d, output_bin);
-                                        let v = raw_xcf * fr_mix * phase_to_f32(applied_phase);
+                                        let v = raw_xcf * grid_phase * phase_to_f32(applied_phase);
                                         maybe_dump_xcf_debug(
                                             args.debug,
                                             emitted + i,
@@ -9180,7 +9114,7 @@ fn run_once(
                                             out_grid,
                                             output_bin,
                                             raw_xcf,
-                                            fr_mix,
+                                            grid_phase,
                                             phase_to_f32(applied_phase),
                                             v,
                                             d,
@@ -9194,15 +9128,15 @@ fn run_once(
                             }
                             if need_acf_products && !args.spectral_line {
                                 let (spectrum, map, accumulator) = match out_grid {
-                                    OutputGrid::Ant1 => (&st.s1, &grid_map1, &mut st.acc_11),
-                                    OutputGrid::Ant2 => (&st.s2, &grid_map2, &mut st.acc_22),
+                                    OutputGrid::Ant1 => (s1, &grid_map1, &mut st.acc_11),
+                                    OutputGrid::Ant2 => (s2, &grid_map2, &mut st.acc_22),
                                 };
                                 for k in 0..output_start {
-                                    let z = mapped_real_fft_bin(spectrum, map, k);
+                                    let z = mapped_fft_bin(spectrum, map, k);
                                     accumulator[k] += z.norm_sqr() as f64;
                                 }
                                 for k in output_start + overlap_len..half {
-                                    let z = mapped_real_fft_bin(spectrum, map, k);
+                                    let z = mapped_fft_bin(spectrum, map, k);
                                     accumulator[k] += z.norm_sqr() as f64;
                                 }
                             }

@@ -302,14 +302,14 @@ pub struct Args {
     #[arg(
         long,
         visible_alias = "maser",
-        help = "Fringe-stop voltages before the FFT for spectral lines on the common measured RF grid"
+        help = "Restrict auto and cross spectra to the common measured RF grid for spectral lines"
     )]
     pub spectral_line: bool,
 
     #[arg(
         long,
         value_name = "HZ",
-        help = "RF for the within-FFT fringe rate; enables spectral-line mode (default: center of the overlap)"
+        help = "RF reference for pre-FFT fringe rotation; enables spectral-line mode (default: center of the overlap)"
     )]
     pub line_frequency_hz: Option<f64>,
 
@@ -564,13 +564,6 @@ pub struct Args {
 
     #[arg(
         long,
-        default_value_t = false,
-        help = "Use PNM06A+GAST, first-order VLBI minus delay and nominal troposphere (overrides model environment variables; EOP unchanged)"
-    )]
-    pub vlbi: bool,
-
-    #[arg(
-        long,
         value_name = "CSV",
         help = "Station TEC/zenith paths/weather CSV; overrides XML atmosphere file/constants"
     )]
@@ -586,7 +579,7 @@ pub struct Args {
     #[arg(
         long,
         value_enum,
-        help = "Troposphere: off, nominal or input (auto: supplied paths/weather, otherwise nominal with --vlbi)"
+        help = "Troposphere: off, nominal or input (auto: supplied paths/weather, otherwise nominal with source and ground-station coordinates)"
     )]
     pub troposphere: Option<crate::atmosphere::TroposphereMode>,
 
@@ -811,11 +804,7 @@ mod tests {
         let default_args = Args::try_parse_from(["yi-corr", "--mkxml"]).unwrap();
         assert!(!default_args.model_diagnostics);
         assert!(!default_args.model_sweep);
-        assert!(!default_args.vlbi);
-        let vlbi =
-            Args::try_parse_from(["yi-corr", "--mkxml", "--vlbi", "--model-diagnostics"]).unwrap();
-        assert!(vlbi.vlbi);
-        assert!(vlbi.model_diagnostics);
+        assert!(Args::try_parse_from(["yi-corr", "--mkxml", "--vlbi"]).is_err());
 
         let diagnostic =
             Args::try_parse_from(["yi-corr", "--mkxml", "--model-diagnostics"]).unwrap();

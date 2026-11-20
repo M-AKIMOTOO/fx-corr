@@ -932,7 +932,7 @@ yi-corr --sc maser.xml --raw raw --cor cor/maser --maser --fft 1048576 \
 
 局名に依存した周波数補正は廃止した。従来の `YI_ANT2_GRID_OFFSET` が非ゼロなら処理開始時にエラーを返す。メーザーモードではRF原点が共通グリッドの整数ビンに一致することも検査する。端数が残る場合は、実際の局設定を保ったまま、その周波数差を表現できるFFT長を選ぶ。以下に残した3.0.1・3.0.2のHITACH32の補正値は当時の比較記録である。
 
-フリンジ回転は整数サンプル遅延をそろえた後、FFTの前に行う。追尾する局の電圧に各サンプル時刻の複素位相を掛け、FFT後に残りの端数サンプル遅延をチャネルごとの位相勾配で補正する。各FFT内では幾何遅延と局時計を含む基線遅延の変化を線形近似する。`--line-frequency-hz` には狙う線の観測RFをHzで指定する。この値がFFT内の回転速度を決める。省略時は両局の共通帯域の中心を使う。出力の周波数軸はどちらの場合もXMLの観測周波数設定で決まる。
+FFT前のフリンジ回転は `yi-corr` の全相関に共通する。`--line-frequency-hz` には狙う線の観測RFをHzで指定する。この値がFFT内の回転速度を決める。省略時は両局の共通帯域の中心を使う。出力の周波数軸はXMLの観測周波数設定で決まる。
 
 G9.62（2025/302 07:00:00、山口32 m–日立32 m）のRAWを1048576点FFT、0.999424秒 × 5積分で再処理した。局別ビン補正をゼロにしたFFT後回転と比較すると、線の周辺（ビン69840–69889）の相互相関ピーク振幅は各積分で4.09–5.18倍になった。両局の自己相関ピークは5積分中4積分で同じビンに入り、残る1積分は隣接ビンだった。観測XMLは保存済みの相関ヘッダーと記録形式から復元し、地球姿勢パラメータには既定値を使用した。
 
@@ -1025,10 +1025,20 @@ Model diagnostics:
 
 ### Delay Compensation Model
 
-`yi-corr` applies delay correction in two parts for each FFT frame:
+`yi-corr` uses the same delay and fringe tracking for continuum, maser,
+pulsar folding and FRB time windows, for both short and long baselines.
 
 1. Integer-sample shift in time domain
-2. Fractional-sample phase rotation in frequency domain
+2. Complex fringe rotation of the tracked voltage before the FFT
+3. Fractional-sample phase correction in frequency domain
+
+The fringe oscillator uses the frame midpoint for its carrier phase and the
+change in modeled baseline delay across the frame for its rate. The other
+station is the time and frequency reference. The rate is fitted at the center
+of the common RF band or at the specified line frequency. A channel with RF
+offset `Δf` from that reference retains approximately `Δf × delay_rate × FFT_duration`
+cycles of phase change within the FFT. This limits the FFT duration for very wide
+bands at large delay rates.
 
 Per frame, total delay is evaluated at frame midpoint (`t_mid`) from geometric/clock/residual terms:
 
@@ -2129,11 +2139,11 @@ frequency grid. In normal `<rotation>` mode, XCF integration uses only XML-grid
 bins where both antennas have real observed signal after the shift. The `.cor`
 header observing frequency remains the XML `<frequency>` value.
 
-`<rotation2>` is an explicit opt-in for the old Hermitian-completion behavior.
-When `<rotation2>` is present in a station `<special>` block, its value is used
-as that station rotation and missing image-band bins may be reconstructed from
-real-FFT Hermitian symmetry. Use `<rotation2>` only for validation cases where
-that image-band correlation is intentionally desired.
+`<rotation2>` opts into image-band correlation for validation. When present in
+a station `<special>` block, its value sets that station's rotation. For the
+station fringe-rotated by `yi-corr`, image bins are read from the negative
+frequencies of the complex FFT. A real FFT supplies image bins by Hermitian
+symmetry.
 
 #### Rotation has two roles
 
@@ -2295,37 +2305,29 @@ Source RA/Dec in XML are treated as J2000 catalog coordinates. The `.cor`
 header keeps these original J2000 values so downstream tools report the same
 catalog position as GICO3/frinZ.
 
-For geometric delay tracking, the internal model currently precesses the J2000
-coordinates to the observation date before evaluating geometric delay/rate. A
-fixed-J2000 delay-model trial in `2.0.9` caused severe decorrelation on
-YAMAGU32/USUDA64 validation data and was reverted in `2.0.10`.
-
-```text
-XML/header coordinates: J2000 catalog RA/Dec
-Delay-model coordinates: precessed-to-date RA/Dec
-```
+For geometric delay tracking, the default coordinate transform uses PNM06A
+and GAST at the observation epoch with the configured Earth orientation
+parameters.
 
 ### Geometric-model diagnostics and unattended sweep
 
-`--vlbi` selects `pnm-gast` and the existing first-order `vlbi-minus` delay model.
-It overrides `YI_SOURCE_VECTOR_MODE` and `YI_GEOM_DELAY_MODE`. With this preset
-the troposphere model defaults to nominal when no atmospheric input or explicit
-troposphere setting is supplied. Integer alignment precedes the FFT and
-fractional delay correction follows it.
-The default continuum path applies the carrier phase after the FFT. Add
-`--maser` to apply a time-dependent complex fringe rotation before the FFT.
-
-For a controlled comparison, use the same schedule and separate output directories:
+PNM06A+GAST (`pnm-gast`), the first-order `vlbi-minus` delay model and nominal
+troposphere are the defaults for both short and long baselines. Nominal
+troposphere requires a source position and Earth-surface station coordinates.
+Supplied weather, zenith delays or an explicit troposphere setting take priority.
+Remove `--vlbi` from existing commands. For controlled comparisons,
+`YI_SOURCE_VECTOR_MODE` and `YI_GEOM_DELAY_MODE` select alternative geometric
+models.
 
 ```bash
 env -u YI_SOURCE_VECTOR_MODE -u YI_GEOM_DELAY_MODE yi-corr --sc test.xml --raw ../raw --cor cor_default --cpu 15 --stdout
-yi-corr --sc test.xml --raw ../raw --cor cor_vlbi --cpu 15 --stdout --vlbi --model-diagnostics
+YI_SOURCE_VECTOR_MODE=mean-gast YI_GEOM_DELAY_MODE=anchored yi-corr --sc test.xml --raw ../raw --cor cor_anchored --cpu 15 --stdout --model-diagnostics
 ```
 
 Repeat for the 110 m and 870 km datasets using their respective schedules.
 Compare amplitude, residual delay/rate, and unwrapped phase with independently
-fitted rate/acceleration for each result. `--model-sweep --vlbi` keeps the preset
-for the active case only; fixed sweep cases retain their specified models.
+fitted rate/acceleration for each result. The active sweep case uses the
+caller's model settings. The other cases select their models explicitly.
 
 
 `--model-diagnostics` diagnoses a curved residual delay or fringe phase without
@@ -2455,10 +2457,10 @@ sector count, and artifact fingerprint must still match its marker. A Unix
 `flock` inherited by the active child prevents overlapping sweeps even if the
 parent is terminated.
 
-These diagnostics alone do not select propagation or station-deformation corrections.
-Troposphere and first-order ionosphere can be selected using
-the [atmosphere inputs](docs/atmosphere.md); `--vlbi` retains nominal troposphere
-when no measured neutral-atmosphere input is supplied. Geometric variant
+The correlation uses nominal troposphere when source and ground-station
+coordinates are available and no measured or explicit setting is supplied.
+Configure measured troposphere and first-order ionosphere using the
+[atmosphere inputs](docs/atmosphere.md). Geometric variant
 comparisons exclude atmosphere, while applied group delays include enabled
 corrections. `yi-corr` currently does **not** model solid-Earth tide, ocean loading, pole tide, station velocity, antenna axis
 offset, or gravitational delay. A changing differential tropospheric slant

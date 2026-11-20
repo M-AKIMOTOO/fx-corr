@@ -172,7 +172,6 @@ fn maser_line_uses_the_measured_rf_grid_for_either_station_order() {
     let reference_hz = 100_000_000.0;
     let fs_hz = 1_000_000.0;
     let df = fs_hz / 1024.0;
-    let line_hz = reference_hz + 73.0 * df;
     let levels = (0..256)
         .map(|i| (i as f64 - 127.5).to_string())
         .collect::<Vec<_>>()
@@ -187,6 +186,10 @@ fn maser_line_uses_the_measured_rf_grid_for_either_station_order() {
         (1, 1024, ["YAMAGU32", "HITACH32"], [0., 3. * df]),
         (2, 2048, ["HITACH32", "YAMAGU32"], [3. * df, 0.]),
     ] {
+        // The default reference is the center of the common band. The line
+        // cases deliberately choose a different frequency and LO origins.
+        let line_bin = if case == 0 { 256.0 } else { 73.0 };
+        let line_hz = reference_hz + line_bin * df;
         write_schedule(&schedule, names[0], names[1]);
         let xml = fs::read_to_string(&schedule).unwrap()
             .replace("<speed>8192</speed>", "<speed>1000000</speed>")
@@ -198,11 +201,7 @@ fn maser_line_uses_the_measured_rf_grid_for_either_station_order() {
             let lsb = names[i] == "HITACH32";
             // An independent clock stretches the recorded tone by 1.25
             // reference channels per FFT (2.5 at the longer FFT length).
-            let rate = if case != 0 && lsb {
-                1.25 * df / line_hz
-            } else {
-                0.0
-            };
+            let rate = if lsb { 1.25 * df / line_hz } else { 0.0 };
             xml = xml.replace(
                 &format!("<clock key=\"{key}\"><delay>0</delay><rate>0"),
                 &format!("<clock key=\"{key}\"><delay>0</delay><rate>{rate:.17e}"),
@@ -246,7 +245,7 @@ fn maser_line_uses_the_measured_rf_grid_for_either_station_order() {
             ])
             .env_remove("YI_ANT2_GRID_OFFSET")
             .env("YI_EOP_MODE", "none");
-        // The default path also has to be independent of station name.
+        // The default path must also correct the clock-induced frequency shift.
         if case != 0 {
             if case == 1 {
                 command.arg("--maser");
@@ -259,6 +258,7 @@ fn maser_line_uses_the_measured_rf_grid_for_either_station_order() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("pre-FFT complex fringe rotation"));
         let mut products = 0;
         for file in fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
             if file.extension().and_then(|s| s.to_str()) != Some("cor") {
@@ -372,9 +372,8 @@ fn ionosphere_corrects_injected_dispersive_voltage_without_changing_frequency_bi
             let sample_count = if tec_rate == 0.0 { nfft } else { nfft * 128 };
             let frame: Vec<u8> = (0..sample_count)
                 .map(|sample| {
-                    let frame_mid_s =
-                        (sample / nfft) as f64 * nfft as f64 / fs_hz + 0.5 * nfft as f64 / fs_hz;
-                    let d = d + 40.3e16 / 299_792_458.0 * tec_rate * frame_mid_s;
+                    let sample_s = sample as f64 / fs_hz;
+                    let d = d + 40.3e16 / 299_792_458.0 * tec_rate * sample_s;
                     let mut value = 0.0;
                     for (j, &bin) in tones.iter().enumerate() {
                         let f = rf_hz + bin as f64 * fs_hz / nfft as f64;
@@ -467,7 +466,16 @@ fn ionosphere_corrects_injected_dispersive_voltage_without_changing_frequency_bi
                 let start = 256 + 128 + bin * 8;
                 let re = f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as f64;
                 let im = f32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap()) as f64;
-                assert!(re.hypot(im) > 1e-8, "tone disappeared from bin {bin}");
+                let amplitude = re.hypot(im);
+                if mode == "off" {
+                    assert!(amplitude > 1e-8, "tone disappeared from bin {bin}");
+                } else {
+                    let expected = 8.0_f64.powi(2) / (2.0 * (256.0_f64.powi(2) - 1.0) / 12.0);
+                    assert!(
+                        (amplitude / expected - 1.0).abs() < 0.08,
+                        "case={case} {mode} bin={bin} amplitude {amplitude} expected {expected}"
+                    );
+                }
                 phases.push(im.atan2(re));
             }
             if mode == "off" {
@@ -482,13 +490,16 @@ fn ionosphere_corrects_injected_dispersive_voltage_without_changing_frequency_bi
                 );
                 if mode == "on" {
                     corrected = phases;
-                } else {
+                } else if !phased || tec_rate == 0.0 {
+                    // The synthesis diagnostics share the same midpoint phase
+                    // for constant TEC. With changing TEC they and yi-corr
+                    // are independently checked against the injected voltage.
                     assert!(
                         phases
                             .iter()
                             .zip(&corrected)
                             .all(|(a, b)| (a - b).abs() < 1e-6),
-                        "phased/mapped correction diverged"
+                        "case={case} {mode} differs from direct correlation: {phases:?} vs {corrected:?}"
                     );
                 }
             }
@@ -2068,7 +2079,7 @@ fn reused_workers_preserve_rotated_mixed_bit_products() {
 }
 
 #[test]
-fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
+fn short_and_long_baselines_use_the_same_default_delay_model() {
     let root = unique_temp_dir();
     let raw_dir = root.join("raw");
     fs::create_dir_all(&raw_dir).unwrap();
@@ -2102,7 +2113,7 @@ fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
         )
         .unwrap();
         let mut products = Vec::new();
-        for run in 0..5 {
+        for run in 0..4 {
             let out = root.join(format!("{baseline}-{run}"));
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
             cmd.args([
@@ -2119,20 +2130,15 @@ fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
             .env_remove("YI_GEOM_DELAY_MODE")
             .env("YI_EOP_MODE", "none");
             if run == 1 {
-                cmd.env("YI_SOURCE_VECTOR_MODE", "mean-gast")
-                    .env("YI_GEOM_DELAY_MODE", "anchored");
+                cmd.env("YI_SOURCE_VECTOR_MODE", "pnm-gast")
+                    .env("YI_GEOM_DELAY_MODE", "vlbi-minus")
+                    .args(["--troposphere", "nominal"]);
             }
             if run == 2 {
-                cmd.env("YI_SOURCE_VECTOR_MODE", "pnm-gast")
-                    .env("YI_GEOM_DELAY_MODE", "vlbi-minus");
+                cmd.args(["--troposphere", "off"]);
             }
             if run == 3 {
-                cmd.arg("--vlbi")
-                    .env("YI_SOURCE_VECTOR_MODE", "mean-gast")
-                    .env("YI_GEOM_DELAY_MODE", "vlbi-plus");
-            }
-            if run == 4 {
-                cmd.arg("--vlbi");
+                cmd.env("YI_GEOM_DELAY_MODE", "vlbi-plus");
             }
             let result = cmd.output().unwrap();
             assert!(
@@ -2140,14 +2146,15 @@ fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
                 "{}",
                 String::from_utf8_lossy(&result.stderr)
             );
-            if run == 3 {
+            if run == 0 {
                 let paths = corr_info_paths(&out);
                 assert_eq!(paths.len(), 1);
                 let info = read_corr_info(&paths[0]);
-                assert!(info.contains("VLBI preset:"));
-                assert!(info.contains("VLBI atmosphere: nominal troposphere enabled"));
-                assert!(String::from_utf8_lossy(&result.stdout)
-                    .contains("atmosphere=nominal-troposphere"));
+                assert!(info.contains("Nominal troposphere enabled"));
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                assert!(stdout.contains("J2000 vector + PNM06A + GAST"));
+                assert!(stdout.contains("tau*(1-V.s/c) - V.b/c^2"));
+                assert!(stdout.contains("atmosphere=nominal-troposphere"));
             }
             let files: std::collections::BTreeMap<_, _> = fs::read_dir(&out)
                 .unwrap()
@@ -2160,19 +2167,15 @@ fn vlbi_flag_overrides_model_env_and_applies_troposphere() {
         }
         assert_eq!(
             products[0], products[1],
-            "legacy defaults changed: {baseline}"
+            "default differs from explicitly selecting PNM06A, first-order VLBI minus and nominal troposphere: {baseline}"
         );
         assert_ne!(
-            products[2], products[3],
-            "VLBI troposphere did not affect the model: {baseline}"
-        );
-        assert_eq!(
-            products[3], products[4],
-            "VLBI preset did not override conflicting environment models: {baseline}"
+            products[0], products[2],
+            "nominal troposphere did not affect the model: {baseline}"
         );
         assert_ne!(
             products[0], products[3],
-            "model switch had no effect: {baseline}"
+            "explicit delay model override had no effect: {baseline}"
         );
     }
     fs::remove_dir_all(root).unwrap();

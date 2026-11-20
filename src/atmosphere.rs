@@ -458,7 +458,7 @@ impl AtmosphereRuntime {
         config: &AtmosphereConfig,
         keys: [String; 2],
         xyz: [[f64; 3]; 2],
-        vlbi: bool,
+        has_source_geometry: bool,
     ) -> Result<Self, DynError> {
         let (stations, input_label) = if let Some(path) = config.file.as_ref() {
             let all = read_csv(path)?;
@@ -482,6 +482,9 @@ impl AtmosphereRuntime {
                 .map(|s| s.values_at(0.0))
                 .unwrap_or_default()
         };
+        let earth_surface_stations = xyz
+            .iter()
+            .all(|p| (6.0e6..7.0e6).contains(&p[0].hypot(p[1]).hypot(p[2])));
         let ionosphere = config.ionosphere.unwrap_or_else(|| {
             if (0..2).any(|i| first(i).has_tec()) {
                 IonosphereMode::Input
@@ -492,7 +495,7 @@ impl AtmosphereRuntime {
         let troposphere = config.troposphere.unwrap_or_else(|| {
             if (0..2).any(|i| first(i).has_trop()) {
                 TroposphereMode::Input
-            } else if vlbi {
+            } else if has_source_geometry && earth_surface_stations {
                 TroposphereMode::Nominal
             } else {
                 TroposphereMode::Off
@@ -524,11 +527,9 @@ impl AtmosphereRuntime {
             sites: xyz.map(Site::from_ecef),
             stations,
         };
-        if runtime.needs_elevation()
-            && xyz.iter().any(|p| {
-                let radius = p[0].hypot(p[1]).hypot(p[2]);
-                !radius.is_finite() || !(6.0e6..7.0e6).contains(&radius)
-            })
+        if !earth_surface_stations
+            && (runtime.needs_elevation()
+                || (has_source_geometry && troposphere == TroposphereMode::Nominal))
         {
             return Err("VTEC/troposphere mapping requires finite Earth-surface station ECEF coordinates in metres".into());
         }
@@ -792,6 +793,26 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn automatic_nominal_troposphere_needs_source_and_ground_station_coordinates() {
+        let ground = [[6_378_137.0, 0.0, 0.0]; 2];
+        let relative = [[0.0, 0.0, 0.0], [110.0, 0.0, 0.0]];
+        for (xyz, has_source, expected) in [
+            (ground, true, TroposphereMode::Nominal),
+            (ground, false, TroposphereMode::Off),
+            (relative, true, TroposphereMode::Off),
+        ] {
+            let runtime = AtmosphereRuntime::new(
+                &AtmosphereConfig::default(),
+                ["A".into(), "B".into()],
+                xyz,
+                has_source,
+            )
+            .unwrap();
+            assert_eq!(runtime.troposphere, expected);
+        }
     }
 
     #[test]

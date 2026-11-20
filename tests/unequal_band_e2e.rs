@@ -65,6 +65,7 @@ fn native_1024_and_32_msps_correlate_only_the_contained_16_mhz() {
         (2, false, 496.0, ["LSB", "LSB"], 8),
         (3, false, 8.0, ["USB", "LSB"], 2),
         (4, true, 8.0, ["USB", "LSB"], 8),
+        (5, true, 8.0, ["LSB", "USB"], 8),
     ] {
         let rates = if wide_first {
             [wide_fs, narrow_fs]
@@ -76,9 +77,22 @@ fn native_1024_and_32_msps_correlate_only_the_contained_16_mhz() {
         } else {
             [offset_mhz * 1e6, 0.0]
         };
-        let delay = if wide_first { 3.25e-9 } else { -2.75e-9 };
         let tones: &[usize] = if bits == 2 { &[23] } else { &[5, 23, 71, 117] };
         let output_low = 6600e6 + offset_mhz * 1e6;
+        // Track the wide station at its native rate in case 5. A drift of
+        // 1.25 channels at the common band's center decorrelates without pre-FFT rotation.
+        let delays = if case == 5 {
+            [3.25e-9, 0.0]
+        } else if wide_first {
+            [0.0, 3.25e-9]
+        } else {
+            [0.0, -2.75e-9]
+        };
+        let rate = if case == 5 {
+            1.25 * df / (output_low + narrow_fs / 4.0)
+        } else {
+            0.0
+        };
         let levels = if bits == 8 {
             (0..256)
                 .map(|i| (i as f64 - 127.5).to_string())
@@ -99,8 +113,8 @@ fn native_1024_and_32_msps_correlate_only_the_contained_16_mhz() {
             r#"<schedule>
 {}
 {}
-<clock key="A"><delay>0</delay><rate>0</rate></clock>
-<clock key="B"><delay>{delay:.17e}</delay><rate>0</rate></clock>
+<clock key="A"><delay>{:.17e}</delay><rate>{rate:.17e}</rate></clock>
+<clock key="B"><delay>{:.17e}</delay><rate>0</rate></clock>
 <terminal name="t1"><speed>{}</speed><bit>{bits}</bit><level>{levels}</level></terminal>
 <terminal name="t2"><speed>{}</speed><bit>{bits}</bit><level>{levels}</level></terminal>
 <shuffle key="A">{shuffle}</shuffle><shuffle key="B">{shuffle}</shuffle>
@@ -113,6 +127,8 @@ fn native_1024_and_32_msps_correlate_only_the_contained_16_mhz() {
 </schedule>"#,
             station("A", "ANT1", "t1"),
             station("B", "ANT2", "t2"),
+            delays[0],
+            delays[1],
             rates[0],
             rates[1],
             rotations[0],
@@ -142,8 +158,8 @@ fn native_1024_and_32_msps_correlate_only_the_contained_16_mhz() {
                 for (j, &bin) in tones.iter().enumerate() {
                     let rf = output_low + bin as f64 * df;
                     let baseband = rf - (6600e6 + rotations[ant]);
-                    let phase = TAU * baseband * t + j as f64 * 0.27
-                        - if ant == 1 { TAU * rf * delay } else { 0.0 }
+                    let station_delay = delays[ant] + if ant == 0 { rate * t } else { 0.0 };
+                    let phase = TAU * baseband * t + j as f64 * 0.27 - TAU * rf * station_delay
                         + if ant == 1 && case == 4 {
                             TAU * (40.3e16 / 299_792_458.0) / rf
                         } else {

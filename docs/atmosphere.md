@@ -4,10 +4,10 @@
 
 ```bash
 target/release/yi-corr --sc observation.xml --raw /observations/raw --cor cor \
-  --vlbi --atmosphere-file atmosphere.csv
+  --atmosphere-file atmosphere.csv
 ```
 
-`--vlbi` は従来どおり PNM06A+GAST、VLBI minus、標準大気の対流圏を選ぶ。入力された天頂遅延・気象値があれば標準大気を置き換え、TEC があれば電離層を有効にする。入力・明示指定がない場合は従来と同じ計算になる。
+短基線と長基線に同じ既定の遅延モデル（PNM06A+GAST、一次の VLBI minus）を使う。天体座標と地表の局の ECEF 座標があるときは公称対流圏モデルを使い、天頂遅延・気象値を与えると測定値に基づく補正に切り替わる。TEC があれば電離層補正を有効にする。
 
 ## 入力
 
@@ -64,7 +64,7 @@ XML のファイル参照は XML 所在ディレクトリ基準、CLI のファ�
 |---|---|
 | `--atmosphere-file CSV` | ファイルと局内定数を置き換える |
 | `--ionosphere off\|input` | 未指定なら TEC 入力時に有効 |
-| `--troposphere off\|nominal\|input` | 未指定なら気象・天頂遅延を優先し、なければ `--vlbi` の標準大気 |
+| `--troposphere off\|nominal\|input` | 未指定なら気象・天頂遅延を優先し、入力がなく天体座標と地表の局座標がある場合は公称対流圏を使用 |
 | `--ionosphere-shell-height-km KM` | VTEC 用の薄層高度、既定450 km |
 | `--atmosphere-min-elevation-deg DEG` | VTEC/Niell の仰角下限、既定5°、指定可能3–90° |
 

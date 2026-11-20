@@ -135,21 +135,6 @@ fn forwarded_arguments() -> Vec<OsString> {
     forwarded_arguments_from(std::env::args_os().skip(1))
 }
 
-// Preserve the preset only for the caller's active model, not fixed sweep cases.
-fn case_arguments(forwarded: &[OsString], case: &SweepCase) -> Vec<OsString> {
-    forwarded
-        .iter()
-        .filter(|argument| {
-            if case.source_mode.is_none() {
-                return true;
-            }
-            let text = argument.to_string_lossy();
-            !split_long_option(&text).is_some_and(|(name, _)| inferred_long_match(name, &["vlbi"]))
-        })
-        .cloned()
-        .collect()
-}
-
 fn configure_case(command: &mut Command, case: SweepCase) {
     command.env(SWEEP_CHILD_ENV, "1");
     if let Some(source_mode) = case.source_mode {
@@ -1085,7 +1070,7 @@ pub(crate) fn run_unattended_model_sweep(args: &Args) -> Result<(), DynError> {
 
         let mut command = Command::new(&executable);
         command
-            .args(case_arguments(&forwarded, &case))
+            .args(&forwarded)
             .arg("--cor-directory")
             .arg(&output_dir)
             .arg("--model-diagnostics")
@@ -1342,20 +1327,6 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn vlbi_preset_only_applies_to_active_sweep_case() {
-        for flag in ["--vlbi", "--vl"] {
-            let input = strings(&["--sc", "test.xml", flag, "--cpu", "8"]);
-            assert_eq!(super::case_arguments(&input, &super::CASES[0]), input);
-            for case in &super::CASES[1..] {
-                assert_eq!(
-                    super::case_arguments(&input, case),
-                    strings(&["--sc", "test.xml", "--cpu", "8"])
-                );
-            }
-        }
     }
 
     #[test]

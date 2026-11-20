@@ -40,19 +40,43 @@ impl FringeFft {
         samples: &[f32],
         midpoint: Complex<f32>,
         cycles_per_sample: f64,
-        out: &mut [Complex<f32>],
-    ) {
-        let angle = std::f64::consts::TAU * cycles_per_sample;
-        let step = Complex::from_polar(1.0, angle);
-        let mut phase = Complex::new(midpoint.re as f64, midpoint.im as f64)
-            * Complex::from_polar(1.0, -0.5 * samples.len() as f64 * angle);
-        for (z, &sample) in self.voltage.iter_mut().zip(samples) {
-            *z = Complex::new(phase.re as f32 * sample, phase.im as f32 * sample);
-            phase *= step;
+    ) -> &[Complex<f32>] {
+        debug_assert_eq!(samples.len(), self.voltage.len());
+        if cycles_per_sample == 0.0 {
+            for (z, &sample) in self.voltage.iter_mut().zip(samples) {
+                *z = midpoint * sample;
+            }
+        } else {
+            const LANES: usize = 4;
+            let angle = std::f64::consts::TAU * cycles_per_sample;
+            let center = 0.5 * samples.len() as f64;
+            let midpoint = Complex::new(midpoint.re as f64, midpoint.im as f64);
+            // Advance four independent phase values so consecutive samples
+            // do not depend on a single chain of complex multiplies.
+            let mut phases: [_; LANES] = std::array::from_fn(|lane| {
+                midpoint * Complex::from_polar(1.0, (lane as f64 - center) * angle)
+            });
+            let step = Complex::from_polar(1.0, LANES as f64 * angle);
+            let mut output = self.voltage.chunks_exact_mut(LANES);
+            let mut input = samples.chunks_exact(LANES);
+            for (output, input) in output.by_ref().zip(input.by_ref()) {
+                for ((z, &sample), phase) in output.iter_mut().zip(input).zip(&mut phases) {
+                    *z = Complex::new(phase.re as f32 * sample, phase.im as f32 * sample);
+                    *phase *= step;
+                }
+            }
+            for ((z, &sample), phase) in output
+                .into_remainder()
+                .iter_mut()
+                .zip(input.remainder())
+                .zip(phases)
+            {
+                *z = Complex::new(phase.re as f32 * sample, phase.im as f32 * sample);
+            }
         }
         self.plan
             .process_with_scratch(&mut self.voltage, &mut self.scratch);
-        out.copy_from_slice(&self.voltage[..out.len()]);
+        &self.voltage
     }
 }
 
