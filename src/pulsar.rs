@@ -1,7 +1,7 @@
 use num_complex::Complex;
 use roxmltree::Node;
 
-use crate::geom;
+use crate::cor::epoch_seconds_parts;
 use crate::utils::DynError;
 
 const DM_DELAY_S_MHZ: f64 = 4.148_808e3;
@@ -23,9 +23,7 @@ pub struct PulsarConfig {
 pub struct PulsarRuntime {
     cfg: PulsarConfig,
     phase_epoch_offset_s: f64,
-    obs_mhz: f64,
-    df_mhz: f64,
-    ref_mhz: f64,
+    dispersion_delays_s: Vec<f64>,
 }
 
 pub struct FoldAccum {
@@ -113,6 +111,9 @@ pub fn parse_xml_node(node: Option<Node<'_, '_>>) -> Result<Option<PulsarConfig>
             .unwrap_or("topocentric")
             .to_ascii_lowercase(),
     };
+    if !cfg.dm.is_finite() || !cfg.pdot.is_finite() || !cfg.pddot.is_finite() {
+        return Err("pulsar dm, pdot and pddot must be finite".into());
+    }
     if cfg.time_correction != "topocentric" {
         return Err(format!(
             "pulsar/time-correction='{}' is reserved for future use; only topocentric is implemented",
@@ -132,18 +133,30 @@ impl PulsarRuntime {
         nfreq: usize,
     ) -> Result<Self, DynError> {
         let phase_epoch_offset_s = if let Some(epoch) = cfg.epoch.as_deref() {
-            let process_mjd = geom::parse_epoch_to_mjd(process_epoch)?;
-            let pulse_mjd = geom::parse_epoch_to_mjd(epoch)?;
-            (process_mjd - pulse_mjd) * 86400.0
+            let (process_s, process_frac) = epoch_seconds_parts(process_epoch)?;
+            let (pulse_s, pulse_frac) = epoch_seconds_parts(epoch)?;
+            (process_s - pulse_s) as f64 + (process_frac - pulse_frac)
         } else {
             0.0
         };
+        let mut dispersion_delays_s = Vec::new();
+        if cfg.dedisperse && cfg.dm != 0.0 {
+            let df_mhz = df_hz / 1e6;
+            let ref_mhz = obs_mhz + nfreq.saturating_sub(1) as f64 * df_mhz;
+            if obs_mhz <= 0.0 || !ref_mhz.is_finite() || ref_mhz <= 0.0 {
+                return Err("pulsar dedispersion requires positive RF frequencies".into());
+            }
+            dispersion_delays_s = (0..nfreq)
+                .map(|k| {
+                    let f = obs_mhz + k as f64 * df_mhz;
+                    DM_DELAY_S_MHZ * cfg.dm * (1.0 / (f * f) - 1.0 / (ref_mhz * ref_mhz))
+                })
+                .collect();
+        }
         Ok(Self {
             cfg,
             phase_epoch_offset_s,
-            obs_mhz,
-            df_mhz: df_hz / 1.0e6,
-            ref_mhz: obs_mhz + (nfreq.saturating_sub(1) as f64) * df_hz / 1.0e6,
+            dispersion_delays_s,
         })
     }
 
@@ -155,18 +168,19 @@ impl PulsarRuntime {
         self.cfg.bins
     }
 
-    pub fn phase_bin(&self, t_since_process_s: f64, freq_bin: usize) -> usize {
-        let mut dt = self.phase_epoch_offset_s + t_since_process_s;
-        if self.cfg.dedisperse && self.cfg.dm != 0.0 {
-            let f_mhz = self.obs_mhz + freq_bin as f64 * self.df_mhz;
-            if f_mhz > 0.0 && self.ref_mhz > 0.0 {
-                let delay_s = DM_DELAY_S_MHZ
-                    * self.cfg.dm
-                    * (1.0 / (f_mhz * f_mhz) - 1.0 / (self.ref_mhz * self.ref_mhz));
-                dt -= delay_s;
-            }
-        }
+    pub fn common_phase_bin(&self, elapsed_s: f64) -> Option<usize> {
+        self.dispersion_delays_s
+            .is_empty()
+            .then(|| self.phase_bin(elapsed_s, 0))
+    }
 
+    pub fn phase_bin(&self, t_since_process_s: f64, freq_bin: usize) -> usize {
+        let dt = self.phase_epoch_offset_s + t_since_process_s
+            - self
+                .dispersion_delays_s
+                .get(freq_bin)
+                .copied()
+                .unwrap_or(0.0);
         let p = self.cfg.period_s;
         let f0 = 1.0 / p;
         let fdot = -self.cfg.pdot / (p * p);
@@ -196,8 +210,7 @@ impl FoldAccum {
 
     pub fn add_values(
         &mut self,
-        runtime: &PulsarRuntime,
-        t_since_process_s: f64,
+        bin: usize,
         freq_bin: usize,
         phased: Option<f64>,
         p11: f64,
@@ -207,7 +220,6 @@ impl FoldAccum {
         if freq_bin >= self.nfreq {
             return;
         }
-        let bin = runtime.phase_bin(t_since_process_s, freq_bin);
         if self.want_phased {
             if let Some(v) = phased {
                 self.phased[bin][freq_bin] += v;

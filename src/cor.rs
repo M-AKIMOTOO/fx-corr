@@ -15,13 +15,6 @@ const ST_TIME_OFFSET: usize = 0;
 const ST_NSEC_OFFSET: usize = 4;
 const ET_TIME_OFFSET: usize = 8;
 const ET_NSEC_OFFSET: usize = 12;
-const GEO1_SEC_OFFSET: usize = 16;
-const GEO2_SEC_OFFSET: usize = 64;
-const AMP0_OFFSET: usize = 116;
-const AMP1_OFFSET: usize = 120;
-const PHS0_OFFSET: usize = 124;
-const PHS1_OFFSET: usize = 126;
-
 #[derive(Clone, Copy, Debug)]
 pub struct CorStation<'a> {
     pub name: &'a str,
@@ -39,25 +32,6 @@ pub struct CorHeaderConfig {
     pub source_name: String,
     pub source_ra_rad: f64,
     pub source_dec_rad: f64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CorClockModel {
-    pub sec: u32,
-    pub nsec: u32,
-    pub delay: f64,
-    pub rate: f64,
-    pub acel: f64,
-    pub jerk: f64,
-    pub snap: f64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CorSectorModel {
-    pub station1: CorClockModel,
-    pub station2: CorClockModel,
-    pub amp: [f32; 2],
-    pub phs: [i16; 2],
 }
 
 pub struct CorWriter {
@@ -91,12 +65,6 @@ fn write_f64_le(buf: &mut [u8], offset: usize, value: f64) {
     }
 }
 
-fn write_i16_le(buf: &mut [u8], offset: usize, value: i16) {
-    if offset + 2 <= buf.len() {
-        buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-    }
-}
-
 fn write_fixed_ascii(buf: &mut [u8], offset: usize, len: usize, value: &str) {
     if offset + len > buf.len() {
         return;
@@ -113,40 +81,15 @@ fn split_sec_nsec(unix_sec: i64, extra_sec: f64) -> Result<(u32, u32), DynError>
         return Err("non-finite sector time offset".into());
     }
 
-    let mut sec = unix_sec as f64 + extra_sec;
-    let mut nsec = sec.fract() * 1_000_000_000.0;
-    sec = sec.floor();
-
-    if nsec < 0.0 {
-        nsec += 1_000_000_000.0;
-        sec -= 1.0;
-    } else if nsec >= 1_000_000_000.0 {
-        nsec -= 1_000_000_000.0;
-        sec += 1.0;
-    }
-
-    let sec_i64 = sec as i64;
-    let nsec_u32 = nsec.round() as i64;
-    let (sec_i64, nsec_u32) = if nsec_u32 >= 1_000_000_000 {
-        (sec_i64 + 1, 0)
-    } else {
-        (sec_i64, nsec_u32)
-    };
-    let sec_u32 =
-        u32::try_from(sec_i64).map_err(|_| "sector sec out of u32 range for .cor sector header")?;
-    let nsec_u32 = u32::try_from(nsec_u32)
-        .map_err(|_| "sector nsec out of u32 range for .cor sector header")?;
-    Ok((sec_u32, nsec_u32))
-}
-
-fn write_clock_model(buf: &mut [u8], base_offset: usize, model: &CorClockModel) {
-    write_u32_le(buf, base_offset, model.sec);
-    write_u32_le(buf, base_offset + 4, model.nsec);
-    write_f64_le(buf, base_offset + 8, model.delay);
-    write_f64_le(buf, base_offset + 16, model.rate);
-    write_f64_le(buf, base_offset + 24, model.acel);
-    write_f64_le(buf, base_offset + 32, model.jerk);
-    write_f64_le(buf, base_offset + 40, model.snap);
+    // Adding a small offset to a present-day Unix timestamp loses hundreds of ns.
+    let whole = extra_sec.floor();
+    let ns = ((extra_sec - whole) * 1_000_000_000.0).round() as u32;
+    let sec = (whole as i128)
+        .checked_add(i128::from(unix_sec))
+        .and_then(|s| s.checked_add(i128::from(ns / 1_000_000_000)))
+        .and_then(|s| u32::try_from(s).ok())
+        .ok_or("sector sec out of u32 range for .cor sector header")?;
+    Ok((sec, ns % 1_000_000_000))
 }
 
 fn build_file_header(
@@ -209,9 +152,9 @@ impl CorWriter {
         st1: CorStation<'_>,
         st2: CorStation<'_>,
     ) -> Result<Self, DynError> {
+        let header = build_file_header(cfg, st1, st2)?;
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        let header = build_file_header(cfg, st1, st2)?;
         writer.write_all(&header)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -221,39 +164,13 @@ impl CorWriter {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn write_sector(
-        &mut self,
-        timestamp_unix_sec: i64,
-        effective_integ_time_s: f32,
-        spectrum: &[Complex<f32>],
-    ) -> Result<(), DynError> {
-        self.write_sector_at(timestamp_unix_sec, 0.0, effective_integ_time_s, spectrum)
-    }
-
     pub fn write_sector_at(
         &mut self,
         timestamp_unix_sec: i64,
         start_offset_s: f64,
-        effective_integ_time_s: f32,
+        duration_s: f64,
+        effective_integ_time_s: f64,
         spectrum: &[Complex<f32>],
-    ) -> Result<(), DynError> {
-        self.write_sector_with_model_at(
-            timestamp_unix_sec,
-            start_offset_s,
-            effective_integ_time_s,
-            spectrum,
-            None,
-        )
-    }
-
-    pub fn write_sector_with_model_at(
-        &mut self,
-        timestamp_unix_sec: i64,
-        start_offset_s: f64,
-        effective_integ_time_s: f32,
-        spectrum: &[Complex<f32>],
-        model: Option<CorSectorModel>,
     ) -> Result<(), DynError> {
         if spectrum.len() != self.fft_half {
             return Err(format!(
@@ -272,26 +189,13 @@ impl CorWriter {
         write_i32_le(&mut sector_header, ST_TIME_OFFSET, st_i32);
         write_u32_le(&mut sector_header, ST_NSEC_OFFSET, st_nsec);
 
-        let integ_sec = if effective_integ_time_s.is_finite() && effective_integ_time_s > 0.0 {
-            effective_integ_time_s as f64
-        } else {
-            1.0
-        };
-        let (et_sec, et_nsec) = split_sec_nsec(timestamp_unix_sec, start_offset_s + integ_sec)?;
+        let (et_sec, et_nsec) = split_sec_nsec(timestamp_unix_sec, start_offset_s + duration_s)?;
         write_u32_le(&mut sector_header, ET_TIME_OFFSET, et_sec);
         write_u32_le(&mut sector_header, ET_NSEC_OFFSET, et_nsec);
-        if let Some(model) = model {
-            write_clock_model(&mut sector_header, GEO1_SEC_OFFSET, &model.station1);
-            write_clock_model(&mut sector_header, GEO2_SEC_OFFSET, &model.station2);
-            write_f32_le(&mut sector_header, AMP0_OFFSET, model.amp[0]);
-            write_f32_le(&mut sector_header, AMP1_OFFSET, model.amp[1]);
-            write_i16_le(&mut sector_header, PHS0_OFFSET, model.phs[0]);
-            write_i16_le(&mut sector_header, PHS1_OFFSET, model.phs[1]);
-        }
         write_f32_le(
             &mut sector_header,
             EFFECTIVE_INTEG_TIME_OFFSET,
-            effective_integ_time_s,
+            effective_integ_time_s as f32,
         );
         self.writer.write_all(&sector_header)?;
         for z in spectrum {
@@ -314,13 +218,30 @@ impl CorWriter {
     }
 }
 
-fn mjd_to_unix_seconds(mjd: f64) -> i64 {
-    ((mjd - 40587.0) * 86400.0).round() as i64
+pub fn epoch_seconds_parts(epoch: &str) -> Result<(i64, f64), DynError> {
+    // Convert the minute boundary separately so a fractional second never
+    // passes through a full Julian date or a floating-point Unix timestamp.
+    let epoch = epoch.trim();
+    if let Some((minute, seconds)) = epoch.rsplit_once(':') {
+        let seconds: f64 = seconds.trim_end_matches(['Z', 'z']).parse()?;
+        if !(0.0..61.0).contains(&seconds) {
+            return Err("invalid epoch seconds".into());
+        }
+        let mjd = geom::parse_epoch_to_mjd(&format!("{minute}:00"))?;
+        let base = ((mjd - 40587.0) * 86400.0).round() as i64;
+        return Ok((base + seconds.trunc() as i64, seconds.fract()));
+    }
+    let mjd = geom::parse_epoch_to_mjd(epoch)?;
+    let seconds = (mjd - mjd.floor()) * 86400.0;
+    Ok((
+        (mjd.floor() as i64 - 40587) * 86400 + seconds.trunc() as i64,
+        seconds.fract(),
+    ))
 }
 
 pub fn epoch_to_unix_seconds(epoch: &str) -> Result<i64, DynError> {
-    let mjd = geom::parse_epoch_to_mjd(epoch)?;
-    Ok(mjd_to_unix_seconds(mjd))
+    let (sec, fraction) = epoch_seconds_parts(epoch)?;
+    Ok(sec + fraction.round() as i64)
 }
 
 pub fn unix_seconds_to_yyyydddhhmmss(unix_seconds: i64) -> Result<String, DynError> {

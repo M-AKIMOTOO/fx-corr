@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
@@ -40,6 +40,8 @@ pub(crate) struct Sector {
     pub frames: usize,
     pub starts: [u64; 2],
     pub samples: [u64; 2],
+    // First FFT origin relative to the permitted read range.
+    pub origins: [u64; 2],
     pub d_seek: f64,
 }
 
@@ -74,13 +76,12 @@ impl Block {
 // Clipping to the original sector preserves its existing boundary padding.
 fn read_window(
     delays: &[FrameDelayEntry],
-    frame: usize,
+    base: i128,
     fft: usize,
     samples: u64,
     word: u64,
     antenna: usize,
 ) -> (u64, u64, i64) {
-    let base = frame as i128 * fft as i128;
     let mut lo = samples as i128;
     let mut hi = 0_i128;
     for (i, d) in delays.iter().enumerate() {
@@ -217,7 +218,6 @@ impl Pipeline {
         read_batch_bytes: usize,
         core: Option<core_affinity::CoreId>,
         produced: Arc<AtomicUsize>,
-        produced_bytes: Arc<AtomicU64>,
     ) -> Self {
         let (ready_tx, ready) = mpsc::sync_channel(depth);
         let ready_frames = Arc::new(AtomicUsize::new(0));
@@ -279,7 +279,7 @@ impl Pipeline {
                             for ant in 0..2 {
                                 let (start, count, offset) = read_window(
                                     &block.delays,
-                                    frame,
+                                    sector.origins[ant] as i128 + frame as i128 * fft[ant] as i128,
                                     fft[ant],
                                     sector.samples[ant],
                                     32 / bits[ant] as u64,
@@ -337,13 +337,11 @@ impl Pipeline {
                             first?;
                             second?;
                             block.read_s = read_start.elapsed().as_secs_f64();
-                            let bytes = block.raw.iter().map(|v| v.len() as u64).sum();
                             producer_ready_frames.fetch_add(block.delays.len(), Ordering::Release);
                             if ready_tx.send(Ok(block)).is_err() {
                                 return Ok(());
                             }
                             produced.fetch_add(1, Ordering::Relaxed);
-                            produced_bytes.fetch_add(bytes, Ordering::Relaxed);
                         }
                         emitted += sector.frames;
                     }
@@ -506,6 +504,7 @@ mod tests {
                         vec![Sector {
                             frames: 100,
                             starts: [0; 2],
+                            origins: [0; 2],
                             samples: [3216; 2],
                             d_seek: 0.0,
                         }],
@@ -521,7 +520,6 @@ mod tests {
                         128,
                         None,
                         Arc::new(AtomicUsize::new(0)),
-                        Arc::new(AtomicU64::new(0)),
                     );
                     let (frames, bytes) = p.prefill().unwrap();
                     assert_eq!(frames, (depth * 3).min(100));
@@ -599,8 +597,14 @@ mod tests {
                                         ..Default::default()
                                     })
                                     .collect();
-                                let (start, count, offset) =
-                                    read_window(&delays, frame, fft, samples as u64, word, 0);
+                                let (start, count, offset) = read_window(
+                                    &delays,
+                                    (frame * fft) as i128,
+                                    fft,
+                                    samples as u64,
+                                    word,
+                                    0,
+                                );
                                 let bytes = &raw[start as usize * bits / 8
                                     ..(start + count) as usize * bits / 8];
                                 let mut scratch = DecodeWindowScratch::new();
@@ -667,6 +671,7 @@ mod tests {
                         vec![Sector {
                             frames: 100,
                             starts: [0; 2],
+                            origins: [0; 2],
                             samples: [3216; 2],
                             d_seek: 0.,
                         }],
@@ -682,7 +687,6 @@ mod tests {
                         128,
                         None,
                         Arc::new(AtomicUsize::new(0)),
-                        Arc::new(AtomicU64::new(0)),
                     );
                     if consume {
                         p.prefill().unwrap();
@@ -705,6 +709,7 @@ mod tests {
                 vec![Sector {
                     frames: 1,
                     starts: [0; 2],
+                    origins: [0; 2],
                     samples: [48; 2],
                     d_seek: 0.,
                 }],
@@ -718,7 +723,6 @@ mod tests {
                 128,
                 None,
                 Arc::new(AtomicUsize::new(0)),
-                Arc::new(AtomicU64::new(0)),
             );
             assert!(p.recv().is_err());
             p.finish().unwrap();

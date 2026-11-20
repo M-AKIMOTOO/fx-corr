@@ -292,8 +292,26 @@ pub struct Args {
     )]
     pub sampling: f64,
 
-    #[arg(long, value_name = "POINTS", default_value_t = DEFAULT_FFT, help = "FFT size [samples/frame]")]
-    pub fft: usize,
+    #[arg(
+        long,
+        value_name = "POINTS",
+        help = "FFT size [samples/frame]; defaults to the schedule FFT or 16384"
+    )]
+    pub fft: Option<usize>,
+
+    #[arg(
+        long,
+        visible_alias = "maser",
+        help = "Fringe-stop voltages before the FFT for spectral lines on the common measured RF grid"
+    )]
+    pub spectral_line: bool,
+
+    #[arg(
+        long,
+        value_name = "HZ",
+        help = "RF for the within-FFT fringe rate; enables spectral-line mode (default: center of the overlap)"
+    )]
+    pub line_frequency_hz: Option<f64>,
 
     #[arg(
         long,
@@ -440,8 +458,23 @@ pub struct Args {
     )]
     pub skip: f64,
 
-    #[arg(long, value_name = "S", help = "Processing duration [s]")]
+    #[arg(long, value_name = "S", help = "End offset from the process epoch [s]")]
     pub length: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "S",
+        conflicts_with = "length",
+        help = "Correlate this duration after the combined XML and CLI skip [s], within the scheduled scan"
+    )]
+    pub duration: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Complete FFT frames per output integration; 1 writes a time-resolved spectrum for each FFT"
+    )]
+    pub integration_frames: Option<std::num::NonZeroUsize>,
 
     // Phased-array analysis parameters
     #[arg(long, value_name = "K", num_args = 1.., help = "System temperature [K]")]
@@ -730,6 +763,17 @@ pub fn resolve_weight(
             return Err(format!("{label} gain must be positive").into());
         }
         Ok((gain / tsys, gain, None, None))
+    }
+}
+
+impl Args {
+    pub fn process_end(&self, start_s: f64, xml_end: Option<f64>) -> Option<f64> {
+        if let Some(duration) = self.duration {
+            let end = start_s + duration;
+            Some(xml_end.map_or(end, |limit| end.min(limit)))
+        } else {
+            self.length.or(xml_end)
+        }
     }
 }
 

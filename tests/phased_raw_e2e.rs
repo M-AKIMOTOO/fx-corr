@@ -46,6 +46,276 @@ fn write_schedule(path: &Path, station1: &str, station2: &str) {
 }
 
 #[test]
+fn microsecond_burst_and_folded_gate_keep_sample_time_and_power() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    let schedule = root.join("gate.xml");
+    write_schedule(&schedule, "ANT1", "ANT2");
+    let xml = fs::read_to_string(&schedule)
+        .unwrap()
+        .replace("<speed>8192</speed>", "<speed>128000000</speed>")
+        .replace("00:00:00</epoch>", "00:00:00.000000125</epoch>")
+        .replace(">LSB<", ">USB<")
+        .replace(
+            "24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7",
+            "31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0",
+        );
+    // Start inside a recorder word. Only the second 128-sample frame has
+    // a tone at bin 32. Both stations see the same voltage.
+    let mut raw = vec![0xaa_u8; 256];
+    for i in 0..128 {
+        let sample = 145 + 128 + i;
+        let shift = 2 * (sample % 4);
+        let code = if i % 4 < 2 { 0 } else { 3 };
+        raw[sample / 4] = (raw[sample / 4] & !(3 << shift)) | (code << shift);
+    }
+    for name in ["ANT1", "ANT2"] {
+        fs::write(root.join(format!("{name}_2000001000000.raw")), &raw).unwrap();
+    }
+    for folded in [false, true] {
+        let out = root.join(if folded { "pulse" } else { "burst" });
+        fs::write(
+            &schedule,
+            if folded {
+                xml.replace(
+                    "<stream>",
+                    "<stream><pulsar><period>0.000004</period><bins>4</bins></pulsar>",
+                )
+            } else {
+                xml.clone()
+            },
+        )
+        .unwrap();
+        let run = Command::new(env!("CARGO_BIN_EXE_yi-corr"))
+            .args(["--sc"])
+            .arg(&schedule)
+            .arg("--raw")
+            .arg(&root)
+            .arg("--cor")
+            .arg(&out)
+            .args([
+                "--cpu",
+                "2",
+                "--no-affinity",
+                "--skip",
+                "0.0000011328125",
+                "--duration",
+                "0.0000035",
+                "--integration-frames",
+                if folded { "3" } else { "1" },
+            ])
+            .env("YI_EOP_MODE", "none")
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let mut products = 0;
+        for file in fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
+            if file.extension().and_then(|s| s.to_str()) != Some("cor") {
+                continue;
+            }
+            products += 1;
+            let data = fs::read(&file).unwrap();
+            let u32_at = |pos| u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            let count = u32_at(28) as usize;
+            let pulse_bin = folded.then(|| {
+                file.file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .rsplit_once(".pbin")
+                    .unwrap()
+                    .1
+                    .parse::<usize>()
+                    .unwrap()
+            });
+            assert_eq!(count, pulse_bin.map_or(3, |b| usize::from(b != 0)));
+            let stride = 128 + 64 * 8;
+            assert_eq!(data.len(), 256 + count * stride);
+            for i in 0..count {
+                let h = 256 + i * stride;
+                let start_ns = 1258 + i as u32 * 1000;
+                assert_eq!((u32_at(h), u32_at(h + 4)), (946684800, start_ns));
+                assert_eq!(
+                    (u32_at(h + 8), u32_at(h + 12)),
+                    (946684800, start_ns + if folded { 3000 } else { 1000 })
+                );
+                assert_eq!(f32::from_bits(u32_at(h + 112)), 1e-6_f32);
+                let tone = h + 128 + 32 * 8;
+                let expected = if pulse_bin.map_or(i == 1, |b| b == 2) {
+                    1.8
+                } else {
+                    0.0
+                };
+                assert!(
+                    (f32::from_bits(u32_at(tone)) - expected).abs() < 1e-5,
+                    "{}",
+                    file.display()
+                );
+                assert!(f32::from_bits(u32_at(tone + 4)).abs() < 1e-5);
+            }
+        }
+        assert_eq!(products, if folded { 12 } else { 3 });
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn maser_line_uses_the_measured_rf_grid_for_either_station_order() {
+    use std::f64::consts::TAU;
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    let schedule = root.join("maser.xml");
+    let reference_hz = 100_000_000.0;
+    let fs_hz = 1_000_000.0;
+    let df = fs_hz / 1024.0;
+    let line_hz = reference_hz + 73.0 * df;
+    let levels = (0..256)
+        .map(|i| (i as f64 - 127.5).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let shuffle = (0..32)
+        .rev()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    for (case, fft, names, rotations) in [
+        (0, 1024, ["YAMAGU32", "HITACH32"], [0., 0.]),
+        (1, 1024, ["YAMAGU32", "HITACH32"], [0., 3. * df]),
+        (2, 2048, ["HITACH32", "YAMAGU32"], [3. * df, 0.]),
+    ] {
+        write_schedule(&schedule, names[0], names[1]);
+        let xml = fs::read_to_string(&schedule).unwrap()
+            .replace("<speed>8192</speed>", "<speed>1000000</speed>")
+            .replace("<bit>2</bit>", "<bit>8</bit>")
+            .replace("-1.5,-0.5,0.5,1.5", &levels)
+            .replace("24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7", &shuffle);
+        let mut xml = xml;
+        for (i, key) in ["A", "B"].iter().enumerate() {
+            let lsb = names[i] == "HITACH32";
+            // An independent clock stretches the recorded tone by 1.25
+            // reference channels per FFT (2.5 at the longer FFT length).
+            let rate = if case != 0 && lsb {
+                1.25 * df / line_hz
+            } else {
+                0.0
+            };
+            xml = xml.replace(
+                &format!("<clock key=\"{key}\"><delay>0</delay><rate>0"),
+                &format!("<clock key=\"{key}\"><delay>0</delay><rate>{rate:.17e}"),
+            );
+            let sideband = if lsb { "LSB" } else { "USB" };
+            xml = xml.replace(
+                &format!("<special key=\"{key}\"><rotation>0</rotation><sideband>LSB"),
+                &format!(
+                    "<special key=\"{key}\"><rotation>{}</rotation><sideband>{sideband}",
+                    rotations[i]
+                ),
+            );
+            let tone_hz = line_hz - (reference_hz + rotations[i]) - line_hz * rate;
+            let bytes: Vec<_> = (0..8192)
+                .map(|j| {
+                    let phase = TAU * tone_hz * j as f64 / fs_hz + if lsb { 0.35 } else { 0. };
+                    let voltage = 100. * phase.cos() * if lsb && j % 2 == 1 { -1. } else { 1. };
+                    (127.5 + voltage).round() as u8
+                })
+                .collect();
+            fs::write(root.join(format!("{}_2000001000000.raw", names[i])), bytes).unwrap();
+        }
+        fs::write(&schedule, xml).unwrap();
+        let out = root.join(case.to_string());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_yi-corr"));
+        command
+            .arg("--sc")
+            .arg(&schedule)
+            .arg("--raw")
+            .arg(&root)
+            .arg("--cor")
+            .arg(&out)
+            .args([
+                "--fft",
+                &fft.to_string(),
+                "--cpu",
+                "2",
+                "--no-affinity",
+                "--skip",
+                "0.000013",
+            ])
+            .env_remove("YI_ANT2_GRID_OFFSET")
+            .env("YI_EOP_MODE", "none");
+        // The default path also has to be independent of station name.
+        if case != 0 {
+            if case == 1 {
+                command.arg("--maser");
+            }
+            command.args(["--line-frequency-hz", &line_hz.to_string()]);
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut products = 0;
+        for file in fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
+            if file.extension().and_then(|s| s.to_str()) != Some("cor") {
+                continue;
+            }
+            products += 1;
+            let data = fs::read(&file).unwrap();
+            let low_hz = f64::from_le_bytes(data[16..24].try_into().unwrap());
+            let rate = i32::from_le_bytes(data[12..16].try_into().unwrap()) as f64;
+            let n = i32::from_le_bytes(data[24..28].try_into().unwrap());
+            let (peak, value) = data[384..]
+                .chunks_exact(8)
+                .map(|v| {
+                    num_complex::Complex::new(
+                        f32::from_le_bytes(v[..4].try_into().unwrap()),
+                        f32::from_le_bytes(v[4..].try_into().unwrap()),
+                    )
+                })
+                .enumerate()
+                .max_by(|a, b| a.1.norm_sqr().total_cmp(&b.1.norm_sqr()))
+                .unwrap();
+            assert_eq!(
+                low_hz + peak as f64 * rate / n as f64,
+                line_hz,
+                "{}",
+                file.display()
+            );
+            assert!(
+                (value.norm() - 2. * 50_f32.powi(2) / ((256_f32.powi(2) - 1.) / 12.)).abs() < 0.01
+            );
+            if file
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&format!("{}_{}_", names[0], names[1]))
+            {
+                let expected_phase = if names[0] == "HITACH32" { 0.35 } else { -0.35 };
+                assert!((value.arg() - expected_phase).abs() < 0.01, "{value:?}");
+            }
+        }
+        assert_eq!(products, 3);
+        if case == 1 {
+            let legacy = command.env("YI_ANT2_GRID_OFFSET", "-1").output().unwrap();
+            assert!(!legacy.status.success());
+            assert!(String::from_utf8_lossy(&legacy.stderr).contains("YI_ANT2_GRID_OFFSET"));
+            command.env_remove("YI_ANT2_GRID_OFFSET");
+            let rejected = command.args(["--rotation", "ant2:500"]).output().unwrap();
+            assert!(!rejected.status.success());
+            assert!(String::from_utf8_lossy(&rejected.stderr)
+                .contains("RF edge is not on the common FFT grid"));
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn ionosphere_corrects_injected_dispersive_voltage_without_changing_frequency_bins() {
     use std::f64::consts::TAU;
     let root = unique_temp_dir();

@@ -1034,8 +1034,7 @@ pub fn run(
             let (epoch, _) = crate::epoch_to_yyyydddhhmmss(&a.epoch)?;
             let start = a.skip_sec + args.skip;
             let end = args
-                .length
-                .or(a.length_sec)
+                .process_end(start, a.length_sec)
                 .ok_or("calibrated target scan requires XML length or --length")?;
             let c = transfer_calibration(
                 calibration.as_ref().ok_or("no multiband calibration")?,
@@ -1421,7 +1420,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 writer
-                    .write_sector_at(946684800, i as f64 * 0.05, 0.05, &spectrum)
+                    .write_sector_at(946684800, i as f64 * 0.05, 0.05, 0.05, &spectrum)
                     .unwrap();
             }
             writer.finalize().unwrap();

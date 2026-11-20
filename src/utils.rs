@@ -1,4 +1,3 @@
-use std::f64::consts::PI;
 use std::sync::Arc;
 
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
@@ -17,6 +16,44 @@ pub struct FftHelper {
 pub struct FftScratch {
     forward_r2c: Vec<Complex<f32>>,
     inverse_c2r: Vec<Complex<f32>>,
+}
+
+/// Multiplication by a complex fringe rotates real voltages off the real
+/// axis. A complex forward FFT preserves both quadratures of that voltage.
+pub struct FringeFft {
+    plan: Arc<dyn Fft<f32>>,
+    voltage: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl FringeFft {
+    pub fn new(plan: Arc<dyn Fft<f32>>) -> Self {
+        Self {
+            voltage: vec![Complex::default(); plan.len()],
+            scratch: vec![Complex::default(); plan.get_inplace_scratch_len()],
+            plan,
+        }
+    }
+
+    pub fn forward(
+        &mut self,
+        samples: &[f32],
+        midpoint: Complex<f32>,
+        cycles_per_sample: f64,
+        out: &mut [Complex<f32>],
+    ) {
+        let angle = std::f64::consts::TAU * cycles_per_sample;
+        let step = Complex::from_polar(1.0, angle);
+        let mut phase = Complex::new(midpoint.re as f64, midpoint.im as f64)
+            * Complex::from_polar(1.0, -0.5 * samples.len() as f64 * angle);
+        for (z, &sample) in self.voltage.iter_mut().zip(samples) {
+            *z = Complex::new(phase.re as f32 * sample, phase.im as f32 * sample);
+            phase *= step;
+        }
+        self.plan
+            .process_with_scratch(&mut self.voltage, &mut self.scratch);
+        out.copy_from_slice(&self.voltage[..out.len()]);
+    }
 }
 
 impl FftHelper {
@@ -84,28 +121,6 @@ impl FftHelper {
             *value *= scale;
         }
         Ok(())
-    }
-}
-
-#[allow(dead_code)]
-pub fn apply_integer_sample_shift_zerofill(samples: &mut [f32], shift_samples: i64) {
-    if samples.is_empty() || shift_samples == 0 {
-        return;
-    }
-    let n = samples.len();
-    let s_abs = shift_samples.unsigned_abs() as usize;
-    if s_abs >= n {
-        samples.fill(0.0_f32);
-        return;
-    }
-    if shift_samples > 0 {
-        // Positive delay: shift right (later in time), zero-fill head.
-        samples.copy_within(..(n - s_abs), s_abs);
-        samples[..s_abs].fill(0.0_f32);
-    } else {
-        // Negative delay: shift left (earlier in time), zero-fill tail.
-        samples.copy_within(s_abs.., 0);
-        samples[(n - s_abs)..].fill(0.0_f32);
     }
 }
 
@@ -551,31 +566,6 @@ pub fn quantise_frame(
         output.extend_from_slice(&shuffled.to_le_bytes());
     }
     Ok(())
-}
-
-pub fn unwrap_phase(phase: &[f64]) -> Vec<f64> {
-    let mut unwrapped = Vec::with_capacity(phase.len());
-    if let Some(&first) = phase.first() {
-        unwrapped.push(first);
-        let mut offset = 0.0;
-        for i in 1..phase.len() {
-            let diff = phase[i] - phase[i - 1];
-            if diff > PI {
-                offset -= 2.0 * PI;
-            } else if diff < -PI {
-                offset += 2.0 * PI;
-            }
-            unwrapped.push(phase[i] + offset);
-        }
-    }
-    unwrapped
-}
-pub fn safe_arg(z: &Complex<f64>) -> f64 {
-    if z.re == 0.0 && z.im == 0.0 {
-        0.0
-    } else {
-        z.arg()
-    }
 }
 
 #[cfg(test)]

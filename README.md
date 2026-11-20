@@ -29,7 +29,7 @@ This repository builds two operational binaries from the same codebase:
 
 ## Features
 
-- [局ごとに帯域幅・サンプリング周波数が異なる相関](docs/unequal-bandwidth.md): 512 MHz / 16 MHz 等の包含帯域を、同じ時間幅・周波数刻みの局別 FFT で処理する（3.12.0）。
+- [局ごとに帯域幅・サンプリング周波数が異なる相関](docs/unequal-bandwidth.md): 512 MHz / 16 MHz 等の包含帯域を、同じ時間幅・周波数刻みの局別 FFT で処理する。
 
 - XML schedule driven operation (`--sc <schedule.xml>`)
 - Multi-process scan support (`<process>` entries in XML)
@@ -921,6 +921,34 @@ yi-corr --sc scan.xml --raw ../raw --cor cor_out --fringe 60
 
 For each interval, files are written under `<cor>/fringe_yicorr_ql/<schedule-basename>/<process-epoch>/` with names containing `_fringe_spectrum.tsv`, `_fringe_spectrum_amp.png`, `_fringe_lag.tsv`, and `_fringe_lag_amp.png`.
 
+### メーザー・狭帯域線の周波数相関
+
+```bash
+yi-corr --sc maser.xml --raw raw --cor cor/maser --maser --fft 1048576 \
+  --line-frequency-hz 6668227539.0625
+```
+
+`--maser`（`--spectral-line`）は、両局が実際に観測した共通RF帯域で自己相関と相互相関を積分する。各 `.cor` ファイルで、先頭を0とするビン `k` の周波数は `ヘッダーの観測周波数 + k × サンプリング周波数 / FFT点数` になる。1024 MS/s、1048576点FFTでは976.5625 Hz間隔となる。実測した周波数設定はXMLの `stream/frequency`、局別の `rotation`（Hz）、`sideband` に記入する。
+
+局名に依存した周波数補正は廃止した。従来の `YI_ANT2_GRID_OFFSET` が非ゼロなら処理開始時にエラーを返す。メーザーモードではRF原点が共通グリッドの整数ビンに一致することも検査する。端数が残る場合は、実際の局設定を保ったまま、その周波数差を表現できるFFT長を選ぶ。以下に残した3.0.1・3.0.2のHITACH32の補正値は当時の比較記録である。
+
+フリンジ回転は整数サンプル遅延をそろえた後、FFTの前に行う。追尾する局の電圧に各サンプル時刻の複素位相を掛け、FFT後に残りの端数サンプル遅延をチャネルごとの位相勾配で補正する。各FFT内では幾何遅延と局時計を含む基線遅延の変化を線形近似する。`--line-frequency-hz` には狙う線の観測RFをHzで指定する。この値がFFT内の回転速度を決める。省略時は両局の共通帯域の中心を使う。出力の周波数軸はどちらの場合もXMLの観測周波数設定で決まる。
+
+G9.62（2025/302 07:00:00、山口32 m–日立32 m）のRAWを1048576点FFT、0.999424秒 × 5積分で再処理した。局別ビン補正をゼロにしたFFT後回転と比較すると、線の周辺（ビン69840–69889）の相互相関ピーク振幅は各積分で4.09–5.18倍になった。両局の自己相関ピークは5積分中4積分で同じビンに入り、残る1積分は隣接ビンだった。観測XMLは保存済みの相関ヘッダーと記録形式から復元し、地球姿勢パラメータには既定値を使用した。
+
+### FRB・単発パルスの短時間相関
+
+`--skip` で候補時刻に移動し、`--duration` でそこから処理する秒数、`--integration-frames` で1スペクトルに積分するFFTフレーム数を指定する。たとえば、XMLのskipが0、サンプリングが1024 MS/sの場合、次のコマンドはスキャン開始から12.345秒後の1 msを切り出し、各局の自己相関と基線の相互相関を1 µs間隔で出力する。
+
+```bash
+yi-corr --sc scan.xml --raw raw --cor cor/burst-01 \
+  --skip 12.345 --duration 0.001 --fft 1024 --integration-frames 1
+```
+
+最短の時間分解能は `FFT長 / サンプリング周波数`、周波数分解能はその逆数で、この例では1 MHzになる。開始位置にはXMLとCLIのskipの合計を使う。スキャン末尾・入力末尾で区間を打ち切り、完全なFFTフレームを積分する。最終積分に残ったフレームは実際の積分時間で記録する。`--length` は従来どおりスキャン開始からの終了位置を指定する。同じ秒に複数の候補を処理するときは、候補ごとに `--cor` の出力先を分ける。
+
+単発バーストの出力は各周波数チャネルでの到着時刻を保つ。分散で広がったFRBを扱うときは、対象帯域の到着時間差を含む長さで切り出す。周期が既知のパルサーでは、次のXML設定で複数周期を位相ビンごとに積分できる。
+
 ### Pulsar folding `.cor` output
 
 XML `<stream><pulsar>...</pulsar></stream>` enables pulse-phase folding for `.cor` spectral products. The pulsar model belongs to the stream, while `<process>` continues to define the scan epoch, skip, length, source, and stations. The first implementation uses topocentric phase folding; barycentric correction is reserved for a future mode.
@@ -950,6 +978,8 @@ Example:
 `<epoch>` is the pulse phase-zero epoch. If omitted, the process epoch is used. `<period>` is seconds, `<pdot>` is s/s, `<pddot>` is s/s^2, and `<bins>` is the number of pulse phase bins. When `<dedisperse>true</dedisperse>` and `<dm>` is non-zero, each frequency bin is assigned to a pulse phase bin after applying the cold-plasma dispersion delay relative to the top of the processed band; ACF and XCF are then accumulated in that corrected pulse bin.
 
 Pulse-bin output adds `.pbinNN` before `.cor`, for example `<ANT1>_<ANT2>_<TAG>_<LABEL>.pbin00.cor`. With `<inband>4</inband>`, names become `<ANT1>_<ANT2>_<TAG>_<LABEL>.ch1bw512.pbin00.cor`.
+
+Folding uses the arrival time at each FFT midpoint, including the XML and CLI skip. Choose an FFT window shorter than the desired phase bin (`period / bins`). Each populated pulse bin records the start and end of the enclosing integration and its effective exposure in seconds. With dedispersion enabled, this exposure is the largest contributing frame count across the output channels times the FFT window duration.
 
 Where:
 
@@ -2278,12 +2308,12 @@ Delay-model coordinates: precessed-to-date RA/Dec
 ### Geometric-model diagnostics and unattended sweep
 
 `--vlbi` selects `pnm-gast` and the existing first-order `vlbi-minus` delay model.
-It overrides `YI_SOURCE_VECTOR_MODE` and `YI_GEOM_DELAY_MODE`. Without this flag,
-existing defaults and environment settings are preserved. EOP and station clock
-settings are unchanged. This is not a full IERS propagation model: atmospheric
-and gravitational delays are not added. Integer alignment remains before FFT;
-fractional delay and fringe-stop remain after FFT. Pre-FFT complex fringe
-rotation is not enabled by this flag.
+It overrides `YI_SOURCE_VECTOR_MODE` and `YI_GEOM_DELAY_MODE`. With this preset
+the troposphere model defaults to nominal when no atmospheric input or explicit
+troposphere setting is supplied. Integer alignment precedes the FFT and
+fractional delay correction follows it.
+The default continuum path applies the carrier phase after the FFT. Add
+`--maser` to apply a time-dependent complex fringe rotation before the FFT.
 
 For a controlled comparison, use the same schedule and separate output directories:
 
@@ -2805,6 +2835,7 @@ state.
 
 | Version | Summary |
 |---|---|
+| `4.0.0` | Adds pre-FFT complex fringe rotation for accurate spectral-line correlations and short-window/integration controls for pulsar and FRB processing. Removes station-name-specific frequency-bin shifts and unused XCF implementation. Improves correlation hot-path memory reuse, read/decode reporting and sub-second timestamps. |
 | `3.12.0` | Correlates unequal station sampling rates using equal-duration native FFTs and the common RF band. Adds native delay tracking, FFT-origin phase alignment, per-station power normalization, narrow-band output metadata and synthetic containment tests. |
 | `3.10.5` | Writes `.info` as ordinary ZIP32/Deflate containing one UTF-8 `info.txt`, compatible with zipcat and zedit without renaming. Retains gzip reading in analysis/benchmark tools and provides a converter that preserves archived originals. |
 | `3.11.0` | Adds station XML/UTC CSV atmosphere providers: STEC/VTEC first-order ionosphere with separate group alignment and dispersive spectral phase, measured zenith paths or Saastamoinen weather delays with Niell mapping. Preserves default/legacy nominal processing and records models in ZIP `.info`. |
